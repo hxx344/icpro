@@ -225,10 +225,14 @@ class BacktestEngine:
         strategy = self.strategy
         pending_orders = self._pending_orders
 
+        # Pre-convert all timestamps to pd.Timestamp (avoids per-step conversion)
+        ts_pd_all = pd.DatetimeIndex(ts_values).tz_localize("UTC")
+
         # 4. Iterate
         for i in tqdm(range(n_steps), desc="Backtesting"):
             ts_np = ts_values[i]               # numpy datetime64
             price = float(close_values[i])
+            ts_pd = ts_pd_all[i]               # pre-converted pd.Timestamp
 
             has_positions = bool(position_mgr.positions)
 
@@ -244,7 +248,6 @@ class BacktestEngine:
                 )
 
             # 4c. Build context (lazy chain) and call strategy
-            ts_pd = pd.Timestamp(ts_np, tz="UTC")
             ctx = self._build_context(ts_pd, price)
             pending_orders.clear()
             strategy.on_step(ctx)
@@ -259,7 +262,7 @@ class BacktestEngine:
         # 5. Force‑close remaining positions at last mark
         if position_mgr.positions:
             logger.info(f"Force‑closing {len(position_mgr.positions)} remaining positions")
-            last_ts = pd.Timestamp(ts_values[-1], tz="UTC")
+            last_ts = ts_pd_all[-1]
             last_price = float(close_values[-1])
             ctx = self._build_context(last_ts, last_price)
             ctx.close_all()
@@ -392,6 +395,8 @@ class BacktestEngine:
         marks: dict[str, float] = {}
         ohlcv_index = self._ohlcv_index
         use_market_data = not self.config.backtest.use_bs_only
+        # Pre-compute values needed for synthetic fallback (avoid per-position overhead)
+        _ts_ns_val = int(np.datetime64(ts_np, 'ns').view('int64')) if not isinstance(ts_np, (int, np.integer)) else int(ts_np)
 
         for name in self.position_mgr.positions:
             # Try pre-indexed OHLCV data first (O(log n) via searchsorted)
@@ -414,8 +419,9 @@ class BacktestEngine:
             if parsed is None:
                 continue
             exp_ts = to_utc_timestamp(parsed["expiration_date"])
-            ts_pd = pd.Timestamp(ts_np, tz="UTC")
-            T = max((exp_ts - ts_pd).total_seconds() / (365.25 * 86400), 0.0001)
+            # Use nanosecond arithmetic to avoid pd.Timestamp creation
+            exp_ns = exp_ts.value
+            T = max((exp_ns - _ts_ns_val) / (365.25 * 86400 * 1e9), 0.0001)
             strike = parsed["strike_price"]
             iv = self._resolve_dynamic_iv(name, ts_np, underlying_price, strike, T)
             if parsed["option_type"] == "call":
@@ -486,9 +492,10 @@ class BacktestEngine:
         if parsed is None:
             return None, None, None
 
-        ts_pd = pd.Timestamp(ts_np, tz="UTC")
         exp_ts = to_utc_timestamp(parsed["expiration_date"])
-        T = max((exp_ts - ts_pd).total_seconds() / (365.25 * 86400), 0.0001)
+        # Use nanosecond arithmetic to avoid pd.Timestamp creation
+        _ts_ns_val = int(np.datetime64(ts_np, 'ns').view('int64')) if not isinstance(ts_np, (int, np.integer)) else int(ts_np)
+        T = max((exp_ts.value - _ts_ns_val) / (365.25 * 86400 * 1e9), 0.0001)
         strike = parsed["strike_price"]
         iv = self._resolve_dynamic_iv(instrument_name, ts_np, underlying_price, strike, T)
         if parsed["option_type"] == "call":
