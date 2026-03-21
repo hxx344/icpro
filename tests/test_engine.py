@@ -123,10 +123,11 @@ class TestPositionManager:
                            direction=Direction.LONG, quantity=1.0,
                            fill_price=0.03, fee=0.0))
         # Settlement: BTC @ 90000, strike 80000 → intrinsic = 10000/90000
+        # Entry cost (withdraw) already handled in _process_orders;
+        # settle_expired only returns the intrinsic cash-flow.
         pnl = pm.settle_expired("BTC-C", 90000, 80000, "call", NOW)
         expected_intrinsic = 10000 / 90000
-        expected_pnl = expected_intrinsic - 0.03  # intrinsic - entry
-        assert pnl == pytest.approx(expected_pnl, abs=1e-6)
+        assert pnl == pytest.approx(expected_intrinsic, abs=1e-6)
         assert not pm.has_position("BTC-C")
 
     def test_settle_otm_put(self):
@@ -135,8 +136,9 @@ class TestPositionManager:
                            direction=Direction.LONG, quantity=1.0,
                            fill_price=0.02, fee=0.0))
         # Settlement: BTC @ 90000, strike 80000 → put OTM
+        # No settlement cash-flow for OTM; entry cost already handled.
         pnl = pm.settle_expired("BTC-P", 90000, 80000, "put", NOW)
-        assert pnl == pytest.approx(-0.02)  # lose entire premium
+        assert pnl == pytest.approx(0.0)
 
     def test_mark_update(self):
         pm = PositionManager()

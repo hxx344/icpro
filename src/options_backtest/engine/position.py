@@ -126,6 +126,13 @@ class PositionManager:
     ) -> float:
         """Settle an expired position, returning realised PnL.
 
+        Premium cash-flow is already in the account balance (deposit on sell,
+        withdraw on buy).  Settlement therefore only handles the **intrinsic**
+        value exchange:
+
+        * ITM  → Long receives intrinsic (+), Short pays intrinsic (−).
+        * OTM  → No settlement cash-flow (premium already handled at entry).
+
         Coin margin (Deribit):
           Call intrinsic = max(0, S − K) / S
           Put  intrinsic = max(0, K − S) / S
@@ -157,21 +164,30 @@ class PositionManager:
 
         is_itm = intrinsic > 0
         if is_itm:
-            # Long receives intrinsic minus entry cost; short is opposite
-            pnl = (intrinsic - pos.entry_price) * pos.quantity * pos.direction_sign
-            fee = delivery_fee_per_qty * pos.quantity
-            # Cap delivery fee at delivery_fee_max_pct of option value (intrinsic)
-            if delivery_fee_max_pct > 0:
-                cap = intrinsic * delivery_fee_max_pct * pos.quantity
-                fee = min(fee, cap)
+            # Only intrinsic settlement (premium already in balance from entry)
+            # Long receives intrinsic; Short pays intrinsic
+            pnl = intrinsic * pos.quantity * pos.direction_sign
+            # Delivery fee only on the receiving side (positive pnl)
+            if pnl > 0:
+                fee = delivery_fee_per_qty * pos.quantity
+                if delivery_fee_max_pct > 0:
+                    cap = intrinsic * delivery_fee_max_pct * pos.quantity
+                    fee = min(fee, cap)
+            else:
+                fee = 0.0
         else:
-            # OTM: buyer loses premium, seller keeps premium
-            pnl = -pos.entry_price * pos.quantity * pos.direction_sign
+            # OTM: no settlement cash-flow (premium already handled at entry)
+            pnl = 0.0
             fee = 0.0
 
         pnl -= fee
 
-        self._record_close_settlement(pos, timestamp, intrinsic, pnl, fee)
+        # Full lifecycle PnL for trade record (includes entry premium):
+        #   (intrinsic − entry) × qty × direction
+        # This is what downstream analytics (WinRate, PF) should use.
+        lifecycle_pnl = (intrinsic - pos.entry_price) * pos.quantity * pos.direction_sign - fee
+
+        self._record_close_settlement(pos, timestamp, intrinsic, lifecycle_pnl, fee)
         del self._positions[instrument_name]
 
         # Derive underlying symbol from instrument name (e.g. ETH-28MAR25-3200-C → ETH)
