@@ -234,7 +234,34 @@ if page == "📊 总览":
 
     client = _get_client(cfg.exchange)
 
-    # --- KPIs ---
+    # --- Fetch LIVE exchange data for KPIs ---
+    has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
+    live_account = None
+    exchange_positions = []
+
+    if has_creds and not cfg.exchange.simulate_private:
+        # 1) Live account balance
+        try:
+            _acct = client.get_account()
+            if not _acct.raw.get("simulated"):
+                live_account = _acct
+        except Exception:
+            pass
+
+        # 2) Live exchange positions
+        try:
+            if hasattr(client, "get_positions"):
+                exchange_positions = client.get_positions(cfg.strategy.underlying.upper())
+        except Exception as e:
+            st.warning(f"获取交易所持仓失败: {e}")
+
+    # Sum unrealized PnL from exchange positions
+    live_upnl = sum(
+        float(p.get("unrealizedPnl") or p.get("unrealizedPNL") or 0)
+        for p in exchange_positions
+    )
+
+    # --- DB stored data (historical) ---
     stats = storage.get_trade_stats()
     equity_curve = storage.get_equity_curve(start_date, end_date)
     daily_pnl = storage.get_daily_pnl(start_date, end_date)
@@ -244,7 +271,7 @@ if page == "📊 总览":
     total_fees = stats["total_fees"]
     net_pnl = total_pnl - total_fees
 
-    # Drawdown
+    # Drawdown (from historical equity curve)
     peak = 0.0
     max_dd = 0.0
     for snap in equity_curve:
@@ -255,9 +282,33 @@ if page == "📊 总览":
         if dd > max_dd:
             max_dd = dd
 
-    # Latest equity
-    latest_equity = equity_curve[-1]["total_equity"] if equity_curve else 0
-    latest_upnl = equity_curve[-1]["unrealized_pnl"] if equity_curve else 0
+    # --- Determine display values: prefer LIVE, fall back to DB snapshot ---
+    if live_account is not None:
+        latest_equity = live_account.total_balance
+        latest_upnl = live_upnl if exchange_positions else live_account.unrealized_pnl
+        _data_source = "实时"
+    elif equity_curve:
+        latest_equity = equity_curve[-1]["total_equity"]
+        latest_upnl = equity_curve[-1]["unrealized_pnl"]
+        _data_source = "历史快照"
+    else:
+        latest_equity = 0
+        latest_upnl = 0
+        _data_source = "无数据"
+
+    # --- Auto-record equity snapshot when live data is available ---
+    if live_account is not None:
+        try:
+            _spot = client.get_spot_price(cfg.strategy.underlying)
+            storage.record_equity_snapshot(
+                total_equity=latest_equity,
+                available_balance=live_account.available_balance,
+                unrealized_pnl=latest_upnl,
+                position_count=len(exchange_positions),
+                underlying_price=_spot,
+            )
+        except Exception:
+            pass  # non-critical
 
     # KPI row
     col1, col2, col3, col4, col5, col6 = st.columns(6)
@@ -277,9 +328,11 @@ if page == "📊 总览":
     with col6:
         st.metric("累计手续费", f"${total_fees:,.2f}")
 
+    st.caption(f"📡 数据来源: **{_data_source}**")
+
     st.divider()
 
-    # --- Open Positions ---
+    # --- Open Positions (local strategy + exchange) ---
     st.subheader("🔓 当前持仓")
     open_trades = storage.get_open_trades()
 
@@ -320,24 +373,17 @@ if page == "📊 总览":
                 df_legs = pd.DataFrame(leg_rows)
                 st.dataframe(df_legs, width='stretch', hide_index=True)
                 st.caption(f"净权利金: **${total_premium:.4f}**")
-    else:
+    elif not exchange_positions:
         st.info("当前无持仓")
+    # If no local trades but exchange has positions, skip the "无持仓" message
+    # since exchange positions section below will show them
 
     st.subheader("🏦 交易所实时持仓")
-    try:
-        if hasattr(client, "get_positions"):
-            exchange_positions = client.get_positions(cfg.strategy.underlying.upper())
-        else:
-            exchange_positions = []
-    except Exception as e:
-        exchange_positions = []
-        has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
-        if has_creds:
-            st.warning(f"获取交易所持仓失败: {e}")
-        else:
-            st.caption("未配置 API Key/Secret，跳过交易所私有持仓查询")
-
-    if exchange_positions:
+    if not has_creds:
+        st.caption("未配置 API Key/Secret，跳过交易所私有持仓查询")
+    elif exchange_positions:
+        # Compute total entry value and total unrealized PnL
+        _total_ex_upnl = sum(float(p.get("unrealizedPnl") or 0) for p in exchange_positions)
         ex_rows = []
         for p in exchange_positions:
             ex_rows.append(
@@ -350,8 +396,9 @@ if page == "📊 总览":
                 }
             )
         st.dataframe(pd.DataFrame(ex_rows), width='stretch', hide_index=True)
+        st.caption(f"合计未实现盈亏: **${_total_ex_upnl:,.4f}**  |  持仓数: **{len(exchange_positions)}**")
     else:
-        st.caption("交易所未返回持仓（或当前确实无仓位）")
+        st.caption("交易所当前无持仓")
 
     st.divider()
 
@@ -407,6 +454,38 @@ if page == "📊 总览":
 
 elif page == "📈 资产曲线":
     st.title("📈 资产曲线")
+
+    # Try to get live account data and auto-record a snapshot
+    @st.cache_resource
+    def _get_client_eq(_exchange_cfg) -> BinanceOptionsClient:
+        return BinanceOptionsClient(_exchange_cfg)
+
+    _eq_client = _get_client_eq(cfg.exchange)
+    _eq_has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
+
+    if _eq_has_creds and not cfg.exchange.simulate_private:
+        try:
+            _eq_acct = _eq_client.get_account()
+            if not _eq_acct.raw.get("simulated") and _eq_acct.total_balance > 0:
+                _eq_positions = []
+                try:
+                    _eq_positions = _eq_client.get_positions(cfg.strategy.underlying.upper())
+                except Exception:
+                    pass
+                _eq_upnl = sum(
+                    float(p.get("unrealizedPnl") or p.get("unrealizedPNL") or 0)
+                    for p in _eq_positions
+                ) if _eq_positions else _eq_acct.unrealized_pnl
+                _eq_spot = _eq_client.get_spot_price(cfg.strategy.underlying)
+                storage.record_equity_snapshot(
+                    total_equity=_eq_acct.total_balance,
+                    available_balance=_eq_acct.available_balance,
+                    unrealized_pnl=_eq_upnl,
+                    position_count=len(_eq_positions),
+                    underlying_price=_eq_spot,
+                )
+        except Exception:
+            pass
 
     equity_curve = storage.get_equity_curve(start_date, end_date)
 
