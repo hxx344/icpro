@@ -27,13 +27,23 @@ from options_backtest.analytics.metrics import compute_metrics
 # -----------------------------------------------------------------------
 # Parameters to sweep
 # -----------------------------------------------------------------------
-BASE_CONFIG = "configs/backtest/iron_condor.yaml"
+BASE_CONFIG = "configs/backtest/ic_0dte_8pct_direct.yaml"
 
-# short_otm_pct fixed, vary wing_width (= long_otm_pct - short_otm_pct)
+# short_otm_pct fixed at 1%, vary hedge_otm_pct (= otm + wing_width)
 SHORT_OTM = 0.01  # 1% OTM (matching trader config)
-WING_WIDTHS = [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10]  # 2%~10%
+# wing_width = hedge_otm - otm; we sweep hedge_otm_pct directly
+WING_CONFIGS = [
+    # (wing_label, hedge_otm_pct)  →  wing_width = hedge_otm - otm
+    ("2%",  0.03),   # wing = 3% - 1% = 2%
+    ("3%",  0.04),   # wing = 4% - 1% = 3%
+    ("4%",  0.05),   # wing = 5% - 1% = 4%
+    ("5%",  0.06),   # wing = 6% - 1% = 5%
+    ("6%",  0.07),   # wing = 7% - 1% = 6%
+    ("8%",  0.09),   # wing = 9% - 1% = 8%  (current)
+    ("10%", 0.11),   # wing = 11% - 1% = 10%
+]
 
-# Override to ETH, 0DTE-like (1 day expiry)
+# Override to ETH, 0DTE
 UNDERLYING = "ETH"
 START_DATE = "2025-03-14"
 END_DATE = "2026-03-14"
@@ -41,38 +51,18 @@ END_DATE = "2026-03-14"
 OUTPUT_DIR = Path("reports/wing_width_comparison")
 
 
-def run_single(wing_pct: float) -> dict:
+def run_single(wing_label: str, hedge_otm: float) -> dict:
     """Run one backtest with a specific wing width and return metrics."""
     cfg = Config.from_yaml(BASE_CONFIG)
 
-    # Override config
-    cfg.backtest.underlying = UNDERLYING
-    cfg.backtest.start_date = START_DATE
-    cfg.backtest.end_date = END_DATE
-    cfg.backtest.time_step = "1h"
-    cfg.backtest.use_bs_only = True
-    cfg.backtest.iv_mode = "proxy"
-    cfg.backtest.fixed_iv = 0.65
+    # Override only the hedge_otm_pct, keep everything else from the proven config
+    cfg.strategy.params["hedge_otm_pct"] = hedge_otm
 
-    cfg.account.initial_balance = 1.0  # 1 ETH
+    wing_pct = hedge_otm - cfg.strategy.params.get("otm_pct", SHORT_OTM)
+    label = f"wing_{wing_label}"
 
-    cfg.strategy.name = "IronCondor"
-    long_otm = SHORT_OTM + wing_pct
-    cfg.strategy.params = {
-        "short_otm_pct": SHORT_OTM,
-        "long_otm_pct": long_otm,
-        "min_days_to_expiry": 0,
-        "max_days_to_expiry": 2,
-        "roll_days_before_expiry": 0,
-        "take_profit_pct": 90,
-        "stop_loss_pct": 200,
-        "quantity": 1.0,
-        "max_positions": 1,
-    }
-
-    label = f"wing_{wing_pct*100:.0f}pct"
-    logger.info(f"--- Running backtest: short_otm={SHORT_OTM*100:.0f}%, "
-                f"wing={wing_pct*100:.0f}%, long_otm={long_otm*100:.0f}% ---")
+    logger.info(f"--- Running backtest: otm={cfg.strategy.params.get('otm_pct', SHORT_OTM)*100:.0f}%, "
+                f"hedge_otm={hedge_otm*100:.0f}%, wing={wing_pct*100:.0f}% ---")
 
     from options_backtest.cli import _load_strategy
     strategy = _load_strategy(cfg.strategy.name, cfg.strategy.params)
@@ -83,8 +73,8 @@ def run_single(wing_pct: float) -> dict:
     return {
         "label": label,
         "wing_pct": wing_pct,
-        "short_otm": SHORT_OTM,
-        "long_otm": long_otm,
+        "hedge_otm": hedge_otm,
+        "short_otm": cfg.strategy.params.get("otm_pct", SHORT_OTM),
         "results": results,
         "metrics": metrics,
     }
@@ -98,7 +88,7 @@ def build_comparison_table(all_results: list[dict]) -> pd.DataFrame:
         rows.append({
             "翼宽 (%)": f"{r['wing_pct']*100:.0f}%",
             "Short OTM": f"{r['short_otm']*100:.0f}%",
-            "Long OTM": f"{r['long_otm']*100:.0f}%",
+            "Hedge OTM": f"{r['hedge_otm']*100:.0f}%",
             "总收益率": f"{m.get('total_return', 0)*100:.2f}%",
             "年化收益率": f"{m.get('annualized_return', 0)*100:.2f}%",
             "最大回撤": f"{m.get('max_drawdown', 0)*100:.2f}%",
@@ -142,7 +132,7 @@ def plot_equity_curves(all_results: list[dict], output_path: Path) -> None:
         ts = pd.to_datetime(df["timestamp"], utc=True)
         eq = df["equity"].astype(float)
         color = colors[i % len(colors)]
-        label = f"翼宽 {r['wing_pct']*100:.0f}%"
+        label = f"翼宽 {r['wing_pct']*100:.0f}% (hedge {r['hedge_otm']*100:.0f}%)"
 
         # Coin equity
         fig.add_trace(
@@ -224,9 +214,9 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     all_results = []
-    for wing_pct in WING_WIDTHS:
+    for wing_label, hedge_otm in WING_CONFIGS:
         try:
-            result = run_single(wing_pct)
+            result = run_single(wing_label, hedge_otm)
             all_results.append(result)
         except Exception as e:
             logger.error(f"Failed wing_pct={wing_pct}: {e}")
@@ -254,7 +244,7 @@ def main():
         m = {k: v for k, v in r["metrics"].items() if not isinstance(v, (pd.DataFrame, pd.Series))}
         m["wing_pct"] = r["wing_pct"]
         m["short_otm"] = r["short_otm"]
-        m["long_otm"] = r["long_otm"]
+        m["hedge_otm"] = r["hedge_otm"]
         metrics_json.append(m)
     with open(OUTPUT_DIR / "wing_width_metrics.json", "w") as f:
         json.dump(metrics_json, f, indent=2, default=str)
