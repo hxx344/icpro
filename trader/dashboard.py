@@ -75,6 +75,50 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Login authentication (credentials from env: DASHBOARD_USER / DASHBOARD_PASS)
+# ---------------------------------------------------------------------------
+
+def _check_login() -> bool:
+    """Show login form and validate credentials. Returns True if authenticated."""
+    # Load expected credentials from environment
+    expected_user = os.environ.get("DASHBOARD_USER", "").strip()
+    expected_pass = os.environ.get("DASHBOARD_PASS", "").strip()
+
+    # If no credentials configured, skip auth
+    if not expected_user or not expected_pass:
+        return True
+
+    # Already authenticated this session
+    if st.session_state.get("authenticated"):
+        return True
+
+    # --- Login form ---
+    st.markdown(
+        "<h2 style='text-align:center; margin-top:80px;'>🦅 铁鹰交易面板</h2>"
+        "<p style='text-align:center; color:#888;'>请输入用户名和密码登录</p>",
+        unsafe_allow_html=True,
+    )
+    _col_l, col_form, _col_r = st.columns([1, 1.5, 1])
+    with col_form:
+        with st.form("login_form"):
+            username = st.text_input("用户名")
+            password = st.text_input("密码", type="password")
+            submitted = st.form_submit_button("登录", width='stretch', type="primary")
+
+        if submitted:
+            if username == expected_user and password == expected_pass:
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("用户名或密码错误")
+
+    return False
+
+
+if not _check_login():
+    st.stop()
+
+# ---------------------------------------------------------------------------
 # Config & Storage initialization
 # ---------------------------------------------------------------------------
 
@@ -149,18 +193,18 @@ elif engine.is_running:
 
     col_stop, col_close = st.sidebar.columns(2)
     with col_stop:
-        if st.button("⏹ 停止引擎", use_container_width=True, type="secondary"):
+        if st.button("⏹ 停止引擎", width='stretch', type="secondary"):
             engine.stop()
             st.rerun()
     with col_close:
-        if st.button("🚨 全部平仓", use_container_width=True, type="primary"):
+        if st.button("🚨 全部平仓", width='stretch', type="primary"):
             pnl = engine.close_all_positions()
             st.sidebar.info(f"已平仓, PnL: ${pnl:,.4f}")
             st.rerun()
 else:
     if is_trade_mode:
         st.sidebar.error("🔴 引擎未运行")
-        if st.sidebar.button("🚀 启动引擎", use_container_width=True, type="primary"):
+        if st.sidebar.button("🚀 启动引擎", width='stretch', type="primary"):
             ok = engine.start()
             if ok:
                 st.sidebar.success("引擎已启动!")
@@ -208,7 +252,7 @@ if auto_refresh:
     st.sidebar.caption(f"每 {refresh_sec} 秒自动刷新")
 
 # Manual refresh
-if st.sidebar.button("🔄 立即刷新", use_container_width=True):
+if st.sidebar.button("🔄 立即刷新", width='stretch'):
     st.rerun()
 
 # --------------------------------------------------------------------------
@@ -445,7 +489,7 @@ if page == "📊 总览":
         )
         fig_mini.update_xaxes(gridcolor="rgba(255,255,255,0.06)", tickfont=dict(color="#b0b0b0"))
         fig_mini.update_yaxes(gridcolor="rgba(255,255,255,0.06)", tickfont=dict(color="#b0b0b0"))
-        st.plotly_chart(fig_mini, use_container_width=True)
+        st.plotly_chart(fig_mini, width='stretch')
 
 
 # ==========================================================================
@@ -623,7 +667,7 @@ elif page == "📈 资产曲线":
         fig.update_yaxes(title_text="回撤 %", autorange="reversed", row=3, col=1)
         fig.update_xaxes(rangeslider_visible=False)
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
         # ======== Position count + underlying overlay ========
         has_ul = "underlying_price" in df.columns and df["underlying_price"].sum() > 0
@@ -663,7 +707,7 @@ elif page == "📈 资产曲线":
             fig2.update_xaxes(**_dark_axis)
             fig2.update_yaxes(title_text="标的价格 (USD)", secondary_y=False, **_dark_axis)
             fig2.update_yaxes(title_text="持仓数", secondary_y=True, **_dark_axis)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width='stretch')
         else:
             # Position count only
             fig_pos = go.Figure()
@@ -680,7 +724,7 @@ elif page == "📈 资产曲线":
             )
             fig_pos.update_xaxes(**_dark_axis)
             fig_pos.update_yaxes(**_dark_axis)
-            st.plotly_chart(fig_pos, use_container_width=True)
+            st.plotly_chart(fig_pos, width='stretch')
 
 
 # ==========================================================================
@@ -738,7 +782,7 @@ elif page == "💰 损益记录":
             height=350, margin=dict(l=50, r=20, t=10, b=20),
             yaxis_title="USD",
         )
-        st.plotly_chart(fig_pnl, use_container_width=True)
+        st.plotly_chart(fig_pnl, width='stretch')
 
         # --- Cumulative PnL chart ---
         st.subheader("📈 累计已实现 PnL")
@@ -746,7 +790,7 @@ elif page == "💰 损益记录":
                           color_discrete_sequence=["#8884d8"])
         fig_cum.update_layout(height=250, margin=dict(l=50, r=20, t=10, b=20),
                               yaxis_title="USD")
-        st.plotly_chart(fig_cum, use_container_width=True)
+        st.plotly_chart(fig_cum, width='stretch')
 
         # --- Daily return distribution ---
         st.subheader("📊 日收益率分布")
@@ -754,7 +798,7 @@ elif page == "💰 损益记录":
                                 color_discrete_sequence=["#00C49A"],
                                 labels={"daily_return_pct": "日收益率 (%)"})
         fig_hist.update_layout(height=250, margin=dict(l=50, r=20, t=10, b=20))
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width='stretch')
 
         # --- Daily PnL table ---
         st.subheader("📋 每日明细")
@@ -1042,7 +1086,7 @@ elif page == "🔧 策略配置":
         st.divider()
         _save_col1, _save_col2 = st.columns([1, 4])
         with _save_col1:
-            _submitted = st.form_submit_button("💾 保存配置", use_container_width=True, type="primary")
+            _submitted = st.form_submit_button("💾 保存配置", width='stretch', type="primary")
         with _save_col2:
             st.caption("保存后需要重启引擎才能生效")
 
@@ -1238,12 +1282,12 @@ elif page == "🖥 引擎状态":
 
     with col_a1:
         if es["running"]:
-            if st.button("⏹ 停止引擎", use_container_width=True, type="secondary",
+            if st.button("⏹ 停止引擎", width='stretch', type="secondary",
                           disabled=not is_trade_mode):
                 engine.stop()
                 st.rerun()
         else:
-            if st.button("🚀 启动引擎", use_container_width=True, type="primary",
+            if st.button("🚀 启动引擎", width='stretch', type="primary",
                           disabled=not is_trade_mode):
                 ok = engine.start()
                 if not ok:
@@ -1251,14 +1295,14 @@ elif page == "🖥 引擎状态":
                 st.rerun()
 
     with col_a2:
-        if st.button("🚨 紧急全部平仓", use_container_width=True, type="primary",
+        if st.button("🚨 紧急全部平仓", width='stretch', type="primary",
                       disabled=(not es["running"] or not is_trade_mode)):
             pnl = engine.close_all_positions()
             st.success(f"已平仓, PnL: ${pnl:,.4f}")
             st.rerun()
 
     with col_a3:
-        if st.button("🔄 重置引擎", use_container_width=True,
+        if st.button("🔄 重置引擎", width='stretch',
                       disabled=(es["running"] or not is_trade_mode),
                       help="停止并释放引擎实例，下次启动将重新初始化"):
             reset_engine()
