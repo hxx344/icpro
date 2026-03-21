@@ -5,7 +5,7 @@
 ## 安装
 
 ```bash
-pip install -e ".[dev]"
+python -m pip install -e ".[dev,trader]"
 ```
 
 ### Ubuntu 命令清单（从 0 到启动）
@@ -23,7 +23,7 @@ source .venv/bin/activate
 
 # 4) 安装项目依赖
 python -m pip install -U pip setuptools wheel
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,trader]"
 
 # 5) 配置 API 环境变量
 cp .env.example .env
