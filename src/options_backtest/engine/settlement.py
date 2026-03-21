@@ -26,6 +26,7 @@ def check_and_settle(
     settlements_df: pd.DataFrame,
     *,
     margin_usd: bool = False,
+    settlement_index: dict[str, float] | None = None,
 ) -> list[str]:
     """Check for expired positions and settle them.
 
@@ -37,6 +38,7 @@ def check_and_settle(
     matcher : used for delivery fee calculation
     instruments : instrument catalogue (DataFrame or pre-built dict[name→row])
     settlements_df : settlement / delivery prices
+    settlement_index : optional pre-built dict[instrument_name → index_price] for O(1) lookup
 
     Returns
     -------
@@ -59,8 +61,15 @@ def check_and_settle(
             if inst_data is None:
                 continue
             # inst_data is a dict
-            exp_col = "expiration_timestamp" if "expiration_timestamp" in inst_data else "expiration_date"
-            expiry = to_utc_timestamp(inst_data[exp_col])
+            # Fast path: use pre-computed _expiry_ns (nanoseconds)
+            exp_ns = inst_data.get("_expiry_ns")
+            if exp_ns is not None:
+                # Deribit settles at UTC 08:00 on expiry date
+                # Convert ns to pd.Timestamp for settlement_time calculation
+                expiry = pd.Timestamp(exp_ns, unit="ns", tz="UTC")
+            else:
+                exp_col = "expiration_timestamp" if "expiration_timestamp" in inst_data else "expiration_date"
+                expiry = to_utc_timestamp(inst_data[exp_col])
             strike = inst_data.get("strike_price", inst_data.get("strike", 0))
             opt_type_raw = inst_data.get("option_type", "call")
         else:
@@ -79,8 +88,13 @@ def check_and_settle(
         if ts < settlement_time:
             continue
 
-        # Find settlement price
-        settlement_price = _find_settlement_price(settlements_df, expiry, name)
+        # Fast path: use pre-built settlement index (O(1) dict lookup)
+        settlement_price = None
+        if settlement_index is not None:
+            settlement_price = settlement_index.get(name)
+        # Fallback to DataFrame scan if not found
+        if settlement_price is None:
+            settlement_price = _find_settlement_price(settlements_df, expiry, name)
         if settlement_price is None:
             logger.warning(f"No settlement price found for {name}, skipping")
             continue

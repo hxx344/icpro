@@ -16,7 +16,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from options_backtest.config import Config
-from options_backtest.data.loader import DataLoader
+from options_backtest.data.loader import DataLoader, ArrayChain
 from options_backtest.engine.account import Account
 from options_backtest.engine.matcher import Matcher
 from options_backtest.engine.position import PositionManager
@@ -80,13 +80,13 @@ class StrategyContext:
         self._ts_ns = _ts_ns
 
     @property
-    def option_chain(self) -> pd.DataFrame:
+    def option_chain(self):
         """Lazy-build option chain on first access."""
         if self._option_chain is None:
             if self._chain_builder is not None:
                 self._option_chain = self._chain_builder()
             else:
-                self._option_chain = pd.DataFrame()
+                self._option_chain = ArrayChain({}, 0)
         return self._option_chain
 
     def get_instrument_dte(self, instrument_name: str) -> float:
@@ -175,6 +175,9 @@ class BacktestEngine:
         # Pre-indexed data for fast lookups (built in _load_data)
         self._ohlcv_index: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         self._instrument_dict: dict[str, dict] = {}
+        self._settlement_index: dict[str, float] = {}  # instrument_name → index_price
+        # Arithmetic OHLCV index: name → (start_ns, step_ns, length, close, low, high, vol)
+        self._ohlcv_arith: dict[str, tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         self._iv_observations: dict[str, tuple[int, float]] = {}
         self._realized_vol_ts: np.ndarray = np.array([], dtype="datetime64[ns]")
         self._realized_vol_values: np.ndarray = np.array([], dtype=float)
@@ -259,6 +262,7 @@ class BacktestEngine:
                     ts_np, position_mgr, account,
                     matcher, instrument_dict, settlements_df,
                     margin_usd=self._margin_usd,
+                    settlement_index=self._settlement_index,
                 )
 
             # 4c. Build context (lazy chain) and call strategy
@@ -350,6 +354,8 @@ class BacktestEngine:
 
         # --- Pre-build OHLCV index: numpy arrays for O(log n) searchsorted ---
         self._ohlcv_index = {}
+        self._ohlcv_arith = {}       # O(1) arithmetic index for regular grids
+        _HOUR_NS = 3600 * 1_000_000_000
         for name, df in self._option_data.items():
             ts_arr = np.asarray(df["timestamp"].values)  # sorted datetime64
             close_arr = np.asarray(df["close"].values, dtype=np.float64)
@@ -361,13 +367,53 @@ class BacktestEngine:
                        if "volume" in df.columns else np.zeros(len(df), dtype=np.float64))
             self._ohlcv_index[name] = (ts_arr, close_arr, low_arr, high_arr, vol_arr)
 
+            # Build O(1) arithmetic index for regularly-spaced (hourly) grids
+            n_rows = len(ts_arr)
+            if n_rows >= 2:
+                ts_ns = ts_arr.view("int64")  # zero-copy view
+                start_ns = int(ts_ns[0])
+                step_ns = int(ts_ns[1] - ts_ns[0])
+                if step_ns > 0:
+                    # Check regularity: all steps should equal step_ns
+                    expected_end_ns = start_ns + step_ns * (n_rows - 1)
+                    if int(ts_ns[-1]) == expected_end_ns:
+                        # Regular grid → O(1) index
+                        self._ohlcv_arith[name] = (
+                            start_ns, step_ns, n_rows,
+                            close_arr, low_arr, high_arr, vol_arr,
+                        )
+            elif n_rows == 1:
+                ts_ns = ts_arr.view("int64")  # zero-copy view
+                self._ohlcv_arith[name] = (
+                    int(ts_ns[0]), _HOUR_NS, 1,
+                    close_arr, low_arr, high_arr, vol_arr,
+                )
+
         # --- Pre-build instrument dict for O(1) lookup (fast vectorised) ---
         records = self._instruments_df.to_dict(orient="records")
         names_list = self._instruments_df["instrument_name"].tolist()
         self._instrument_dict = {names_list[i]: records[i] for i in range(len(names_list))}
 
+        # --- Pre-extract instrument columns as numpy arrays for build_option_chain ---
+        idf = self._instruments_df
+        self._inst_arrays = {
+            "instrument_name": idf["instrument_name"].values,
+            "_expiry_ns": idf["_expiry_ns"].values if "_expiry_ns" in idf.columns else None,
+            "strike_price": idf["strike_price"].values.astype(np.float64),
+            "option_type": idf["option_type"].values,
+            "_expiry_dt": idf["_expiry_dt"].values if "_expiry_dt" in idf.columns else None,
+        }
+
+        # --- Pre-build settlement index: instrument_name → index_price (O(1) lookup) ---
+        self._settlement_index = {}
+        sdf = self._settlements_df
+        if not sdf.empty and "instrument_name" in sdf.columns and "index_price" in sdf.columns:
+            for inst_name, idx_price in zip(sdf["instrument_name"].values, sdf["index_price"].values):
+                self._settlement_index[str(inst_name)] = float(idx_price)
+
         logger.info(f"Pre-indexed {len(self._ohlcv_index)} OHLCV series, "
-                    f"{len(self._instrument_dict)} instruments")
+                    f"{len(self._instrument_dict)} instruments, "
+                    f"{len(self._settlement_index)} settlement prices")
 
     # ------------------------------------------------------------------
     # Context helpers
@@ -383,6 +429,8 @@ class BacktestEngine:
                 ohlcv_index=self._ohlcv_index,
                 source_counter=sc,
                 prefer_market_data=not self.config.backtest.use_bs_only,
+                ohlcv_arith=self._ohlcv_arith,
+                inst_arrays=self._inst_arrays,
             )
             self._chain_source_market += sc["market"]
             self._chain_source_synth += sc["synth"]
@@ -410,14 +458,31 @@ class BacktestEngine:
         """
         marks: dict[str, float] = {}
         ohlcv_index = self._ohlcv_index
+        ohlcv_arith = self._ohlcv_arith
         use_market_data = not self.config.backtest.use_bs_only
         margin_usd = self._margin_usd
         # Pre-compute values needed for synthetic fallback (avoid per-position overhead)
         _ts_ns_val = int(np.datetime64(ts_np, 'ns').view('int64')) if not isinstance(ts_np, (int, np.integer)) else int(ts_np)
 
         for name in self.position_mgr.positions:
-            # Try pre-indexed OHLCV data first (O(log n) via searchsorted)
+            # Try O(1) arithmetic index first (regular hourly grids)
             if use_market_data:
+                arith = ohlcv_arith.get(name)
+                if arith is not None:
+                    start_ns, step_ns, a_len, a_close = arith[0], arith[1], arith[2], arith[3]
+                    j = (_ts_ns_val - start_ns) // step_ns
+                    if j < 0:
+                        j = -1
+                    elif j >= a_len:
+                        j = a_len - 1
+                    if j >= 0:
+                        market_mark = float(a_close[j])
+                        self._mark_source_market += 1
+                        self._update_iv_observation(name, ts_np, market_mark, underlying_price)
+                        marks[name] = market_mark * underlying_price if margin_usd else market_mark
+                        continue
+
+                # Fallback: O(log n) searchsorted
                 idx_data = ohlcv_index.get(name)
                 if idx_data is not None:
                     ts_arr, close_arr = idx_data[0], idx_data[1]
@@ -426,7 +491,6 @@ class BacktestEngine:
                         market_mark = float(close_arr[j])
                         self._mark_source_market += 1
                         self._update_iv_observation(name, ts_np, market_mark, underlying_price)
-                        # OHLCV is in coin; convert to USD if needed
                         marks[name] = market_mark * underlying_price if margin_usd else market_mark
                         continue
 
@@ -494,6 +558,27 @@ class BacktestEngine:
         """
         margin_usd = self._margin_usd
         if not self.config.backtest.use_bs_only:
+            # O(1) arithmetic index for regular grids
+            arith = self._ohlcv_arith.get(instrument_name)
+            if arith is not None:
+                start_ns, step_ns, a_len, a_close, a_low, a_high, _ = arith
+                _ts_ns = int(np.datetime64(ts_np, 'ns').view('int64')) if not isinstance(ts_np, (int, np.integer)) else int(ts_np)
+                j = (_ts_ns - start_ns) // step_ns
+                if j < 0:
+                    j = -1
+                elif j >= a_len:
+                    j = a_len - 1
+                if j >= 0:
+                    market_mark = float(a_close[j])
+                    self._quote_source_market += 1
+                    self._update_iv_observation(instrument_name, ts_np, market_mark, underlying_price)
+                    if margin_usd:
+                        return (float(a_low[j]) * underlying_price,
+                                float(a_high[j]) * underlying_price,
+                                market_mark * underlying_price)
+                    return float(a_low[j]), float(a_high[j]), market_mark
+
+            # Fallback: O(log n) searchsorted
             idx_data = self._ohlcv_index.get(instrument_name)
             if idx_data is not None:
                 ts_arr, close_arr, low_arr, high_arr, _ = idx_data

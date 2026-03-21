@@ -19,6 +19,80 @@ from loguru import logger
 
 from options_backtest.utils import to_utc_timestamp
 
+
+class _ValuesView:
+    """Tiny proxy so that ``chain['col'].values`` returns the array itself."""
+    __slots__ = ("_arr",)
+
+    def __init__(self, arr: np.ndarray):
+        self._arr = arr
+
+    @property
+    def values(self) -> np.ndarray:
+        return self._arr
+
+    # forward .astype so ``chain['col'].values.astype(float)`` works
+    def astype(self, dtype):
+        return self._arr.astype(dtype)
+
+    # pandas-like .str accessor for long_call.py compatibility
+    @property
+    def str(self):
+        return pd.Series(self._arr).str
+
+    # Comparison operators (return numpy bool arrays for boolean indexing)
+    def __eq__(self, other):  return self._arr == other  # noqa: E704
+    def __ne__(self, other):  return self._arr != other  # noqa: E704
+    def __ge__(self, other):  return self._arr >= other  # noqa: E704
+    def __le__(self, other):  return self._arr <= other  # noqa: E704
+    def __gt__(self, other):  return self._arr > other   # noqa: E704
+    def __lt__(self, other):  return self._arr < other   # noqa: E704
+    def __hash__(self):       return id(self)             # noqa: E704
+
+
+class ArrayChain:
+    """Lightweight option-chain container backed by numpy arrays.
+
+    Supports the same ``chain['col'].values`` and ``chain.empty``
+    interface used by all strategies, but avoids the ~5 s overhead of
+    constructing a pandas DataFrame every bar.
+    """
+    __slots__ = ("_data", "_len")
+
+    def __init__(self, data: dict[str, np.ndarray], length: int):
+        self._data = data
+        self._len = length
+
+    # chain['col'] returns a _ValuesView or raw array
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            arr = self._data[key]
+            return _ValuesView(arr)
+        # Boolean indexing: chain[mask] → convert to DataFrame and filter
+        return self._to_dataframe()[key]
+
+    # chain.empty
+    @property
+    def empty(self) -> bool:
+        return self._len == 0
+
+    def __len__(self) -> int:
+        return self._len
+
+    # Pandas boolean-index filter support for long_call.py:
+    #   chain[chain['option_type'].str.lower().str.startswith('c')]
+    def __getattr__(self, name):
+        # Fallback: convert to DataFrame for legacy code paths
+        return getattr(self._to_dataframe(), name)
+
+    def _to_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame(self._data)
+
+    # Support iteration over column names (rarely needed)
+    @property
+    def columns(self):
+        return list(self._data.keys())
+
 # ---------------------------------------------------------------------------
 # Module-level in-memory cache (survives across BacktestEngine instances
 # within the same Python process – extremely useful for parameter sweeps).
@@ -311,7 +385,10 @@ class DataLoader:
         ohlcv_index: dict | None = None,
         source_counter: dict | None = None,
         prefer_market_data: bool = True,
-    ) -> pd.DataFrame:
+        ohlcv_cursor: dict | None = None,
+        ohlcv_arith: dict | None = None,
+        inst_arrays: dict | None = None,
+    ) -> "ArrayChain":
         """Build an option‑chain snapshot – **fully vectorised**.
 
         All filtering + Black‑76 pricing is done via NumPy / pandas
@@ -322,52 +399,67 @@ class DataLoader:
         ohlcv_index : optional pre-indexed dict mapping instrument name to
             (ts_arr, close_arr, low_arr, high_arr, vol_arr) numpy arrays.
             When provided, uses O(log n) searchsorted instead of boolean masks.
+        ohlcv_arith : optional pre-built dict mapping instrument name to
+            (start_ns, step_ns, length, close, low, high, vol) for O(1)
+            arithmetic index lookups on regular hourly grids.
+        inst_arrays : optional pre-extracted dict of numpy arrays from
+            instruments_df, avoids per-call DataFrame column lookups.
         """
         from options_backtest.pricing.black76 import call_price_vec, put_price_vec
 
         ts = to_utc_timestamp(timestamp)
 
         if instruments_df.empty:
-            return pd.DataFrame()
+            return ArrayChain({}, 0)
+
+        # --- Use pre-extracted arrays if available, else pull from DataFrame ---
+        _ia = inst_arrays
+        if _ia is not None and _ia.get("_expiry_ns") is not None:
+            exp_ns = _ia["_expiry_ns"]
+            strikes_arr = _ia["strike_price"]
+            all_names = _ia["instrument_name"]
+            all_opt_types = _ia["option_type"]
+            all_exp_dt = _ia.get("_expiry_dt")
+        else:
+            exp_ns = instruments_df["_expiry_ns"].values if "_expiry_ns" in instruments_df.columns else None
+            strikes_arr = instruments_df["strike_price"].values
+            all_names = instruments_df["instrument_name"].values
+            all_opt_types = instruments_df["option_type"].values
+            all_exp_dt = instruments_df["_expiry_dt"].values if "_expiry_dt" in instruments_df.columns else None
 
         # --- Fast numpy filtering (avoids pd.Series arithmetic) ----------------
-        if "_expiry_ns" in instruments_df.columns:
+        if exp_ns is not None:
             # Pure numpy DTE calculation using pre-computed int64 nanoseconds
-            exp_ns = instruments_df["_expiry_ns"].values  # int64
             ts_ns = ts.value  # nanoseconds since epoch
             dte_ns = exp_ns - ts_ns
             dte_days = dte_ns / (86400 * 1_000_000_000)  # ns → days (float)
-            strikes_arr = instruments_df["strike_price"].values
             mask_np = ((dte_ns > 0) & (dte_days <= max_dte)
                        & (strikes_arr >= underlying_price * 0.3)
                        & (strikes_arr <= underlying_price * 3.0))
-            mask = pd.Series(mask_np, index=instruments_df.index)
         else:
             exp_col = "expiration_timestamp" if "expiration_timestamp" in instruments_df.columns else "expiration_date"
             exps = pd.to_datetime(instruments_df[exp_col], utc=True)
             dte_seconds = (exps - ts).dt.total_seconds()
             dte_days_s = dte_seconds / 86400.0
-            strike_col = "strike_price" if "strike_price" in instruments_df.columns else "strike"
-            strikes_s = instruments_df[strike_col]
-            mask = ((dte_seconds > 0) & (dte_days_s <= max_dte)
-                    & (strikes_s >= underlying_price * 0.3)
-                    & (strikes_s <= underlying_price * 3.0))
+            mask_np = ((dte_seconds > 0).values & (dte_days_s <= max_dte).values
+                       & (strikes_arr >= underlying_price * 0.3)
+                       & (strikes_arr <= underlying_price * 3.0))
             dte_days = dte_days_s.values
 
-        idx_arr = np.flatnonzero(mask.values if hasattr(mask, 'values') else mask)
+        idx_arr = np.flatnonzero(mask_np)
         if len(idx_arr) == 0:
-            return pd.DataFrame()
+            return ArrayChain({}, 0)
 
         # --- Build chain from numpy arrays (avoid full DataFrame copy) ---------
-        names = instruments_df["instrument_name"].values[idx_arr]
+        names = all_names[idx_arr]
         n = len(names)
         dte_vals = dte_days[idx_arr] if isinstance(dte_days, np.ndarray) else dte_days.values[idx_arr]
         dte_vals = np.maximum(dte_vals, 0.001)
-        strike_vals = instruments_df["strike_price"].values[idx_arr]
-        opt_type_vals = instruments_df["option_type"].values[idx_arr]
+        strike_vals = strikes_arr[idx_arr]
+        opt_type_vals = all_opt_types[idx_arr]
 
-        if "_expiry_dt" in instruments_df.columns:
-            exp_dt_vals = instruments_df["_expiry_dt"].values[idx_arr]
+        if all_exp_dt is not None:
+            exp_dt_vals = all_exp_dt[idx_arr]
         else:
             exp_col = "expiration_timestamp" if "expiration_timestamp" in instruments_df.columns else "expiration_date"
             exp_dt_vals = pd.to_datetime(instruments_df[exp_col].values[idx_arr], utc=True)
@@ -379,19 +471,42 @@ class DataLoader:
         vol_arr = np.zeros(n)
 
         if prefer_market_data:
-            if ohlcv_index:
+            if ohlcv_arith or ohlcv_index:
                 ts_np = ts.to_datetime64() if hasattr(ts, "to_datetime64") else np.datetime64(ts)
+                ts_ns_val = int(np.datetime64(ts_np, "ns").view("int64"))
+                _arith_get = ohlcv_arith.get if ohlcv_arith else None
+                _ohlcv_get = ohlcv_index.get if ohlcv_index else None
                 for i in range(n):
-                    idx_data = ohlcv_index.get(names[i])
-                    if idx_data is None:
-                        continue
-                    ts_a, close_a, low_a, high_a, vol_a = idx_data
-                    j = np.searchsorted(ts_a, ts_np, side="right") - 1
-                    if j >= 0:
-                        mark_arr[i] = close_a[j]
-                        bid_arr[i] = low_a[j]
-                        ask_arr[i] = high_a[j]
-                        vol_arr[i] = vol_a[j]
+                    nm = names[i]
+                    # Fast path: O(1) arithmetic index for regular grids
+                    if _arith_get is not None:
+                        arith = _arith_get(nm)
+                        if arith is not None:
+                            start_ns, step_ns, a_len, a_close, a_low, a_high, a_vol = arith
+                            j = (ts_ns_val - start_ns) // step_ns
+                            if 0 <= j < a_len:
+                                mark_arr[i] = a_close[j]
+                                bid_arr[i] = a_low[j]
+                                ask_arr[i] = a_high[j]
+                                vol_arr[i] = a_vol[j]
+                            elif j >= a_len:
+                                # past end: use last available
+                                mark_arr[i] = a_close[a_len - 1]
+                                bid_arr[i] = a_low[a_len - 1]
+                                ask_arr[i] = a_high[a_len - 1]
+                                vol_arr[i] = a_vol[a_len - 1]
+                            continue
+                    # Fallback: O(log n) searchsorted for irregular grids
+                    if _ohlcv_get is not None:
+                        idx_data = _ohlcv_get(nm)
+                        if idx_data is not None:
+                            ts_a, close_a, low_a, high_a, vol_a_arr = idx_data
+                            j = int(np.searchsorted(ts_a, ts_np, side="right")) - 1
+                            if j >= 0:
+                                mark_arr[i] = close_a[j]
+                                bid_arr[i] = low_a[j]
+                                ask_arr[i] = high_a[j]
+                                vol_arr[i] = vol_a_arr[j]
             elif option_data:
                 ts_np64 = ts.to_datetime64() if hasattr(ts, "to_datetime64") else np.datetime64(ts)
                 for i, name in enumerate(names):
@@ -428,10 +543,10 @@ class DataLoader:
             bid_arr[need_synth] = np.maximum(synth_mark * 0.98, 0.0)
             ask_arr[need_synth] = synth_mark * 1.02
 
-        # --- Build result DataFrame directly from arrays -----------------------
-        chain = pd.DataFrame({
+        # --- Build lightweight ArrayChain (no pandas overhead) ----------------
+        chain = ArrayChain({
             "instrument_name": names,
-            "underlying_price": underlying_price,
+            "underlying_price": np.full(n, underlying_price),
             "strike_price": strike_vals,
             "option_type": opt_type_vals,
             "expiration_date": exp_dt_vals,
@@ -440,6 +555,5 @@ class DataLoader:
             "bid_price": bid_arr,
             "ask_price": ask_arr,
             "volume": vol_arr,
-        })
-        chain = chain.sort_values(["expiration_date", "strike_price"]).reset_index(drop=True) if "_expiry_ns" not in instruments_df.columns else chain.reset_index(drop=True)
+        }, n)
         return chain
