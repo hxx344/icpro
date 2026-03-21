@@ -328,7 +328,7 @@ if page == "📊 总览":
         if hasattr(client, "get_positions"):
             exchange_positions = client.get_positions(cfg.strategy.underlying.upper())
         else:
-            raise AttributeError("client.get_positions 不存在")
+            exchange_positions = []
     except Exception as e:
         exchange_positions = []
         has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
