@@ -1426,7 +1426,7 @@ elif page == "🔧 策略配置":
                     showlegend=False,
                 )
 
-                st.plotly_chart(_fig, use_container_width=True)
+                st.plotly_chart(_fig, width='stretch')
 
                 # Text summary
                 with st.expander("📊 完整计算明细"):
