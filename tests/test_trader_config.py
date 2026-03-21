@@ -1,0 +1,214 @@
+"""Tests for trader.config — 配置管理单元测试.
+
+覆盖:
+  - ExchangeConfig 默认值 & __post_init__
+  - 环境变量覆盖
+  - TraderConfig 向后兼容 (deribit alias)
+  - load_config YAML 加载
+  - legacy client_id/client_secret 映射
+  - 缺失文件处理
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+import yaml
+
+from trader.config import (
+    ExchangeConfig,
+    DeribitConfig,  # backward compat alias
+    StrategyConfig,
+    StorageConfig,
+    MonitorConfig,
+    TraderConfig,
+    load_config,
+)
+
+
+# ======================================================================
+# 1. ExchangeConfig
+# ======================================================================
+
+
+class TestExchangeConfig:
+    def test_defaults(self):
+        cfg = ExchangeConfig()
+        assert cfg.testnet is True
+        assert cfg.timeout == 10
+        assert cfg.account_currency == "USDT"
+        assert cfg.simulate_private is False
+
+    def test_testnet_url(self):
+        cfg = ExchangeConfig(testnet=True)
+        assert "testnet" in cfg.base_url
+
+    def test_prod_url(self):
+        cfg = ExchangeConfig(testnet=False)
+        assert "eapi.binance.com" in cfg.base_url
+
+    def test_custom_base_url_not_overwritten(self):
+        """显式指定 base_url 时不被 __post_init__ 覆盖."""
+        cfg = ExchangeConfig(base_url="https://custom.api.com", testnet=True)
+        assert cfg.base_url == "https://custom.api.com"
+
+    def test_env_vars_override(self, monkeypatch):
+        """环境变量 BINANCE_API_KEY / BINANCE_API_SECRET 应覆盖字段."""
+        monkeypatch.setenv("BINANCE_API_KEY", "env_key_123")
+        monkeypatch.setenv("BINANCE_API_SECRET", "env_secret_456")
+        cfg = ExchangeConfig(api_key="yaml_key", api_secret="yaml_secret")
+        assert cfg.api_key == "env_key_123"
+        assert cfg.api_secret == "env_secret_456"
+
+    def test_env_vars_not_set(self, monkeypatch):
+        """环境变量不存在时保留 YAML 值."""
+        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+        cfg = ExchangeConfig(api_key="from_yaml", api_secret="from_yaml_secret")
+        assert cfg.api_key == "from_yaml"
+        assert cfg.api_secret == "from_yaml_secret"
+
+    def test_backward_compat_alias(self):
+        """DeribitConfig 应是 ExchangeConfig 的别名."""
+        assert DeribitConfig is ExchangeConfig
+
+
+# ======================================================================
+# 2. StrategyConfig / StorageConfig / MonitorConfig
+# ======================================================================
+
+
+class TestStrategyConfig:
+    def test_defaults(self):
+        cfg = StrategyConfig()
+        assert cfg.underlying == "ETH"
+        assert cfg.otm_pct == 0.08
+        assert cfg.wing_width_pct == 0.02
+        assert cfg.entry_time_utc == "08:00"
+        assert cfg.compound is True
+
+
+class TestStorageConfig:
+    def test_defaults(self):
+        cfg = StorageConfig()
+        assert cfg.log_level == "INFO"
+
+
+class TestMonitorConfig:
+    def test_defaults(self):
+        cfg = MonitorConfig()
+        assert cfg.check_interval_sec == 60
+        assert cfg.heartbeat_interval_sec == 300
+
+
+# ======================================================================
+# 3. TraderConfig
+# ======================================================================
+
+
+class TestTraderConfig:
+    def test_defaults(self):
+        cfg = TraderConfig()
+        assert isinstance(cfg.exchange, ExchangeConfig)
+        assert isinstance(cfg.strategy, StrategyConfig)
+
+    def test_deribit_alias(self):
+        """cfg.deribit 应返回 cfg.exchange (向后兼容)."""
+        cfg = TraderConfig()
+        assert cfg.deribit is cfg.exchange
+
+
+# ======================================================================
+# 4. load_config
+# ======================================================================
+
+
+class TestLoadConfig:
+    def test_load_none(self):
+        """path=None 返回全部默认值."""
+        cfg = load_config(None)
+        assert cfg.name == "Iron Condor 0DTE +8%"
+        assert cfg.exchange.testnet is True
+
+    def test_load_missing_file(self, tmp_path):
+        """文件不存在时使用默认值 (不报错)."""
+        cfg = load_config(tmp_path / "nonexistent.yaml")
+        assert cfg.name == "Iron Condor 0DTE +8%"
+
+    def test_load_yaml(self, tmp_path, monkeypatch):
+        """从 YAML 加载配置并合并."""
+        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+
+        config_data = {
+            "name": "Test Strategy",
+            "exchange": {
+                "api_key": "yaml_key",
+                "api_secret": "yaml_secret",
+                "testnet": False,
+                "account_currency": "USDT",
+            },
+            "strategy": {
+                "underlying": "BTC",
+                "otm_pct": 0.10,
+            },
+        }
+        yaml_path = tmp_path / "test_config.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.dump(config_data, f)
+
+        cfg = load_config(yaml_path)
+        assert cfg.name == "Test Strategy"
+        assert cfg.exchange.api_key == "yaml_key"
+        assert cfg.exchange.testnet is False
+        assert "eapi.binance.com" in cfg.exchange.base_url
+        assert cfg.strategy.underlying == "BTC"
+        assert cfg.strategy.otm_pct == 0.10
+
+    def test_load_legacy_deribit_key(self, tmp_path, monkeypatch):
+        """旧格式 'deribit' YAML key 也能正确加载."""
+        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+
+        config_data = {
+            "deribit": {
+                "api_key": "legacy_key",
+                "api_secret": "legacy_secret",
+            }
+        }
+        yaml_path = tmp_path / "legacy.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.dump(config_data, f)
+
+        cfg = load_config(yaml_path)
+        assert cfg.exchange.api_key == "legacy_key"
+
+    def test_load_empty_yaml(self, tmp_path):
+        """空 YAML 文件不报错."""
+        yaml_path = tmp_path / "empty.yaml"
+        yaml_path.write_text("")
+        cfg = load_config(yaml_path)
+        assert cfg.name == "Iron Condor 0DTE +8%"
+
+    def test_all_sections_merge(self, tmp_path, monkeypatch):
+        """所有配置节都能正确合并."""
+        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+
+        config_data = {
+            "strategy": {"quantity": 0.5, "max_positions": 3},
+            "storage": {"log_level": "DEBUG"},
+            "monitor": {"check_interval_sec": 30},
+        }
+        yaml_path = tmp_path / "full.yaml"
+        with open(yaml_path, "w") as f:
+            yaml.dump(config_data, f)
+
+        cfg = load_config(yaml_path)
+        assert cfg.strategy.quantity == 0.5
+        assert cfg.strategy.max_positions == 3
+        assert cfg.storage.log_level == "DEBUG"
+        assert cfg.monitor.check_interval_sec == 30

@@ -1,0 +1,43 @@
+backtest:
+  name: "ETH Naked Call 12m + Protective Call"
+  start_date: "2025-03-14"
+  end_date: "2026-03-13"
+  time_step: "1h"
+  underlying: "ETH"
+  use_bs_only: false
+  iv_mode: "proxy"
+  fixed_iv: 0.60
+  dvol_path: ""
+  iv_proxy_lookback_days: 30
+  iv_smile_slope: 0.35
+  iv_term_slope: 0.20
+  iv_min: 0.05
+  iv_max: 3.0
+
+account:
+  initial_balance: 1.0
+
+execution:
+  slippage: 0.0001
+  taker_fee: 0.0003
+  maker_fee: 0.0002
+  min_fee: 0.0003
+  max_fee_pct: 0.125
+  delivery_fee: 0.00015
+
+strategy:
+  name: "NakedCall"
+  params:
+    quantity: 1.0
+    min_dte: 0.0
+    max_dte: 1.5
+    entry_hour: 8
+    roll_daily: true
+    roll_threshold_pct: 0.0
+    compound: true
+    buy_protective_call: true
+    hedge_strike_pct: 1.10
+    hedge_quantity_ratio: 1.0
+
+report:
+  output_dir: "./reports"

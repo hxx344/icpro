@@ -1,0 +1,35 @@
+backtest:
+  name: "BTC Dual Investment (OKX 双币赢)"
+  start_date: "2025-01-01"
+  end_date: "2025-12-31"
+  time_step: "1h"
+  underlying: "BTC"
+  use_bs_only: true
+  iv_mode: "proxy"
+  fixed_iv: 0.60
+  dvol_path: ""
+  iv_proxy_lookback_days: 30
+  iv_smile_slope: 0.35
+  iv_term_slope: 0.20
+  iv_min: 0.05
+  iv_max: 3.0
+
+account:
+  initial_balance: 1.0  # 以 1 BTC 入场
+
+execution:
+  # 双币赢费用已内含在 APR 中，不额外收费
+  slippage: 0.0
+  taker_fee: 0.0
+  maker_fee: 0.0
+  min_fee: 0.0
+  max_fee_pct: 0.0
+  delivery_fee: 0.0
+
+strategy:
+  name: "DualInvest"
+  params:
+    apr: 3.60             # 360% 固定年化 (≈0.986%/天)
+    strike_step: 500      # 行权价档位间距 $500
+report:
+  output_dir: "./reports"

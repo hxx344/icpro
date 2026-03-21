@@ -1,0 +1,442 @@
+"""Limit-order chaser – 限价追单引擎.
+
+Manages limit orders that gradually drift toward market price over a
+configurable time window to maximise fill probability while minimising
+slippage.
+
+Strategy:
+  - SELL legs: start at (ask - tick), drift toward bid over time
+  - BUY  legs: start at (bid + tick), drift toward ask over time
+  - At deadline: switch to market order to guarantee fill
+
+Time-based price interpolation:
+  elapsed_ratio = elapsed / window_seconds        (0.0 → 1.0)
+  aggression    = elapsed_ratio ^ 2               (slow start, fast finish)
+
+  SELL: price = ask - tick × (1 - aggression) × spread_ticks
+        i.e. starts near ask, ends at bid
+  BUY:  price = bid + tick × (1 - aggression) × spread_ticks
+        i.e. starts near bid, ends at ask
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from loguru import logger
+
+from trader.binance_client import BinanceOptionsClient, OrderResult, OptionTicker
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LegOrder:
+    """Tracks a single leg's limit order through its lifecycle."""
+    leg_role: str       # "buy_put", "buy_call", "sell_put", "sell_call"
+    symbol: str
+    side: str           # "BUY" or "SELL"
+    quantity: float
+    strike: float
+    option_type: str    # "call" or "put"
+
+    # Current order state
+    order_id: str = ""
+    current_price: float = 0.0
+    status: str = "PENDING"     # PENDING / NEW / FILLED / FAILED
+    avg_price: float = 0.0
+    fee: float = 0.0
+    filled_qty: float = 0.0
+
+    # Tracking
+    attempts: int = 0
+    start_time: float = 0.0     # time.monotonic()
+
+
+@dataclass
+class ChaserConfig:
+    """Configuration for the limit-order chaser."""
+    window_seconds: int = 1800          # 30 minutes total window
+    poll_interval_sec: int = 60         # check / amend every 60 seconds
+    tick_size_usdt: float = 0.01        # min price increment in USDT
+    market_fallback_sec: int = 60       # switch to market order last N seconds
+    max_amend_attempts: int = 180       # safety cap on re-pricing loops
+
+
+# ---------------------------------------------------------------------------
+# Limit Chaser Engine
+# ---------------------------------------------------------------------------
+
+class LimitChaser:
+    """Execute multi-leg limit orders with time-based price drift.
+
+    Usage:
+        chaser = LimitChaser(client, config)
+        results = chaser.execute_legs(legs)
+        # results: list[LegOrder] – each with status FILLED or FAILED
+    """
+
+    def __init__(
+        self,
+        client: BinanceOptionsClient,
+        config: ChaserConfig | None = None,
+    ):
+        self.client = client
+        self.cfg = config or ChaserConfig()
+
+    def execute_legs(
+        self,
+        legs: list[LegOrder],
+        underlying: str = "ETH",
+    ) -> list[LegOrder]:
+        """Execute all legs concurrently with adaptive limit orders.
+
+        Legs are processed in parallel: all limits placed simultaneously,
+        then a polling loop amends unfilled orders until all fill or timeout.
+
+        Parameters
+        ----------
+        legs : list of LegOrder to execute
+        underlying : underlying symbol for ticker lookups
+
+        Returns
+        -------
+        List of LegOrder with updated status / fill info.
+        """
+        if not legs:
+            return legs
+
+        t0 = time.monotonic()
+        for leg in legs:
+            leg.start_time = t0
+            leg.status = "PENDING"
+
+        # Phase 1: Place initial limit orders for all legs
+        self._place_initial_orders(legs, underlying)
+
+        # Phase 2: Poll + amend loop
+        self._chase_loop(legs, underlying, t0)
+
+        return legs
+
+    # ------------------------------------------------------------------
+    # Phase 1: Initial placement
+    # ------------------------------------------------------------------
+
+    def _place_initial_orders(
+        self,
+        legs: list[LegOrder],
+        underlying: str,
+    ) -> None:
+        """Place the first limit order for each leg."""
+        # Fetch all tickers once
+        quotes = self._get_quotes(legs)
+
+        for leg in legs:
+            q = quotes.get(leg.symbol)
+            if not q or q.bid_price <= 0 or q.ask_price <= 0:
+                logger.warning(
+                    f"[Chaser] No valid quote for {leg.symbol}, "
+                    f"using market order fallback"
+                )
+                self._market_fallback(leg)
+                continue
+
+            price = self._compute_limit_price(leg, q, elapsed_ratio=0.0)
+            self._place_or_amend(leg, price)
+
+    # ------------------------------------------------------------------
+    # Phase 2: Chase loop
+    # ------------------------------------------------------------------
+
+    def _chase_loop(
+        self,
+        legs: list[LegOrder],
+        underlying: str,
+        t0: float,
+    ) -> None:
+        """Poll unfilled orders and amend prices until all fill or timeout."""
+        deadline = t0 + self.cfg.window_seconds
+        market_time = t0 + self.cfg.window_seconds - self.cfg.market_fallback_sec
+
+        while True:
+            # Check if all legs are done
+            pending = [l for l in legs if l.status not in ("FILLED", "FAILED")]
+            if not pending:
+                logger.info("[Chaser] All legs filled")
+                break
+
+            now = time.monotonic()
+            elapsed = now - t0
+
+            # Past deadline – should not happen but safety check
+            if now > deadline + 5:
+                logger.warning("[Chaser] Past deadline, forcing market fills")
+                for leg in pending:
+                    self._cancel_and_market(leg)
+                break
+
+            # Check order statuses
+            for leg in pending:
+                self._check_fill(leg)
+
+            # Re-check pending after status updates
+            pending = [l for l in legs if l.status not in ("FILLED", "FAILED")]
+            if not pending:
+                break
+
+            # Market fallback zone: last N seconds
+            if now >= market_time:
+                logger.info(
+                    f"[Chaser] Entering market fallback zone "
+                    f"({self.cfg.market_fallback_sec}s remaining)"
+                )
+                for leg in pending:
+                    self._cancel_and_market(leg)
+                break
+
+            # Amend prices based on elapsed time
+            elapsed_ratio = min(elapsed / (self.cfg.window_seconds - self.cfg.market_fallback_sec), 1.0)
+            quotes = self._get_quotes(pending)
+
+            for leg in pending:
+                if leg.status == "FILLED":
+                    continue
+                if leg.attempts >= self.cfg.max_amend_attempts:
+                    logger.warning(f"[Chaser] Max attempts for {leg.symbol}, market fill")
+                    self._cancel_and_market(leg)
+                    continue
+
+                q = quotes.get(leg.symbol)
+                if not q or q.bid_price <= 0 or q.ask_price <= 0:
+                    continue
+
+                new_price = self._compute_limit_price(leg, q, elapsed_ratio)
+
+                # Only amend if price changed meaningfully
+                if abs(new_price - leg.current_price) >= self.cfg.tick_size_usdt * 0.5:
+                    self._cancel_and_replace(leg, new_price)
+
+            # Sleep before next poll
+            time.sleep(self.cfg.poll_interval_sec)
+
+    # ------------------------------------------------------------------
+    # Price computation
+    # ------------------------------------------------------------------
+
+    def _compute_limit_price(
+        self,
+        leg: LegOrder,
+        quote: OptionTicker,
+        elapsed_ratio: float,
+    ) -> float:
+        """Compute limit price with time-based drift.
+
+        SELL: start at ask - 1 tick, drift toward bid
+        BUY:  start at bid + 1 tick, drift toward ask
+
+        Uses quadratic aggression curve: slow at start, fast at end.
+        """
+        bid = quote.bid_price   # in USDT (we work in USDT for Binance)
+        ask = quote.ask_price
+        tick = self.cfg.tick_size_usdt
+
+        # Safety: ensure bid < ask
+        if bid >= ask:
+            mid = (bid + ask) / 2
+            bid = mid - tick
+            ask = mid + tick
+
+        # Quadratic aggression: 0 at start → 1 at deadline
+        aggression = elapsed_ratio ** 2
+
+        if leg.side == "SELL":
+            # Start: ask - tick (aggressive maker, just under the ask)
+            # End:   bid (take the bid if needed)
+            start_price = ask - tick
+            end_price = bid
+            price = start_price - aggression * (start_price - end_price)
+            # Never below bid
+            price = max(price, bid)
+        else:  # BUY
+            # Start: bid + tick (aggressive maker, just above the bid)
+            # End:   ask (take the ask if needed)
+            start_price = bid + tick
+            end_price = ask
+            price = start_price + aggression * (end_price - start_price)
+            # Never above ask
+            price = min(price, ask)
+
+        # Round to tick size
+        price = round(price / tick) * tick
+        price = max(price, tick)  # never zero
+
+        return price
+
+    # ------------------------------------------------------------------
+    # Order operations
+    # ------------------------------------------------------------------
+
+    def _place_or_amend(self, leg: LegOrder, price: float) -> None:
+        """Place a new limit order for a leg."""
+        try:
+            result = self.client.place_order(
+                symbol=leg.symbol,
+                side=leg.side,
+                quantity=leg.quantity,
+                order_type="LIMIT",
+                price=price,
+            )
+
+            leg.order_id = result.order_id
+            leg.current_price = price
+            leg.attempts += 1
+
+            if result.status == "FILLED":
+                leg.status = "FILLED"
+                leg.avg_price = result.avg_price
+                leg.fee = result.fee
+                leg.filled_qty = result.quantity
+                logger.info(
+                    f"[Chaser] {leg.leg_role} {leg.symbol} FILLED immediately "
+                    f"at {result.avg_price:.4f}"
+                )
+            else:
+                leg.status = "NEW"
+                logger.info(
+                    f"[Chaser] {leg.leg_role} {leg.symbol} limit {leg.side} "
+                    f"@ {price:.4f} placed (attempt #{leg.attempts})"
+                )
+
+        except Exception as e:
+            logger.error(f"[Chaser] Failed to place {leg.leg_role}: {e}")
+            leg.status = "FAILED"
+
+    def _check_fill(self, leg: LegOrder) -> None:
+        """Query exchange for current order status."""
+        if not leg.order_id or leg.status in ("FILLED", "FAILED"):
+            return
+
+        try:
+            result = self.client.query_order(leg.symbol, leg.order_id)
+
+            if result.status == "FILLED":
+                leg.status = "FILLED"
+                leg.avg_price = result.avg_price
+                leg.fee = result.fee
+                leg.filled_qty = result.quantity
+                logger.info(
+                    f"[Chaser] {leg.leg_role} {leg.symbol} FILLED "
+                    f"at {result.avg_price:.4f}"
+                )
+            elif result.status == "PARTIALLY_FILLED":
+                leg.filled_qty = result.quantity
+                logger.debug(
+                    f"[Chaser] {leg.leg_role} partial fill: "
+                    f"{result.quantity}/{leg.quantity}"
+                )
+            elif result.status in ("CANCELLED", "EXPIRED", "REJECTED"):
+                # Order was killed externally
+                leg.status = "PENDING"
+                leg.order_id = ""
+                logger.warning(
+                    f"[Chaser] {leg.leg_role} order {result.status}, will retry"
+                )
+
+        except Exception as e:
+            logger.error(f"[Chaser] Query failed for {leg.leg_role}: {e}")
+
+    def _cancel_and_replace(self, leg: LegOrder, new_price: float) -> None:
+        """Cancel current order and place a new one at new_price."""
+        if leg.order_id:
+            try:
+                self.client.cancel_order(leg.symbol, leg.order_id)
+                logger.debug(
+                    f"[Chaser] Cancelled {leg.leg_role} order {leg.order_id}"
+                )
+            except Exception as e:
+                logger.warning(f"[Chaser] Cancel failed for {leg.leg_role}: {e}")
+                # Check if it filled in the meantime
+                self._check_fill(leg)
+                if leg.status == "FILLED":
+                    return
+
+        leg.order_id = ""
+        self._place_or_amend(leg, new_price)
+
+    def _cancel_and_market(self, leg: LegOrder) -> None:
+        """Cancel limit order and fill with market order."""
+        # Cancel outstanding limit
+        if leg.order_id:
+            try:
+                self.client.cancel_order(leg.symbol, leg.order_id)
+            except Exception:
+                pass
+
+            # Check if it filled during cancel
+            self._check_fill(leg)
+            if leg.status == "FILLED":
+                return
+
+        logger.info(
+            f"[Chaser] {leg.leg_role} {leg.symbol} switching to MARKET order"
+        )
+        self._market_fallback(leg)
+
+    def _market_fallback(self, leg: LegOrder) -> None:
+        """Execute a market order as last resort."""
+        try:
+            result = self.client.place_order(
+                symbol=leg.symbol,
+                side=leg.side,
+                quantity=leg.quantity,
+                order_type="MARKET",
+            )
+
+            if result.status in ("FILLED", "PARTIALLY_FILLED"):
+                leg.status = "FILLED"
+                leg.avg_price = result.avg_price
+                leg.fee = result.fee
+                leg.filled_qty = result.quantity
+                leg.order_id = result.order_id
+                logger.info(
+                    f"[Chaser] {leg.leg_role} MARKET filled at "
+                    f"{result.avg_price:.4f}"
+                )
+            else:
+                leg.status = "FAILED"
+                logger.error(
+                    f"[Chaser] {leg.leg_role} MARKET order failed: "
+                    f"{result.status}"
+                )
+
+        except Exception as e:
+            logger.error(f"[Chaser] Market fallback failed for {leg.leg_role}: {e}")
+            leg.status = "FAILED"
+
+    # ------------------------------------------------------------------
+    # Quote helpers
+    # ------------------------------------------------------------------
+
+    def _get_quotes(
+        self, legs: list[LegOrder]
+    ) -> dict[str, OptionTicker]:
+        """Fetch current quotes for all leg symbols."""
+        quotes: dict[str, OptionTicker] = {}
+        for leg in legs:
+            if leg.status in ("FILLED", "FAILED"):
+                continue
+            if leg.symbol in quotes:
+                continue
+            try:
+                ticker = self.client.get_ticker(leg.symbol)
+                if ticker:
+                    quotes[leg.symbol] = ticker
+            except Exception as e:
+                logger.debug(f"[Chaser] Quote fetch failed for {leg.symbol}: {e}")
+        return quotes

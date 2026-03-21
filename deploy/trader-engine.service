@@ -1,0 +1,25 @@
+[Unit]
+Description=Iron Condor Trading Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/opt/project_Options
+ExecStart=/opt/project_Options/.venv/bin/python -m trader.main run --config configs/trader/iron_condor_0dte.yaml
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Graceful shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

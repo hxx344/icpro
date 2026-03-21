@@ -1,0 +1,171 @@
+2026-03-20 04:09:38.513 | INFO     | trader.storage:_init_db:124 | Storage initialized: data\trader.db
+2026-03-20 04:09:38.513 | INFO     | trader.engine:_init_modules:172 | Binance client: TESTNET
+2026-03-20 04:09:38.513 | INFO     | trader.position_manager:_load_open_positions:167 | Recovered 1 open condor position(s)
+2026-03-20 04:09:38.513 | INFO     | trader.engine:_init_modules:192 | All modules initialized
+2026-03-20 04:09:38.514 | INFO     | trader.engine:_run_loop:214 | Engine loop started
+2026-03-20 04:09:38.514 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 04:09:38.548 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:09:39.334 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773950978514&recvWindow=5000&signature=e66f1d7b8471479ba3660ac12a2c34d8e24ba9c5c3d90a42ca99861fb4d9474d | body: 
+2026-03-20 04:09:39.334 | WARNING  | trader.engine:_init_day:262 | Could not init day equity: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773950978514&recvWindow=5000&signature=e66f1d7b8471479ba3660ac12a2c34d8e24ba9c5c3d90a42ca99861fb4d9474d
+2026-03-20 04:09:39.620 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773950979480&recvWindow=5000&signature=4232f3b727bd67f09a0bc4a31c2adfa0be957587f40f46a51762e64eeb83d366 | body: 
+2026-03-20 04:09:39.620 | ERROR    | trader.equity:take_snapshot:58 | Failed to get account for snapshot: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773950979480&recvWindow=5000&signature=4232f3b727bd67f09a0bc4a31c2adfa0be957587f40f46a51762e64eeb83d366
+2026-03-20 04:09:39.759 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773950979620&recvWindow=5000&signature=8ba86bb41cf5280514004291ad98b56a1a005d13de93f530cb1db2808cd58b64 | body: 
+2026-03-20 04:09:39.759 | INFO     | trader.engine:_heartbeat:289 | [Heartbeat] 20:09:39 UTC | balance=-1.0000 | upnl=0.0000 | positions=1 | ticks=1
+2026-03-20 04:09:57.278 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:09:58.452 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:09:59.014 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:09:59.568 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:00.100 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:00.585 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:01.114 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:10.027 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:41.186 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 04:10:41.186 | INFO     | trader.engine:_init_modules:172 | Binance client: TESTNET
+2026-03-20 04:10:41.186 | INFO     | trader.position_manager:_load_open_positions:167 | Recovered 1 open condor position(s)
+2026-03-20 04:10:41.187 | INFO     | trader.engine:_init_modules:192 | All modules initialized
+2026-03-20 04:10:41.187 | INFO     | trader.engine:_run_loop:214 | Engine loop started
+2026-03-20 04:10:41.187 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 04:10:41.244 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:41.872 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951041187&recvWindow=5000&signature=ff29b11c053d53f9fd8a7d18a2f08111832e7618741b24e6099facbbe5fae426 | body: 
+2026-03-20 04:10:41.872 | WARNING  | trader.engine:_init_day:262 | Could not init day equity: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951041187&recvWindow=5000&signature=ff29b11c053d53f9fd8a7d18a2f08111832e7618741b24e6099facbbe5fae426
+2026-03-20 04:10:42.178 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951042032&recvWindow=5000&signature=d3423a07890f71b6ec4879be4bb7d82da199ac810e19d206b5029a40face39b9 | body: 
+2026-03-20 04:10:42.178 | ERROR    | trader.equity:take_snapshot:58 | Failed to get account for snapshot: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951042032&recvWindow=5000&signature=d3423a07890f71b6ec4879be4bb7d82da199ac810e19d206b5029a40face39b9
+2026-03-20 04:10:42.328 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951042178&recvWindow=5000&signature=fe49c189963754bfc843ad68cde140fa9702560119c15997b08ea5630ad02e78 | body: 
+2026-03-20 04:10:42.328 | INFO     | trader.engine:_heartbeat:289 | [Heartbeat] 20:10:42 UTC | balance=-1.0000 | upnl=0.0000 | positions=1 | ticks=1
+2026-03-20 04:10:44.408 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:44.910 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:10:56.412 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:18:53.542 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 04:18:53.542 | INFO     | trader.engine:_init_modules:172 | Binance client: TESTNET
+2026-03-20 04:18:53.543 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 04:18:53.543 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 04:18:53.543 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 04:18:53.577 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:18:54.615 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951533543&recvWindow=5000&signature=f37624298226141b2effb85181b84473ae2b24bc9ab63149e4b03f7079b739fe | body: 
+2026-03-20 04:18:54.615 | WARNING  | trader.engine:_init_day:263 | Could not init day equity: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951533543&recvWindow=5000&signature=f37624298226141b2effb85181b84473ae2b24bc9ab63149e4b03f7079b739fe
+2026-03-20 04:18:54.783 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951534615&recvWindow=5000&signature=27b6eff4db372779bbb020ced840a5e95641516fb4699e13fa600697ecc0f45a | body: 
+2026-03-20 04:18:54.783 | ERROR    | trader.equity:take_snapshot:60 | Failed to get account for snapshot: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951534615&recvWindow=5000&signature=27b6eff4db372779bbb020ced840a5e95641516fb4699e13fa600697ecc0f45a
+2026-03-20 04:18:54.952 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951534783&recvWindow=5000&signature=3a199799693c018a68f21a6ae19e6b00a24a37b5c2fbf99c2a3f0c70c2a05c5d | body: 
+2026-03-20 04:18:54.952 | INFO     | trader.engine:_heartbeat:290 | [Heartbeat] 20:18:54 UTC | balance=-1.0000 | upnl=0.0000 | positions=0 | ticks=1
+2026-03-20 04:19:02.829 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:19:03.903 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:19:04.400 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:19:04.980 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:19:11.015 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:19:15.819 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:22:10.249 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 04:22:10.249 | INFO     | trader.engine:_init_modules:172 | Binance client: TESTNET
+2026-03-20 04:22:10.250 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 04:22:10.250 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 04:22:10.250 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 04:22:10.283 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:22:11.522 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951730250&recvWindow=5000&signature=c3689f539105c0d879358dc6686e5009afa00de080a5df82c2a1bc137980e208 | body: 
+2026-03-20 04:22:11.523 | WARNING  | trader.engine:_init_day:263 | Could not init day equity: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951730250&recvWindow=5000&signature=c3689f539105c0d879358dc6686e5009afa00de080a5df82c2a1bc137980e208
+2026-03-20 04:22:11.805 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951731523&recvWindow=5000&signature=a7b4c67ccb69953b332daa37cddece9c7509656dc18135c63d6b8dac29b236b3 | body: 
+2026-03-20 04:22:11.805 | ERROR    | trader.equity:take_snapshot:60 | Failed to get account for snapshot: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951731523&recvWindow=5000&signature=a7b4c67ccb69953b332daa37cddece9c7509656dc18135c63d6b8dac29b236b3
+2026-03-20 04:22:12.084 | ERROR    | trader.binance_client:_get:194 | GET /eapi/v1/account HTTP error: 404 Client Error: Not Found for url: https://testnet.binancefuture.com/eapi/v1/account?timestamp=1773951731805&recvWindow=5000&signature=69656fbd00dfc7adacf363c83c1585f6cd6f38f4460193ba8917509f23ea5c4c | body: 
+2026-03-20 04:22:12.084 | INFO     | trader.engine:_heartbeat:290 | [Heartbeat] 20:22:11 UTC | balance=-1.0000 | upnl=0.0000 | positions=0 | ticks=1
+2026-03-20 04:22:13.433 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:22:15.189 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:22:42.904 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:22:43.988 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:22:44.771 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:22:45.538 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:25.828 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 04:27:25.828 | INFO     | trader.binance_client:__init__:164 | [TESTNET] Binance EAPI has no testnet. Market data uses production API. Account/order endpoints are simulated.
+2026-03-20 04:27:25.828 | INFO     | trader.engine:_init_modules:172 | Binance client: TESTNET
+2026-03-20 04:27:25.829 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 04:27:25.829 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 04:27:25.829 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 04:27:25.829 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 04:27:25.862 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:25.901 | INFO     | trader.equity:on_day_start:122 | Day start: 2026-03-19, equity=10000.0000
+2026-03-20 04:27:25.902 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 04:27:27.638 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:28.104 | DEBUG    | trader.equity:take_snapshot:92 | Equity snapshot: equity=10000.0000 upnl=0.0000 positions=0
+2026-03-20 04:27:28.105 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 04:27:28.105 | INFO     | trader.engine:_heartbeat:290 | [Heartbeat] 20:27:28 UTC | balance=10000.0000 | upnl=0.0000 | positions=0 | ticks=1
+2026-03-20 04:27:29.047 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:29.740 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:30.400 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:30.928 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:31.408 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:34.122 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:36.384 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:37.273 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:37.873 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 04:27:38.713 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:03:38.403 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 05:03:38.404 | INFO     | trader.binance_client:__init__:164 | [TESTNET] Binance EAPI has no testnet. Market data uses production API. Account/order endpoints are simulated.
+2026-03-20 05:03:38.404 | INFO     | trader.engine:_init_modules:172 | Binance client: TESTNET
+2026-03-20 05:03:38.404 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 05:03:38.405 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 05:03:38.405 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 05:03:38.405 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 05:03:38.439 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:03:38.533 | INFO     | trader.equity:on_day_start:122 | Day start: 2026-03-19, equity=10000.0000
+2026-03-20 05:03:38.534 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 05:03:39.269 | DEBUG    | trader.equity:take_snapshot:92 | Equity snapshot: equity=10000.0000 upnl=0.0000 positions=0
+2026-03-20 05:03:39.269 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 05:03:39.269 | INFO     | trader.engine:_heartbeat:290 | [Heartbeat] 21:03:39 UTC | balance=10000.0000 | upnl=0.0000 | positions=0 | ticks=1
+2026-03-20 05:03:43.324 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:03:48.788 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:03:59.072 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:04:09.366 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:04:19.661 | INFO     | trader.config:load_config:122 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:23:47.248 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 05:23:47.248 | INFO     | trader.binance_client:__init__:164 | [TESTNET] Binance EAPI has no testnet. Market data uses production API. Account/order endpoints are simulated.
+2026-03-20 05:23:47.248 | INFO     | trader.engine:_init_modules:172 | Binance client: TESTNET
+2026-03-20 05:23:47.249 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 05:23:47.249 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 05:23:47.250 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 05:23:47.250 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 05:23:47.288 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:23:47.354 | INFO     | trader.equity:on_day_start:122 | Day start: 2026-03-19, equity=10000.0000
+2026-03-20 05:23:47.355 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 05:23:48.373 | DEBUG    | trader.equity:take_snapshot:92 | Equity snapshot: equity=10000.0000 upnl=0.0000 positions=0
+2026-03-20 05:23:48.373 | DEBUG    | trader.binance_client:get_account:359 | [TESTNET] Simulated get_account
+2026-03-20 05:23:48.374 | INFO     | trader.engine:_heartbeat:290 | [Heartbeat] 21:23:48 UTC | balance=10000.0000 | upnl=0.0000 | positions=0 | ticks=1
+2026-03-20 05:23:57.937 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:23:58.643 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:23:58.681 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 05:24:11.933 | INFO     | trader.config:load_config:120 | Loading config from configs\trader_iron_condor_0dte.yaml
+2026-03-20 19:03:03.829 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 19:03:03.829 | INFO     | trader.engine:_init_modules:172 | Deribit client: TESTNET
+2026-03-20 19:03:03.830 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 19:03:03.831 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 19:03:03.831 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 19:03:03.831 | WARNING  | trader.engine:_init_day:270 | Could not init day equity: Deribit client_id/client_secret not configured
+2026-03-20 19:03:03.832 | ERROR    | trader.equity:take_snapshot:60 | Failed to get account for snapshot: Deribit client_id/client_secret not configured
+2026-03-20 19:03:03.833 | INFO     | trader.engine:_heartbeat:301 | [Heartbeat] 11:03:03 UTC | balance=-1.0000 | upnl=0.0000 | positions=0 | ticks=1
+2026-03-20 19:03:03.888 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:03:08.147 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:03:08.892 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:03:18.968 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:03:29.243 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:03:40.238 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:03:51.241 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:09:29.554 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 19:09:29.554 | INFO     | trader.engine:_init_modules:172 | Deribit client: TESTNET
+2026-03-20 19:09:29.555 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 19:09:29.555 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 19:09:29.555 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 19:09:29.589 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:09:29.698 | INFO     | trader.equity:on_day_start:122 | Day start: 2026-03-20, equity=1.0000
+2026-03-20 19:09:30.665 | DEBUG    | trader.equity:take_snapshot:92 | Equity snapshot: equity=1.0000 upnl=0.0000 positions=0
+2026-03-20 19:09:30.665 | INFO     | trader.engine:_heartbeat:301 | [Heartbeat] 11:09:30 UTC | balance=1.0000 | upnl=0.0000 | positions=0 | ticks=1
+2026-03-20 19:09:32.691 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:09:33.501 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:09:43.707 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:12:28.524 | INFO     | trader.storage:_init_db:129 | Storage initialized: data\trader.db
+2026-03-20 19:12:28.524 | INFO     | trader.engine:_init_modules:172 | Deribit client: TESTNET
+2026-03-20 19:12:28.525 | INFO     | trader.engine:_init_modules:193 | All modules initialized
+2026-03-20 19:12:28.525 | INFO     | trader.engine:_run_loop:215 | Engine loop started
+2026-03-20 19:12:28.525 | INFO     | trader.engine:start:101 | Trading engine started in background thread
+2026-03-20 19:12:28.526 | DEBUG    | trader.equity:take_snapshot:65 | Skipping equity snapshot – using simulated account data
+2026-03-20 19:12:28.526 | INFO     | trader.engine:_heartbeat:309 | [Heartbeat] 11:12:28 UTC | balance=simulated | upnl=simulated | positions=0 | ticks=1
+2026-03-20 19:12:28.561 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:12:31.515 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:12:32.126 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:12:32.776 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml
+2026-03-20 19:12:33.440 | INFO     | trader.config:load_config:113 | Loading config from configs\trader\iron_condor_0dte.yaml

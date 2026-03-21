@@ -1,0 +1,40 @@
+# ============================================================
+# Iron Condor 0DTE ±8% (ETH) — Binance
+# ============================================================
+# 由交易面板自动保存
+# ============================================================
+
+name: Iron Condor 0DTE ±8% (ETH)
+exchange:
+  api_key: ''
+  api_secret: ''
+  testnet: true
+  timeout: 10
+  account_currency: USDT
+  simulate_private: false
+strategy:
+  underlying: ETH
+  otm_pct: 0.01
+  wing_width_pct: 0.08
+  entry_time_utc: 08:01
+  quantity: 1.0
+  max_positions: 1
+  max_capital_pct: 0.3
+  compound: true
+  wait_for_midpoint: false
+storage:
+  db_path: ./data/trader.db
+  log_dir: ./logs
+  log_level: INFO
+  log_rotation: 1 day
+  log_retention: 30 days
+monitor:
+  check_interval_sec: 60
+  heartbeat_interval_sec: 60
+  equity_snapshot_interval_sec: 300
+chaser:
+  window_seconds: 1800          # 30分钟追单窗口
+  poll_interval_sec: 60         # 每10秒检查/调价
+  tick_size_usdt: 0.01          # 最小价格步长 (USDT)
+  market_fallback_sec: 60       # 最后60秒切市价单
+  max_amend_attempts: 180       # 最大改单次数

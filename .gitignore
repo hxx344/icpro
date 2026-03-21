@@ -1,0 +1,33 @@
+# Data
+data/
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reports & sandbox outputs
+reports/
+sandbox/logs/
+
+# Environment
+.env
