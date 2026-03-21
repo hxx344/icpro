@@ -48,6 +48,10 @@ python -m trader.main run -c configs/trader/iron_condor_0dte.yaml
 ### 环境变量
 
 ```bash
+# 复制模板后填值
+cp .env.example .env
+
+# 或直接导出
 export BINANCE_API_KEY="your_key"
 export BINANCE_API_SECRET="your_secret"
 ```
