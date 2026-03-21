@@ -156,10 +156,13 @@ class BacktestEngine:
         self.config = config
         self.strategy = strategy
 
+        # Margin mode (must be set before Matcher)
+        self._margin_usd: bool = config.backtest.margin_mode.upper() == "USD"
+
         self.loader = DataLoader(data_dir="data")
         self.account = Account(initial_balance=config.account.initial_balance)
         self.position_mgr = PositionManager()
-        self.matcher = Matcher(config.execution)
+        self.matcher = Matcher(config.execution, margin_usd=self._margin_usd)
 
         self._pending_orders: list = []
 
@@ -210,6 +213,16 @@ class BacktestEngine:
 
         logger.info(f"Time steps: {n_steps}")
 
+        # 2b. USD margin: convert initial balance from coin to USD
+        if self._margin_usd:
+            first_price = float(close_values[0])
+            if first_price > 0:
+                usd_balance = self.account.initial_balance * first_price
+                self.account.initial_balance = usd_balance
+                self.account.balance = usd_balance
+                logger.info(f"USD margin mode: initial balance = {usd_balance:,.2f} USD "
+                            f"({self.config.account.initial_balance} coin × {first_price:,.2f})")
+
         # 3. Initialise strategy
         ts0 = pd.Timestamp(ts_values[0])
         initial_ctx = self._build_context(ts0, float(close_values[0]))
@@ -245,6 +258,7 @@ class BacktestEngine:
                 check_and_settle(
                     ts_np, position_mgr, account,
                     matcher, instrument_dict, settlements_df,
+                    margin_usd=self._margin_usd,
                 )
 
             # 4c. Build context (lazy chain) and call strategy
@@ -391,10 +405,13 @@ class BacktestEngine:
 
         Uses searchsorted for O(log n) lookups instead of O(n) boolean masks.
         Falls back to Black-76 synthetic pricing when OHLCV is missing.
+
+        Returns prices in coin or USD depending on margin_mode.
         """
         marks: dict[str, float] = {}
         ohlcv_index = self._ohlcv_index
         use_market_data = not self.config.backtest.use_bs_only
+        margin_usd = self._margin_usd
         # Pre-compute values needed for synthetic fallback (avoid per-position overhead)
         _ts_ns_val = int(np.datetime64(ts_np, 'ns').view('int64')) if not isinstance(ts_np, (int, np.integer)) else int(ts_np)
 
@@ -407,9 +424,10 @@ class BacktestEngine:
                     j = np.searchsorted(ts_arr, ts_np, side="right") - 1
                     if j >= 0:
                         market_mark = float(close_arr[j])
-                        marks[name] = market_mark
                         self._mark_source_market += 1
                         self._update_iv_observation(name, ts_np, market_mark, underlying_price)
+                        # OHLCV is in coin; convert to USD if needed
+                        marks[name] = market_mark * underlying_price if margin_usd else market_mark
                         continue
 
             # Synthetic fallback
@@ -428,7 +446,7 @@ class BacktestEngine:
                 usd_price = call_price(underlying_price, strike, T, iv, r=0.0)
             else:
                 usd_price = put_price(underlying_price, strike, T, iv, r=0.0)
-            marks[name] = usd_price / underlying_price
+            marks[name] = usd_price if margin_usd else usd_price / underlying_price
             self._mark_source_synth += 1
 
         return marks
@@ -472,7 +490,9 @@ class BacktestEngine:
         """Return (bid, ask, mark) using pre-indexed OHLCV + searchsorted.
 
         Falls back to Black-76 when no OHLCV data is available.
+        Returns prices in coin or USD depending on margin_mode.
         """
+        margin_usd = self._margin_usd
         if not self.config.backtest.use_bs_only:
             idx_data = self._ohlcv_index.get(instrument_name)
             if idx_data is not None:
@@ -482,6 +502,10 @@ class BacktestEngine:
                     market_mark = float(close_arr[j])
                     self._quote_source_market += 1
                     self._update_iv_observation(instrument_name, ts_np, market_mark, underlying_price)
+                    if margin_usd:
+                        return (float(low_arr[j]) * underlying_price,
+                                float(high_arr[j]) * underlying_price,
+                                market_mark * underlying_price)
                     return float(low_arr[j]), float(high_arr[j]), market_mark
 
         # Synthetic pricing
@@ -502,7 +526,7 @@ class BacktestEngine:
             usd = call_price(underlying_price, strike, T, iv, r=0.0)
         else:
             usd = put_price(underlying_price, strike, T, iv, r=0.0)
-        mark = usd / underlying_price
+        mark = usd if margin_usd else usd / underlying_price
         spread = mark * 0.02
         self._quote_source_synth += 1
         return max(mark - spread, 0.0), mark + spread, mark
@@ -756,11 +780,17 @@ class BacktestEngine:
         initial = self.account.initial_balance
         final = eq_values[-1]
 
-        # USD equity: BTC equity × underlying price
-        initial_underlying = equity[0][4] if len(equity[0]) > 4 and equity[0][4] > 0 else 1.0
-        final_underlying = equity[-1][4] if len(equity[-1]) > 4 and equity[-1][4] > 0 else 1.0
-        initial_usd = initial * initial_underlying
-        final_usd = final * final_underlying
+        # USD equity depends on margin mode
+        if self._margin_usd:
+            # Equity IS already in USD
+            initial_usd = initial
+            final_usd = final
+        else:
+            # Coin margin: convert to USD
+            initial_underlying = equity[0][4] if len(equity[0]) > 4 and equity[0][4] > 0 else 1.0
+            final_underlying = equity[-1][4] if len(equity[-1]) > 4 and equity[-1][4] > 0 else 1.0
+            initial_usd = initial * initial_underlying
+            final_usd = final * final_underlying
 
         # Data source statistics
         mark_total = self._mark_source_market + self._mark_source_synth
@@ -769,6 +799,7 @@ class BacktestEngine:
 
         return {
             "underlying": self.config.backtest.underlying,
+            "margin_mode": "USD" if self._margin_usd else "coin",
             "initial_balance": initial,
             "final_equity": final,
             "total_return": (final - initial) / initial if initial > 0 else 0.0,

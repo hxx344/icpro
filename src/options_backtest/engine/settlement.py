@@ -24,6 +24,8 @@ def check_and_settle(
     matcher: Matcher,
     instruments: pd.DataFrame | dict,
     settlements_df: pd.DataFrame,
+    *,
+    margin_usd: bool = False,
 ) -> list[str]:
     """Check for expired positions and settle them.
 
@@ -101,6 +103,7 @@ def check_and_settle(
             timestamp=timestamp,
             delivery_fee_per_qty=delivery_fee,
             delivery_fee_max_pct=delivery_fee_max_pct,
+            margin_usd=margin_usd,
         )
 
         account.balance += pnl

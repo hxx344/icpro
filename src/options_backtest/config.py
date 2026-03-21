@@ -17,6 +17,7 @@ class BacktestConfig(BaseModel):
     end_date: str = "2025-12-31"
     time_step: str = "1h"
     underlying: str = "BTC"
+    margin_mode: str = "USD"  # "USD" (Binance USDT) | "coin" (Deribit inverse)
     use_bs_only: bool = False
     iv_mode: str = "fixed"  # fixed | surface | proxy
     fixed_iv: float = 0.60
@@ -31,7 +32,7 @@ class BacktestConfig(BaseModel):
 class AccountConfig(BaseModel):
     """Account / capital settings."""
 
-    initial_balance: float = 1.0  # BTC
+    initial_balance: float = 1.0  # coin units (auto-converted to USD if margin_mode=USD)
 
 
 class ExecutionConfig(BaseModel):

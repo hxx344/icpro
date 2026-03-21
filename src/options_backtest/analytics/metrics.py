@@ -24,6 +24,9 @@ def compute_metrics(results: dict) -> dict:
     if not equity_history:
         return {"error": "no equity data"}
 
+    margin_mode = results.get("margin_mode", "coin")
+    is_usd_margin = margin_mode == "USD"
+
     # Build equity series
     # Support both 4-column (legacy) and 5-column (with underlying_price) history
     sample = equity_history[0]
@@ -36,39 +39,49 @@ def compute_metrics(results: dict) -> dict:
     ts = pd.to_datetime(eq_df["timestamp"], utc=True)
     underlying_prices = eq_df["underlying_price"].values.astype(float)
 
-    # Basic return (coin-denominated)
+    # Basic return
     final_eq = float(eq[-1])
     total_return = (final_eq - initial_balance) / initial_balance
     underlying_name = results.get("underlying", "BTC")
+    currency = "USD" if is_usd_margin else underlying_name
 
-    # USD equity = coin equity × underlying price
-    has_underlying = underlying_prices[0] > 0
-    if has_underlying:
-        usd_eq: np.ndarray = eq * underlying_prices
-        initial_usd = float(usd_eq[0])
-        final_usd = float(usd_eq[-1])
-        total_return_usd = (final_usd - initial_usd) / initial_usd if initial_usd > 0 else 0.0
-
-        # Hedged USD (real-time delta-neutral):
-        # Each step's coin PnL is locked in at that step's coin price.
-        # hedged[t] = hedged[t-1] + (eq[t] - eq[t-1]) * price[t]
-        # This models continuously adjusting the perp short to match coin equity.
-        hedged_usd_eq: np.ndarray = np.empty_like(eq)
-        hedged_usd_eq[0] = eq[0] * underlying_prices[0]
-        delta_eq = np.diff(eq)  # coin PnL each step
-        hedged_usd_eq[1:] = hedged_usd_eq[0] + np.cumsum(delta_eq * underlying_prices[1:])
-        initial_hedged_usd = float(hedged_usd_eq[0])
-        final_hedged_usd = float(hedged_usd_eq[-1])
-        total_return_hedged = (final_hedged_usd - initial_hedged_usd) / initial_hedged_usd if initial_hedged_usd > 0 else 0.0
+    if is_usd_margin:
+        # USD margin: equity IS USD already — no conversion needed
+        usd_eq = eq.copy()
+        initial_usd = initial_balance
+        final_usd = final_eq
+        total_return_usd = total_return
+        # Hedged = same as primary (already USD, no coin exposure)
+        hedged_usd_eq = eq.copy()
+        initial_hedged_usd = initial_balance
+        final_hedged_usd = final_eq
+        total_return_hedged = total_return
     else:
-        usd_eq = np.zeros_like(eq)
-        hedged_usd_eq = np.zeros_like(eq)
-        initial_usd = 0.0
-        final_usd = 0.0
-        total_return_usd = 0.0
-        initial_hedged_usd = 0.0
-        final_hedged_usd = 0.0
-        total_return_hedged = 0.0
+        # Coin margin: convert to USD
+        has_underlying = underlying_prices[0] > 0
+        if has_underlying:
+            usd_eq = eq * underlying_prices
+            initial_usd = float(usd_eq[0])
+            final_usd = float(usd_eq[-1])
+            total_return_usd = (final_usd - initial_usd) / initial_usd if initial_usd > 0 else 0.0
+
+            # Hedged USD (real-time delta-neutral)
+            hedged_usd_eq = np.empty_like(eq)
+            hedged_usd_eq[0] = eq[0] * underlying_prices[0]
+            delta_eq = np.diff(eq)
+            hedged_usd_eq[1:] = hedged_usd_eq[0] + np.cumsum(delta_eq * underlying_prices[1:])
+            initial_hedged_usd = float(hedged_usd_eq[0])
+            final_hedged_usd = float(hedged_usd_eq[-1])
+            total_return_hedged = (final_hedged_usd - initial_hedged_usd) / initial_hedged_usd if initial_hedged_usd > 0 else 0.0
+        else:
+            usd_eq = np.zeros_like(eq)
+            hedged_usd_eq = np.zeros_like(eq)
+            initial_usd = 0.0
+            final_usd = 0.0
+            total_return_usd = 0.0
+            initial_hedged_usd = 0.0
+            final_hedged_usd = 0.0
+            total_return_hedged = 0.0
 
     # Time span
     days = max((ts.max() - ts.min()).total_seconds() / 86400, 1)
@@ -81,13 +94,13 @@ def compute_metrics(results: dict) -> dict:
         ann_return = -1.0
 
     # Annualized return (USD)
-    if has_underlying and total_return_usd > -1:
+    if total_return_usd > -1 and total_return_usd != 0:
         ann_return_usd = (1 + total_return_usd) ** (1 / years) - 1 if years > 0 else total_return_usd
     else:
         ann_return_usd = 0.0
 
     # Annualized return (Hedged USD)
-    if has_underlying and total_return_hedged > -1:
+    if total_return_hedged > -1 and total_return_hedged != 0:
         ann_return_hedged = (1 + total_return_hedged) ** (1 / years) - 1 if years > 0 else total_return_hedged
     else:
         ann_return_hedged = 0.0
@@ -98,7 +111,7 @@ def compute_metrics(results: dict) -> dict:
     max_drawdown = float(np.min(drawdown))
 
     # Drawdown (USD)
-    if has_underlying and usd_eq is not None:
+    if usd_eq is not None and len(usd_eq) > 0 and usd_eq[0] > 0:
         usd_running_max = np.maximum.accumulate(usd_eq)
         usd_drawdown = (usd_eq - usd_running_max) / np.where(usd_running_max > 0, usd_running_max, 1)
         max_drawdown_usd = float(np.min(usd_drawdown))
@@ -106,7 +119,7 @@ def compute_metrics(results: dict) -> dict:
         max_drawdown_usd = 0.0
 
     # Drawdown (Hedged USD)
-    if has_underlying and hedged_usd_eq is not None:
+    if hedged_usd_eq is not None and len(hedged_usd_eq) > 0 and hedged_usd_eq[0] > 0:
         hedged_running_max = np.maximum.accumulate(hedged_usd_eq)
         hedged_drawdown = (hedged_usd_eq - hedged_running_max) / np.where(hedged_running_max > 0, hedged_running_max, 1)
         max_drawdown_hedged = float(np.min(hedged_drawdown))
@@ -124,7 +137,7 @@ def compute_metrics(results: dict) -> dict:
         sharpe = 0.0
 
     # Sharpe (USD)
-    if has_underlying and usd_eq is not None and len(usd_eq) > 1:
+    if usd_eq is not None and len(usd_eq) > 1 and usd_eq[0] > 0:
         usd_returns = np.diff(usd_eq) / np.where(usd_eq[:-1] != 0, usd_eq[:-1], 1)
         if np.std(usd_returns) > 0:
             sharpe_usd = float(np.mean(usd_returns) / np.std(usd_returns) * np.sqrt(steps_per_year))
@@ -134,7 +147,7 @@ def compute_metrics(results: dict) -> dict:
         sharpe_usd = 0.0
 
     # Sharpe (Hedged USD)
-    if has_underlying and hedged_usd_eq is not None and len(hedged_usd_eq) > 1:
+    if hedged_usd_eq is not None and len(hedged_usd_eq) > 1 and hedged_usd_eq[0] > 0:
         hedged_returns = np.diff(hedged_usd_eq) / np.where(hedged_usd_eq[:-1] != 0, hedged_usd_eq[:-1], 1)
         if np.std(hedged_returns) > 0:
             sharpe_hedged = float(np.mean(hedged_returns) / np.std(hedged_returns) * np.sqrt(steps_per_year))
@@ -159,6 +172,8 @@ def compute_metrics(results: dict) -> dict:
     data_source = results.get("data_source", {})
 
     metrics = {
+        "margin_mode": margin_mode,
+        "currency": currency,
         "initial_balance": initial_balance,
         "final_equity": final_eq,
         "total_return": total_return,

@@ -1,6 +1,7 @@
 """Order matching / execution simulator.
 
-MVP: mid‑price fill with fixed slippage and Deribit fee model.
+MVP: mid‑price fill with fixed slippage.
+Supports both coin-margined (Deribit) and USD-margined (Binance) fee models.
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ from options_backtest.data.models import Direction, Fill, OrderRequest
 class Matcher:
     """Simulates order execution against historical quotes."""
 
-    def __init__(self, config: ExecutionConfig | None = None):
+    def __init__(self, config: ExecutionConfig | None = None, *, margin_usd: bool = False):
         self.cfg = config or ExecutionConfig()
+        self._margin_usd = margin_usd
 
     def execute(
         self,
@@ -28,7 +30,7 @@ class Matcher:
     ) -> Fill | None:
         """Try to fill *order* and return a Fill, or ``None`` if unfillable.
 
-        All prices are in BTC (coin‑margined).
+        Prices are in coin (Deribit) or USD (Binance) depending on margin mode.
         """
         # Determine execution price
         if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0:
@@ -61,11 +63,17 @@ class Matcher:
     def _compute_fee(
         self, price_btc: float, quantity: float, underlying_price: float
     ) -> float:
-        """Deribit taker fee: 0.03 % of underlying, capped and floored.
+        """Compute trading fee.
 
-        Fee is in BTC.
+        Coin margin (Deribit): fixed fee per contract (0.03% of underlying), capped.
+        USD margin (Binance): percentage of premium (taker_fee × premium × qty).
         """
-        # 0.03 % of underlying value (in BTC, underlying = 1 BTC per contract)
+        if self._margin_usd:
+            # Binance: fee = taker_rate × premium × quantity
+            fee = self.cfg.taker_fee * price_btc * quantity
+            return max(fee, 0.0)
+
+        # Deribit: 0.03 % of underlying value (in BTC, underlying = 1 BTC per contract)
         fee_per_contract = self.cfg.taker_fee  # 0.0003 BTC
 
         # Floor

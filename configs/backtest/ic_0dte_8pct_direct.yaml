@@ -5,6 +5,7 @@ backtest:
   end_date: "2026-03-14"
   time_step: "1h"
   underlying: "ETH"
+  margin_mode: "USD"
   use_bs_only: false
   iv_mode: "proxy"
   iv_proxy_lookback_days: 30

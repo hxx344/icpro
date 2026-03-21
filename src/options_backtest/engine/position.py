@@ -121,12 +121,18 @@ class PositionManager:
         timestamp: datetime,
         delivery_fee_per_qty: float = 0.0,
         delivery_fee_max_pct: float = 0.0,
+        *,
+        margin_usd: bool = False,
     ) -> float:
-        """Settle an expired position, returning realised PnL (coin).
+        """Settle an expired position, returning realised PnL.
 
-        Uses Deribit settlement logic:
+        Coin margin (Deribit):
           Call intrinsic = max(0, S − K) / S
           Put  intrinsic = max(0, K − S) / S
+        USD margin (Binance):
+          Call intrinsic = max(0, S − K)
+          Put  intrinsic = max(0, K − S)
+
         where S = settlement_price_usd.
         """
         pos = self._positions.get(instrument_name)
@@ -136,10 +142,18 @@ class PositionManager:
         S = settlement_price_usd
         K = strike_price
 
-        if option_type.lower().startswith("c"):
-            intrinsic = max(0.0, (S - K) / S) if S > 0 else 0.0
+        if margin_usd:
+            # USD margin: intrinsic in USD
+            if option_type.lower().startswith("c"):
+                intrinsic = max(0.0, S - K)
+            else:
+                intrinsic = max(0.0, K - S)
         else:
-            intrinsic = max(0.0, (K - S) / S) if S > 0 else 0.0
+            # Coin margin: intrinsic in coin
+            if option_type.lower().startswith("c"):
+                intrinsic = max(0.0, (S - K) / S) if S > 0 else 0.0
+            else:
+                intrinsic = max(0.0, (K - S) / S) if S > 0 else 0.0
 
         is_itm = intrinsic > 0
         if is_itm:
