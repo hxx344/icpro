@@ -75,6 +75,31 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Config & Storage initialization
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def init_storage(db_path: str) -> Storage:
+    """Initialize SQLite storage (cached across reruns)."""
+    return Storage(db_path)
+
+
+def get_config_path() -> str:
+    """Get config path from CLI args or default."""
+    # streamlit run trader/dashboard.py -- --config path/to/config.yaml
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--config" and i + 1 < len(args):
+            return args[i + 1]
+    return "configs/trader_iron_condor_0dte.yaml"
+
+
+config_path = get_config_path()
+cfg = load_config(config_path)          # ← This also loads .env into os.environ
+storage = init_storage(cfg.storage.db_path)
+
+# ---------------------------------------------------------------------------
 # Login authentication (credentials from env: DASHBOARD_USER / DASHBOARD_PASS)
 # ---------------------------------------------------------------------------
 
@@ -117,30 +142,6 @@ def _check_login() -> bool:
 
 if not _check_login():
     st.stop()
-
-# ---------------------------------------------------------------------------
-# Config & Storage initialization
-# ---------------------------------------------------------------------------
-
-@st.cache_resource
-def init_storage(db_path: str) -> Storage:
-    """Initialize SQLite storage (cached across reruns)."""
-    return Storage(db_path)
-
-
-def get_config_path() -> str:
-    """Get config path from CLI args or default."""
-    # streamlit run trader/dashboard.py -- --config path/to/config.yaml
-    args = sys.argv[1:]
-    for i, a in enumerate(args):
-        if a == "--config" and i + 1 < len(args):
-            return args[i + 1]
-    return "configs/trader_iron_condor_0dte.yaml"
-
-
-config_path = get_config_path()
-cfg = load_config(config_path)
-storage = init_storage(cfg.storage.db_path)
 
 # ---------------------------------------------------------------------------
 # Sidebar
