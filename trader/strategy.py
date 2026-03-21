@@ -293,18 +293,13 @@ class IronCondor0DTEStrategy:
     def _compute_quantity(self, spot: float) -> float:
         """Compute order quantity based on account equity and config.
 
-        If compound=True, scale quantity to current equity, capped by
-        max_capital_pct.
+        compound=False → 直接用 quantity (base)
+        compound=True  → 按权益放大, quantity 是下限, max_capital_pct 是上限
 
-        Binance European Options use portfolio margin. For an Iron Condor
-        (4 legs), the margin requirement ≈ one side's spread width × qty
-        (the two vertical spreads share margin since they can't both lose).
-        We use a conservative estimate: margin ≈ wing_width_pct × spot × qty.
-        Additionally each leg incurs premium outflow for the longs and inflow
-        for the shorts, but margin is the binding constraint.
-
-        quantity (base) is the default / minimum.
-        max_capital_pct is the safety cap — scaled_qty will not exceed it.
+        Binance 欧式期权 Iron Condor 保证金估算:
+        - 4 条腿, 2 条 short 各自占保证金
+        - Binance 不一定做 spread 对冲, 保守按两侧都占保证金算
+        - margin ≈ wing_width × spot × qty × 2 (两侧 short)
         """
         quantity = self.cfg.quantity
 
@@ -313,35 +308,25 @@ class IronCondor0DTEStrategy:
                 account = self.client.get_account()
                 equity = account.total_balance
                 if equity > 0 and spot > 0:
-                    # Max capital we're willing to allocate
                     max_notional = equity * self.cfg.max_capital_pct
-                    # Margin per Iron Condor ≈ spread width of one side
-                    # (both sides share margin, so we don't double-count)
                     wing_width = self.cfg.wing_width_pct * spot
                     if wing_width > 0:
-                        # How many Iron Condors can we afford?
-                        max_qty = max_notional / wing_width
-                        # Round down to step size, cap at max_qty
-                        scaled_qty = math.floor(max_qty * 100) / 100
-                        quantity = min(scaled_qty, max(quantity, 0.01))
-                        # If base quantity exceeds cap, warn and clamp
-                        if self.cfg.quantity > scaled_qty:
-                            logger.warning(
-                                f"Base quantity {self.cfg.quantity} exceeds "
-                                f"capital cap {scaled_qty:.2f} "
-                                f"(equity={equity:.2f}, "
-                                f"max_capital_pct={self.cfg.max_capital_pct})"
-                            )
-                            quantity = scaled_qty
-                        else:
-                            # Scale up from base, but never exceed cap
-                            quantity = min(scaled_qty, max(self.cfg.quantity, 0.01))
+                        # 保守: 两侧 short 腿各占保证金
+                        margin_per_condor = wing_width * 2
+                        scaled_qty = math.floor(
+                            max_notional / margin_per_condor * 100
+                        ) / 100
+                        # compound: 取 max(base, scaled), 让仓位随权益增长
+                        # 但如果算出来比 base 还小 (权益不足), 则 clamp
+                        quantity = max(self.cfg.quantity, scaled_qty)
 
                     logger.info(
                         f"[Quantity] equity={equity:.2f}, spot={spot:.2f}, "
                         f"wing_width={wing_width:.2f}, "
+                        f"margin_per_condor={wing_width * 2:.2f}, "
                         f"max_notional={max_notional:.2f}, "
-                        f"scaled_qty={quantity:.2f}"
+                        f"scaled_qty={scaled_qty:.2f}, "
+                        f"final_qty={quantity:.2f}"
                     )
             except Exception as e:
                 logger.warning(f"Could not scale quantity: {e}")
