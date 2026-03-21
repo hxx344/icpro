@@ -19,6 +19,71 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 
 
+def _strip_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and ((value[0] == '"' and value[-1] == '"') or (value[0] == "'" and value[-1] == "'")):
+        return value[1:-1]
+    return value
+
+
+def _load_env_file(env_path: Path) -> bool:
+    """Load .env key-values into process env (without overriding existing vars)."""
+    if not env_path.exists():
+        return False
+
+    loaded_any = False
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("export "):
+            line = line[7:].strip()
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = _strip_quotes(value)
+
+        if not key:
+            continue
+
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded_any = True
+
+    return loaded_any
+
+
+def _auto_load_dotenv(config_path: Path | None) -> None:
+    """Try loading .env from common project locations."""
+    candidates: list[Path] = []
+
+    if config_path is not None:
+        candidates.append(config_path.parent / ".env")
+        candidates.append(config_path.parent.parent / ".env")
+
+    candidates.append(Path.cwd() / ".env")
+    candidates.append(Path(__file__).resolve().parent.parent / ".env")
+
+    seen: set[str] = set()
+    for p in candidates:
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _load_env_file(p):
+            logger.info(f"Loaded environment from {p}")
+            return
+
+
 @dataclass
 class ExchangeConfig:
     """Exchange API connection settings (Binance European Options)."""
@@ -129,13 +194,15 @@ def load_config(path: str | Path | None = None) -> TraderConfig:
     -------
     TraderConfig instance with all settings merged.
     """
+    path_obj = Path(path) if path is not None else None
+    _auto_load_dotenv(path_obj)
+
     cfg = TraderConfig()
 
-    if path is not None:
-        path = Path(path)
-        if path.exists():
-            logger.info(f"Loading config from {path}")
-            with open(path, "r", encoding="utf-8") as f:
+    if path_obj is not None:
+        if path_obj.exists():
+            logger.info(f"Loading config from {path_obj}")
+            with open(path_obj, "r", encoding="utf-8") as f:
                 raw = yaml.safe_load(f) or {}
 
             if "name" in raw:
@@ -160,7 +227,7 @@ def load_config(path: str | Path | None = None) -> TraderConfig:
             if not (raw_exchange or {}).get("base_url"):
                 cfg.exchange.base_url = ""
         else:
-            logger.warning(f"Config file not found: {path}, using defaults")
+            logger.warning(f"Config file not found: {path_obj}, using defaults")
 
     # Re-trigger __post_init__ for env vars and base_url
     cfg.exchange.__post_init__()
