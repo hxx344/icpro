@@ -1151,6 +1151,326 @@ elif page == "🔧 策略配置":
 
     st.divider()
 
+    # ------------------------------------------------------------------
+    # 📋  下单预览 — 根据实时行情模拟下一次 Iron Condor 下单
+    # ------------------------------------------------------------------
+    st.subheader("📋 下单预览（实时行情）")
+
+    @st.cache_resource
+    def _get_client_preview(_exchange_cfg) -> BinanceOptionsClient:
+        return BinanceOptionsClient(_exchange_cfg)
+
+    _pv_client = _get_client_preview(cfg.exchange)
+
+    _pv_ok = False
+    try:
+        _pv_ul = cfg.strategy.underlying.upper()
+        _pv_spot = _pv_client.get_spot_price(_pv_ul)
+        _pv_tickers = _pv_client.get_tickers(_pv_ul)
+        # Filter 0DTE
+        _pv_today = [t for t in _pv_tickers if 0 < t.dte_hours < 24]
+
+        if _pv_spot <= 0:
+            # fallback from tickers
+            _prices = [t.underlying_price for t in _pv_tickers if t.underlying_price > 0]
+            _pv_spot = _prices[0] if _prices else 0
+
+        if _pv_spot > 0 and _pv_today:
+            # Strike targets
+            _otm = cfg.strategy.otm_pct
+            _wing = cfg.strategy.wing_width_pct
+            _sc_target = _pv_spot * (1 + _otm)
+            _sp_target = _pv_spot * (1 - _otm)
+            _lc_target = _pv_spot * (1 + _otm + _wing)
+            _lp_target = _pv_spot * (1 - _otm - _wing)
+
+            def _best(tks, otype, target):
+                cs = [t for t in tks if t.option_type == otype]
+                if not cs:
+                    return None
+                cs.sort(key=lambda t: abs(t.strike - target))
+                return cs[0]
+
+            _sell_call = _best(_pv_today, "call", _sc_target)
+            _buy_call  = _best(_pv_today, "call", _lc_target)
+            _sell_put  = _best(_pv_today, "put",  _sp_target)
+            _buy_put   = _best(_pv_today, "put",  _lp_target)
+
+            if all([_sell_call, _buy_call, _sell_put, _buy_put]):
+                # Compute quantity (replicating _compute_quantity logic)
+                import math as _math
+                _base_qty = cfg.strategy.quantity
+                _pv_qty = _base_qty
+                _pv_equity = 0.0
+                _pv_equity_src = "配置基础数量"
+                if cfg.strategy.compound:
+                    try:
+                        _pv_acct = _pv_client.get_account()
+                        _pv_equity = _pv_acct.total_balance
+                        if _pv_equity > 0 and _pv_spot > 0:
+                            _max_notional = _pv_equity * cfg.strategy.max_capital_pct
+                            _ww = _wing * _pv_spot
+                            if _ww > 0:
+                                _margin_per = _ww * 2
+                                _scaled = _math.floor(_max_notional / _margin_per * 100) / 100
+                                _pv_qty = max(_base_qty, _scaled)
+                                _pv_equity_src = "实时权益(复利)"
+                    except Exception:
+                        _pv_equity_src = "权益获取失败, 用基础数量"
+
+                # Prices in USDT (bid/ask are in coin, multiply by spot)
+                _sc_bid = _sell_call.bid_price * _pv_spot
+                _sc_ask = _sell_call.ask_price * _pv_spot
+                _lc_bid = _buy_call.bid_price * _pv_spot
+                _lc_ask = _buy_call.ask_price * _pv_spot
+                _sp_bid = _sell_put.bid_price * _pv_spot
+                _sp_ask = _sell_put.ask_price * _pv_spot
+                _lp_bid = _buy_put.bid_price * _pv_spot
+                _lp_ask = _buy_put.ask_price * _pv_spot
+
+                # Net premium received (sell at bid, buy at ask)
+                _premium_per = (_sc_bid + _sp_bid) - (_lc_ask + _lp_ask)
+
+                # Wing widths (actual, from strikes)
+                _call_width = _buy_call.strike - _sell_call.strike
+                _put_width = _sell_put.strike - _buy_put.strike
+                _max_wing = max(_call_width, _put_width)
+
+                # Max loss (one side) = wing_width - premium
+                _max_loss_per = _max_wing - _premium_per
+                _total_premium = _premium_per * _pv_qty
+                _total_max_loss = _max_loss_per * _pv_qty
+                _margin_used = _max_wing * 2 * _pv_qty
+
+                # Breakeven
+                _be_upper = _sell_call.strike + _premium_per
+                _be_lower = _sell_put.strike - _premium_per
+
+                _pv_ok = True
+
+                # ---- Display ----
+                st.caption(f"数据来源: Binance 实时行情 | {_pv_equity_src}")
+
+                # KPI row
+                kc1, kc2, kc3, kc4 = st.columns(4)
+                with kc1:
+                    st.metric(f"{_pv_ul} 现货", f"${_pv_spot:,.2f}")
+                with kc2:
+                    st.metric("下单数量", f"{_pv_qty:.2f} 张")
+                with kc3:
+                    if _pv_equity > 0:
+                        st.metric("账户权益", f"${_pv_equity:,.2f}")
+                    else:
+                        st.metric("账户权益", "-")
+                with kc4:
+                    if _pv_equity > 0:
+                        st.metric("保证金占比", f"{_margin_used / _pv_equity * 100:.1f}%")
+                    else:
+                        st.metric("保证金占比", "-")
+
+                # Legs table
+                st.markdown("##### 🦵 四条腿明细")
+                _legs_data = [
+                    {
+                        "腿": "① Long Put (买入保护)",
+                        "合约": _buy_put.symbol,
+                        "行权价": f"${_buy_put.strike:,.0f}",
+                        "距Spot": f"{(_buy_put.strike/_pv_spot - 1)*100:+.1f}%",
+                        "方向": "🟢 买入",
+                        "Bid (USDT)": f"${_lp_bid:.2f}",
+                        "Ask (USDT)": f"${_lp_ask:.2f}",
+                        "DTE": f"{_buy_put.dte_hours:.1f}h",
+                    },
+                    {
+                        "腿": "② Short Put (卖出收权利金)",
+                        "合约": _sell_put.symbol,
+                        "行权价": f"${_sell_put.strike:,.0f}",
+                        "距Spot": f"{(_sell_put.strike/_pv_spot - 1)*100:+.1f}%",
+                        "方向": "🔴 卖出",
+                        "Bid (USDT)": f"${_sp_bid:.2f}",
+                        "Ask (USDT)": f"${_sp_ask:.2f}",
+                        "DTE": f"{_sell_put.dte_hours:.1f}h",
+                    },
+                    {
+                        "腿": "③ Short Call (卖出收权利金)",
+                        "合约": _sell_call.symbol,
+                        "行权价": f"${_sell_call.strike:,.0f}",
+                        "距Spot": f"{(_sell_call.strike/_pv_spot - 1)*100:+.1f}%",
+                        "方向": "🔴 卖出",
+                        "Bid (USDT)": f"${_sc_bid:.2f}",
+                        "Ask (USDT)": f"${_sc_ask:.2f}",
+                        "DTE": f"{_sell_call.dte_hours:.1f}h",
+                    },
+                    {
+                        "腿": "④ Long Call (买入保护)",
+                        "合约": _buy_call.symbol,
+                        "行权价": f"${_buy_call.strike:,.0f}",
+                        "距Spot": f"{(_buy_call.strike/_pv_spot - 1)*100:+.1f}%",
+                        "方向": "🟢 买入",
+                        "Bid (USDT)": f"${_lc_bid:.2f}",
+                        "Ask (USDT)": f"${_lc_ask:.2f}",
+                        "DTE": f"{_buy_call.dte_hours:.1f}h",
+                    },
+                ]
+                st.dataframe(pd.DataFrame(_legs_data), width="stretch", hide_index=True)
+
+                # P&L summary
+                st.markdown("##### 💰 盈亏概要")
+                pl1, pl2, pl3, pl4 = st.columns(4)
+                with pl1:
+                    _clr = "normal" if _premium_per > 0 else "inverse"
+                    st.metric("净权利金/组", f"${_premium_per:.2f}", delta=f"总计 ${_total_premium:.2f}", delta_color=_clr)
+                with pl2:
+                    st.metric("最大收益", f"${_total_premium:.2f}",
+                              delta=f"{_total_premium/_pv_equity*100:.2f}% 权益" if _pv_equity > 0 else None,
+                              delta_color="normal")
+                with pl3:
+                    st.metric("最大亏损 (单侧)", f"${_total_max_loss:.2f}",
+                              delta=f"{_total_max_loss/_pv_equity*100:.1f}% 权益" if _pv_equity > 0 else None,
+                              delta_color="inverse")
+                with pl4:
+                    _rr = _total_premium / _total_max_loss if _total_max_loss > 0 else 0
+                    st.metric("盈亏比", f"1 : {1/_rr:.1f}" if _rr > 0 else "-")
+
+                # Breakeven
+                be1, be2, be3, be4 = st.columns(4)
+                with be1:
+                    st.metric("下方盈亏平衡", f"${_be_lower:,.0f}")
+                with be2:
+                    st.metric("上方盈亏平衡", f"${_be_upper:,.0f}")
+                with be3:
+                    st.metric("保证金占用", f"${_margin_used:,.0f}")
+                with be4:
+                    _lev = _pv_spot * _pv_qty / _pv_equity if _pv_equity > 0 else 0
+                    st.metric("名义杠杆 (单侧)", f"{_lev:.2f}x")
+
+                # ---------- Plotly payoff chart ----------
+                st.markdown("##### 📈 到期盈亏曲线")
+                import numpy as _np
+                _price_lo = _buy_put.strike * 0.92
+                _price_hi = _buy_call.strike * 1.08
+                _prices = _np.linspace(_price_lo, _price_hi, 500)
+
+                def _payoff(S):
+                    sc = -_np.maximum(S - _sell_call.strike, 0)
+                    lc = _np.maximum(S - _buy_call.strike, 0)
+                    sp = -_np.maximum(_sell_put.strike - S, 0)
+                    lp = _np.maximum(_buy_put.strike - S, 0)
+                    return (sc + lc + sp + lp + _premium_per) * _pv_qty
+
+                _pnl = _payoff(_prices)
+
+                _fig = go.Figure()
+                # Split into profit/loss segments for coloring
+                _fig.add_trace(go.Scatter(
+                    x=_prices, y=_pnl,
+                    mode="lines", line=dict(color="royalblue", width=2.5),
+                    name="P&L", hovertemplate="ETH: $%{x:,.0f}<br>P&L: $%{y:,.2f}<extra></extra>",
+                ))
+                # Profit fill
+                _pnl_pos = _np.where(_pnl > 0, _pnl, 0)
+                _fig.add_trace(go.Scatter(
+                    x=_prices, y=_pnl_pos, fill="tozeroy",
+                    fillcolor="rgba(0,200,83,0.15)", line=dict(width=0),
+                    showlegend=False, hoverinfo="skip",
+                ))
+                # Loss fill
+                _pnl_neg = _np.where(_pnl < 0, _pnl, 0)
+                _fig.add_trace(go.Scatter(
+                    x=_prices, y=_pnl_neg, fill="tozeroy",
+                    fillcolor="rgba(255,82,82,0.15)", line=dict(width=0),
+                    showlegend=False, hoverinfo="skip",
+                ))
+
+                # Strike lines
+                for _k, _lbl, _clr2 in [
+                    (_buy_put.strike,   f"Long Put ${_buy_put.strike:,.0f}",   "green"),
+                    (_sell_put.strike,  f"Short Put ${_sell_put.strike:,.0f}",  "red"),
+                    (_sell_call.strike, f"Short Call ${_sell_call.strike:,.0f}", "red"),
+                    (_buy_call.strike,  f"Long Call ${_buy_call.strike:,.0f}",  "green"),
+                ]:
+                    _fig.add_vline(x=_k, line_dash="dot", line_color=_clr2,
+                                   opacity=0.5, annotation_text=_lbl,
+                                   annotation_position="top")
+
+                # Spot line
+                _fig.add_vline(x=_pv_spot, line_dash="dash", line_color="orange",
+                               opacity=0.7, annotation_text=f"Spot ${_pv_spot:,.0f}",
+                               annotation_position="bottom right")
+
+                # Breakeven lines
+                _fig.add_vline(x=_be_lower, line_dash="dashdot", line_color="purple",
+                               opacity=0.4, annotation_text=f"BE ${_be_lower:,.0f}")
+                _fig.add_vline(x=_be_upper, line_dash="dashdot", line_color="purple",
+                               opacity=0.4, annotation_text=f"BE ${_be_upper:,.0f}")
+
+                # Zero line
+                _fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.3)
+
+                # Max profit / loss annotations
+                _fig.add_hline(y=_total_premium, line_dash="dot",
+                               line_color="green", opacity=0.3,
+                               annotation_text=f"Max Profit ${_total_premium:.0f}")
+                _fig.add_hline(y=-_total_max_loss, line_dash="dot",
+                               line_color="red", opacity=0.3,
+                               annotation_text=f"Max Loss -${_total_max_loss:.0f}")
+
+                _fig.update_layout(
+                    title=f"Iron Condor 到期盈亏  |  {_pv_ul} Spot=${_pv_spot:,.0f}  |  "
+                          f"Qty={_pv_qty:.0f}",
+                    xaxis_title="ETH 到期价格 ($)",
+                    yaxis_title="盈亏 ($)",
+                    height=450,
+                    hovermode="x unified",
+                    template="plotly_white",
+                    showlegend=False,
+                )
+
+                st.plotly_chart(_fig, use_container_width=True)
+
+                # Text summary
+                with st.expander("📊 完整计算明细"):
+                    st.code(
+                        f"标的: {_pv_ul}  现货: ${_pv_spot:,.2f}\n"
+                        f"OTM: {_otm*100:.1f}%  翼宽: {_wing*100:.1f}%\n"
+                        f"───────────────────────────────\n"
+                        f"Long Put:   {_buy_put.symbol}  K=${_buy_put.strike:,.0f}\n"
+                        f"Short Put:  {_sell_put.symbol}  K=${_sell_put.strike:,.0f}\n"
+                        f"Short Call: {_sell_call.symbol}  K=${_sell_call.strike:,.0f}\n"
+                        f"Long Call:  {_buy_call.symbol}  K=${_buy_call.strike:,.0f}\n"
+                        f"───────────────────────────────\n"
+                        f"Put侧翼宽:  ${_put_width:,.0f}\n"
+                        f"Call侧翼宽: ${_call_width:,.0f}\n"
+                        f"───────────────────────────────\n"
+                        f"数量: {_pv_qty:.2f} 张  (base={_base_qty}, compound={cfg.strategy.compound})\n"
+                        f"权益: ${_pv_equity:,.2f}  max_capital: {cfg.strategy.max_capital_pct*100:.0f}%\n"
+                        f"保证金: ${_margin_used:,.0f} ({_margin_used/_pv_equity*100:.1f}% 权益)\n" if _pv_equity > 0 else ""
+                        f"───────────────────────────────\n"
+                        f"净权利金/组: ${_premium_per:.2f}  (sell_call_bid={_sc_bid:.2f} + sell_put_bid={_sp_bid:.2f}"
+                        f" - buy_call_ask={_lc_ask:.2f} - buy_put_ask={_lp_ask:.2f})\n"
+                        f"总权利金: ${_total_premium:.2f}\n"
+                        f"最大亏损(单侧): ${_total_max_loss:.2f}\n"
+                        f"盈亏平衡: ${_be_lower:,.0f} ~ ${_be_upper:,.0f}\n"
+                        f"名义杠杆(单侧): {_lev:.2f}x\n",
+                        language=None,
+                    )
+            else:
+                st.warning("⚠️ 无法找到完整的 4 条腿合约，可能盘前无 0DTE 合约")
+        else:
+            if _pv_spot <= 0:
+                st.warning("⚠️ 无法获取现货价格")
+            else:
+                st.warning("⚠️ 当前无 0DTE 期权合约可用")
+    except Exception as _pv_ex:
+        st.error(f"下单预览失败: {_pv_ex}")
+        import traceback
+        st.code(traceback.format_exc())
+
+    if not _pv_ok:
+        st.info("💡 下单预览需要实时行情数据，请确保网络连通且有 0DTE 合约可用")
+
+    st.divider()
+
     # --- Strategy State ---
     st.subheader("💾 策略状态 (持久化)")
     state_keys = ["last_trade_date", "day_start_equity", "day_realized_pnl",
