@@ -333,33 +333,7 @@ if page == "📊 总览":
         exchange_positions = []
         has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
         if has_creds:
-            try:
-                raw_positions = client._private_get("/eapi/v1/position")
-                if isinstance(raw_positions, list):
-                    ul = cfg.strategy.underlying.upper()
-                    for item in raw_positions:
-                        if not isinstance(item, dict):
-                            continue
-                        symbol = str(item.get("symbol", ""))
-                        if ul and not symbol.startswith(f"{ul}-"):
-                            continue
-                        qty = float(
-                            item.get("quantity")
-                            or item.get("positionQty")
-                            or item.get("positionAmount")
-                            or 0
-                        )
-                        if abs(qty) <= 0:
-                            continue
-                        exchange_positions.append({
-                            "symbol": symbol,
-                            "side": str(item.get("side") or ("LONG" if qty > 0 else "SHORT")).upper(),
-                            "quantity": qty,
-                            "entryPrice": float(item.get("entryPrice") or 0),
-                            "unrealizedPnl": float(item.get("unrealizedPNL") or item.get("unrealizedPnl") or 0),
-                        })
-            except Exception:
-                st.warning(f"获取交易所持仓失败: {e}")
+            st.warning(f"获取交易所持仓失败: {e}")
         else:
             st.caption("未配置 API Key/Secret，跳过交易所私有持仓查询")
 
