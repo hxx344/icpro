@@ -8,6 +8,34 @@
 pip install -e ".[dev]"
 ```
 
+### Ubuntu 命令清单（从 0 到启动）
+
+```bash
+# 1) 基础依赖
+sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
+
+# 2) 进入项目
+cd ~/icpro
+
+# 3) 创建并激活虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 4) 安装项目依赖
+python -m pip install -U pip setuptools wheel
+python -m pip install -e ".[dev]"
+
+# 5) 配置 API 环境变量
+cp .env.example .env
+# 编辑 .env 填写 BINANCE_API_KEY / BINANCE_API_SECRET
+
+# 6) 启动（Dashboard + 引擎）
+streamlit run trader/dashboard.py -- --config configs/trader/iron_condor_0dte.yaml
+
+# 7) 仅后端运行（可选）
+python -m trader.main run -c configs/trader/iron_condor_0dte.yaml
+```
+
 ## 回测系统
 
 支持 BTC/ETH 多策略回测，配置驱动：
