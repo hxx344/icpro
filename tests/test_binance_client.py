@@ -472,11 +472,29 @@ class TestGetAccount:
             ]
         }
         mock_resp.raise_for_status = MagicMock()
-        with patch.object(client.session, "get", return_value=mock_resp):
+        with patch.object(client.session, "get", return_value=mock_resp) as mock_get:
             acct = client.get_account()
         assert acct.total_balance == pytest.approx(15.0)
         assert acct.available_balance == pytest.approx(11.0)
         assert acct.unrealized_pnl == pytest.approx(0.4)
+        # Verify correct endpoint is called
+        call_url = mock_get.call_args[1].get("url", "") if mock_get.call_args[1] else mock_get.call_args[0][0] if mock_get.call_args[0] else ""
+        # URL is constructed as keyword arg
+        called_url = str(mock_get.call_args)
+        assert "marginAccount" in called_url, f"Should call /eapi/v1/marginAccount, got: {called_url}"
+
+    def test_real_account_available_field(self, client):
+        """Binance EAPI uses 'available' not 'availableBalance'."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "asset": [
+                {"marginBalance": "10.0", "available": "8.0", "unrealizedPNL": "0.5"},
+            ]
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=mock_resp):
+            acct = client.get_account()
+        assert acct.available_balance == pytest.approx(8.0)
 
     def test_account_error(self, client):
         with patch.object(client.session, "get", side_effect=Exception("conn")):

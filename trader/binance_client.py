@@ -1,4 +1,4 @@
-﻿"""Binance European Options API client.
+"""Binance European Options API client.
 
 Provides a unified interface for the trader modules:
 - Market data (spot/index, option tickers, mark prices)
@@ -292,7 +292,7 @@ class BinanceOptionsClient:
             )
 
         try:
-            result = self._private_get("/eapi/v1/account")
+            result = self._private_get("/eapi/v1/marginAccount")
         except Exception as e:
             logger.error(f"Failed to get account: {e}")
             return AccountInfo(
@@ -302,23 +302,90 @@ class BinanceOptionsClient:
                 raw={"error": str(e)},
             )
 
-        assets = result.get("asset", []) if isinstance(result, dict) else []
+        if not isinstance(result, dict):
+            logger.warning(f"Unexpected account response type: {type(result)}")
+            return AccountInfo(
+                total_balance=0.0,
+                available_balance=0.0,
+                unrealized_pnl=0.0,
+                raw={"unexpected": str(result)[:200]},
+            )
+
+        assets = result.get("asset", [])
+        if not isinstance(assets, list):
+            assets = []
+
         total_balance = 0.0
         available = 0.0
         upnl = 0.0
 
-        for a in assets if isinstance(assets, list) else []:
+        for a in assets:
+            if not isinstance(a, dict):
+                continue
             total_balance += float(a.get("marginBalance") or 0)
-            available += float(a.get("availableBalance") or 0)
-            upnl += float(a.get("unrealizedPNL") or 0)
+            # Binance EAPI uses "available", not "availableBalance"
+            available += float(
+                a.get("available") or a.get("availableBalance") or 0
+            )
+            upnl += float(
+                a.get("unrealizedPNL") or a.get("unrealizedPnl") or 0
+            )
+
+        logger.debug(
+            f"Account: balance={total_balance:.4f}, "
+            f"available={available:.4f}, upnl={upnl:.4f}, "
+            f"assets_count={len(assets)}"
+        )
 
         return AccountInfo(
             total_balance=total_balance,
             available_balance=available,
             unrealized_pnl=upnl,
-            raw=result if isinstance(result, dict) else {"result": result},
+            raw=result,
         )
 
+    def get_positions(self, underlying: str = "ETH") -> list[dict]:
+        """Get open option positions from exchange (filtered by underlying)."""
+        if self.cfg.simulate_private or not self.cfg.api_key or not self.cfg.api_secret:
+            return []
+
+        try:
+            result = self._private_get("/eapi/v1/position")
+        except Exception as e:
+            logger.error(f"Failed to query positions: {e}")
+            return []
+
+        if not isinstance(result, list):
+            return []
+
+        ul = underlying.upper()
+        positions: list[dict] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+
+            symbol = str(item.get("symbol", ""))
+            if ul and not symbol.startswith(f"{ul}-"):
+                continue
+
+            qty = float(
+                item.get("quantity")
+                or item.get("positionQty")
+                or item.get("positionAmount")
+                or 0
+            )
+            if abs(qty) <= 0:
+                continue
+
+            positions.append({
+                "symbol": symbol,
+                "side": str(item.get("side") or ("LONG" if qty > 0 else "SHORT")).upper(),
+                "quantity": qty,
+                "entryPrice": float(item.get("entryPrice") or 0),
+                "unrealizedPnl": float(item.get("unrealizedPNL") or item.get("unrealizedPnl") or 0),
+            })
+
+        return positions
     # ------------------------------------------------------------------
     # Order management
     # ------------------------------------------------------------------
@@ -528,3 +595,4 @@ class BinanceOptionsClient:
             )
 
         return None
+
