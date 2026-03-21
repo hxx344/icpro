@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import requests
 import sys
 import time as _time
 from datetime import datetime, timezone, timedelta
@@ -227,6 +228,12 @@ page = st.sidebar.radio(
 if page == "📊 总览":
     st.title("📊 策略总览")
 
+    @st.cache_resource
+    def _get_client(_exchange_cfg) -> BinanceOptionsClient:
+        return BinanceOptionsClient(_exchange_cfg)
+
+    client = _get_client(cfg.exchange)
+
     # --- KPIs ---
     stats = storage.get_trade_stats()
     equity_curve = storage.get_equity_curve(start_date, end_date)
@@ -315,6 +322,62 @@ if page == "📊 总览":
                 st.caption(f"净权利金: **${total_premium:.4f}**")
     else:
         st.info("当前无持仓")
+
+    st.subheader("🏦 交易所实时持仓")
+    try:
+        if hasattr(client, "get_positions"):
+            exchange_positions = client.get_positions(cfg.strategy.underlying.upper())
+        else:
+            raise AttributeError("client.get_positions 不存在")
+    except Exception as e:
+        exchange_positions = []
+        has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
+        if has_creds:
+            try:
+                raw_positions = client._private_get("/eapi/v1/position")
+                if isinstance(raw_positions, list):
+                    ul = cfg.strategy.underlying.upper()
+                    for item in raw_positions:
+                        if not isinstance(item, dict):
+                            continue
+                        symbol = str(item.get("symbol", ""))
+                        if ul and not symbol.startswith(f"{ul}-"):
+                            continue
+                        qty = float(
+                            item.get("quantity")
+                            or item.get("positionQty")
+                            or item.get("positionAmount")
+                            or 0
+                        )
+                        if abs(qty) <= 0:
+                            continue
+                        exchange_positions.append({
+                            "symbol": symbol,
+                            "side": str(item.get("side") or ("LONG" if qty > 0 else "SHORT")).upper(),
+                            "quantity": qty,
+                            "entryPrice": float(item.get("entryPrice") or 0),
+                            "unrealizedPnl": float(item.get("unrealizedPNL") or item.get("unrealizedPnl") or 0),
+                        })
+            except Exception:
+                st.warning(f"获取交易所持仓失败: {e}")
+        else:
+            st.caption("未配置 API Key/Secret，跳过交易所私有持仓查询")
+
+    if exchange_positions:
+        ex_rows = []
+        for p in exchange_positions:
+            ex_rows.append(
+                {
+                    "合约": p.get("symbol", ""),
+                    "方向": p.get("side", ""),
+                    "数量": p.get("quantity", 0.0),
+                    "开仓价": f"${float(p.get('entryPrice', 0.0)):.4f}",
+                    "未实现PnL": f"${float(p.get('unrealizedPnl', 0.0)):.4f}",
+                }
+            )
+        st.dataframe(pd.DataFrame(ex_rows), width='stretch', hide_index=True)
+    else:
+        st.caption("交易所未返回持仓（或当前确实无仓位）")
 
     st.divider()
 
@@ -1202,8 +1265,10 @@ elif page == "📡 期权行情":
     # --- Fetch tickers ---
     try:
         tickers = client.get_tickers(ul)
+        _market_source = "client"
     except Exception as e:
         tickers = []
+        _market_source = "error"
         st.error(f"获取行情失败: {e}")
 
     # --- Header row: spot price + pricing unit toggle ---
@@ -1221,11 +1286,8 @@ elif page == "📡 期权行情":
         )
     _is_usd = price_unit == "USD"
 
-    st.caption(f"共 {len(tickers)} 个合约  |  更新时间: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
-
+    rows = []
     if tickers:
-        # Build DataFrame — always store both denominations
-        rows = []
         for t in tickers:
             dte_h = t.dte_hours
             moneyness = t.moneyness_pct
@@ -1237,13 +1299,11 @@ elif page == "📡 期权行情":
                 "行权价": t.strike,
                 "到期": t.expiry.strftime("%m-%d %H:%M"),
                 "DTE(h)": round(dte_h, 1),
-                # Native (ETH/BTC) prices
                 "Bid": t.bid_price,
                 "Ask": t.ask_price,
                 "Mid": round(t.mid_price, 6),
                 "Mark": t.mark_price,
                 "Last": t.last_price,
-                # USD equivalent prices
                 "Bid$": round(t.bid_price * ul_px, 2),
                 "Ask$": round(t.ask_price * ul_px, 2),
                 "Mid$": round(t.mid_price * ul_px, 2),
@@ -1255,6 +1315,88 @@ elif page == "📡 期权行情":
                 "OI": t.open_interest,
                 "标的价": ul_px,
             })
+    else:
+        # Dashboard-level fallback: production public feed (read-only)
+        try:
+            resp = requests.get("https://eapi.binance.com/eapi/v1/ticker", timeout=10)
+            raw = resp.json()
+            if isinstance(raw, list):
+                _market_source = "production-fallback"
+                now_utc = datetime.now(timezone.utc)
+                for item in raw:
+                    symbol = str(item.get("symbol", ""))
+                    if not symbol.startswith(f"{ul}-"):
+                        continue
+                    # Fallback parse inline (ETH-260327-2400-C)
+                    try:
+                        ul0, yymmdd, strike_s, cp = symbol.split("-")
+                        yy, mm, dd = int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
+                        expiry = datetime(2000 + yy, mm, dd, 8, 0, tzinfo=timezone.utc)
+                        strike = float(strike_s)
+                        opt_type = "CALL" if cp == "C" else "PUT"
+                    except Exception:
+                        continue
+
+                    ul_px = float(item.get("underlyingPrice") or item.get("exercisePrice") or spot or 0)
+                    bid_u = float(item.get("bidPrice") or 0)
+                    ask_u = float(item.get("askPrice") or 0)
+                    last_u = float(item.get("lastPrice") or 0)
+                    mark_u = (bid_u + ask_u) / 2 if bid_u > 0 and ask_u > 0 else last_u
+
+                    if ul_px > 0:
+                        bid = bid_u / ul_px
+                        ask = ask_u / ul_px
+                        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (mark_u / ul_px if ul_px > 0 else 0)
+                        mark = mark_u / ul_px
+                        last = last_u / ul_px
+                    else:
+                        bid = bid_u
+                        ask = ask_u
+                        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else mark_u
+                        mark = mark_u
+                        last = last_u
+
+                    spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 0
+                    dte_h = max((expiry - now_utc).total_seconds() / 3600.0, 0.0)
+                    moneyness = ((strike / ul_px - 1.0) * 100) if ul_px > 0 else 0.0
+
+                    rows.append({
+                        "合约": symbol,
+                        "类型": opt_type,
+                        "行权价": strike,
+                        "到期": expiry.strftime("%m-%d %H:%M"),
+                        "DTE(h)": round(dte_h, 1),
+                        "Bid": bid,
+                        "Ask": ask,
+                        "Mid": round(mid, 6),
+                        "Mark": mark,
+                        "Last": last,
+                        "Bid$": round(bid * ul_px, 2),
+                        "Ask$": round(ask * ul_px, 2),
+                        "Mid$": round(mid * ul_px, 2),
+                        "Mark$": round(mark * ul_px, 2),
+                        "Last$": round(last * ul_px, 2),
+                        "价差%": round(spread_pct, 2),
+                        "OTM%": round(moneyness, 2),
+                        "24h量": float(item.get("volume") or 0),
+                        "OI": float(item.get("amount") or 0),
+                        "标的价": ul_px,
+                    })
+        except Exception:
+            pass
+
+    st.caption(
+        f"共 {len(rows)} 个合约  |  数据源: {_market_source}  |  更新时间: "
+        f"{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
+    )
+
+    if not rows:
+        st.warning(
+            "未获取到期权行情。若当前为 testnet，系统会尝试使用生产公共行情；"
+            "请检查网络连通性与交易所接口可用性。"
+        )
+
+    if rows:
         df_all = pd.DataFrame(rows)
 
         st.divider()
