@@ -1,7 +1,7 @@
 """Main trader entry point — 主程序入口.
 
 启动交易系统:
-  python -m trader.main --config configs/trader/iron_condor_0dte.yaml
+  python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 
 功能:
   - 加载配置
