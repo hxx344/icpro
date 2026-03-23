@@ -256,7 +256,10 @@ class TestCondorValidation:
 
     def test_normal_flow(self, mock_client, mock_storage, mock_pos_mgr):
         """正常情况下策略 tick 应成功开仓."""
-        cfg = StrategyConfig(entry_time_utc="08:00")
+        cfg = StrategyConfig(
+            entry_time_utc="08:00", mode="iron_condor",
+            target_dte_days=0, dte_window_hours=24,
+        )
         s = IronCondor0DTEStrategy(mock_client, mock_pos_mgr, mock_storage, cfg)
 
         from trader.position_manager import IronCondorPosition
@@ -281,9 +284,9 @@ class TestCondorValidation:
 
 class TestStrategyStatus:
     def test_status_dict(self, mock_client, mock_storage, mock_pos_mgr):
-        cfg = StrategyConfig(underlying="ETH", otm_pct=0.08)
+        cfg = StrategyConfig(underlying="ETH", otm_pct=0.08, mode="iron_condor")
         s = IronCondor0DTEStrategy(mock_client, mock_pos_mgr, mock_storage, cfg)
         status = s.status()
-        assert status["strategy"] == "IronCondor0DTE"
+        assert status["strategy"] == "IronCondor"
         assert status["underlying"] == "ETH"
         assert status["otm_pct"] == 0.08

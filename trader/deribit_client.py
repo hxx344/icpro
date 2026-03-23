@@ -17,7 +17,7 @@ from typing import Any
 import requests
 from loguru import logger
 
-from trader.config import DeribitConfig
+from trader.config import ExchangeConfig
 
 
 @dataclass
@@ -34,6 +34,7 @@ class OptionTicker:
     underlying_price: float
     volume_24h: float
     open_interest: float
+    mark_iv: float = 0.0                 # mark implied vol (decimal, e.g. 0.80)
 
     @property
     def mid_price(self) -> float:
@@ -112,7 +113,7 @@ def _parse_symbol(symbol: str) -> dict | None:
 class DeribitOptionsClient:
     """REST client for Deribit options API v2."""
 
-    def __init__(self, config: DeribitConfig):
+    def __init__(self, config: ExchangeConfig):
         self.cfg = config
         self.session = requests.Session()
         self._base = self.cfg.base_url.rstrip("/")
@@ -193,6 +194,7 @@ class DeribitOptionsClient:
                 underlying_price=float(item.get("underlying_price") or 0.0),
                 volume_24h=float(item.get("volume") or 0.0),
                 open_interest=float(item.get("open_interest") or 0.0),
+                mark_iv=float(item.get("mark_iv") or 0.0) / 100.0,  # API returns %, convert to decimal
             ))
 
         return tickers
@@ -286,3 +288,124 @@ class DeribitOptionsClient:
             order_type="MARKET",
             reduce_only=True,
         )
+
+    # ------------------------------------------------------------------
+    # Additional methods for LimitChaser / PositionManager compatibility
+    # ------------------------------------------------------------------
+
+    def get_ticker(self, symbol: str) -> OptionTicker | None:
+        """Get a single ticker by instrument name."""
+        parsed = _parse_symbol(symbol)
+        if not parsed:
+            return None
+
+        try:
+            result = self._rpc("public/ticker", {"instrument_name": symbol})
+        except Exception:
+            return None
+
+        if not isinstance(result, dict):
+            return None
+
+        mark_iv_raw = float(result.get("mark_iv") or 0.0)
+        return OptionTicker(
+            symbol=symbol,
+            underlying=parsed["underlying"],
+            strike=parsed["strike"],
+            option_type=parsed["option_type"],
+            expiry=parsed["expiry"],
+            bid_price=float(result.get("best_bid_price") or 0.0),
+            ask_price=float(result.get("best_ask_price") or 0.0),
+            mark_price=float(result.get("mark_price") or 0.0),
+            last_price=float(result.get("last_price") or 0.0),
+            underlying_price=float(result.get("underlying_price") or 0.0),
+            volume_24h=float(result.get("stats", {}).get("volume") or 0.0) if isinstance(result.get("stats"), dict) else 0.0,
+            open_interest=float(result.get("open_interest") or 0.0),
+            mark_iv=mark_iv_raw / 100.0,
+        )
+
+    def get_positions(self, underlying: str = "BTC") -> list[dict]:
+        """Get open option positions from Deribit."""
+        if self.cfg.simulate_private or not self.cfg.client_id or not self.cfg.client_secret:
+            return []
+
+        try:
+            result = self._private_rpc("private/get_positions", {
+                "currency": underlying.upper(),
+                "kind": "option",
+            })
+        except Exception as e:
+            logger.error(f"Failed to query positions: {e}")
+            return []
+
+        if not isinstance(result, list):
+            return []
+
+        positions: list[dict] = []
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            size = float(item.get("size") or 0)
+            if abs(size) <= 0:
+                continue
+            positions.append({
+                "symbol": str(item.get("instrument_name", "")),
+                "side": "LONG" if size > 0 else "SHORT",
+                "quantity": abs(size),
+                "entryPrice": float(item.get("average_price") or 0),
+                "unrealizedPnl": float(item.get("floating_profit_loss") or 0),
+            })
+
+        return positions
+
+    def query_order(self, symbol: str, order_id: str) -> OrderResult:
+        """Query a single order by order_id."""
+        if self.cfg.simulate_private:
+            return OrderResult(
+                order_id=order_id, symbol=symbol, side="",
+                quantity=0.0, price=0.0, avg_price=0.0,
+                status="FILLED", fee=0.0, raw={"simulated": True},
+            )
+
+        try:
+            result = self._private_rpc("private/get_order_state", {
+                "order_id": order_id,
+            })
+        except Exception as e:
+            logger.error(f"Query order {order_id} failed: {e}")
+            raise
+
+        order = result if isinstance(result, dict) else {}
+        state = str(order.get("order_state", "")).upper()
+        status_map = {
+            "FILLED": "FILLED",
+            "OPEN": "NEW",
+            "CANCELLED": "CANCELLED",
+            "REJECTED": "REJECTED",
+            "UNTRIGGERED": "NEW",
+        }
+        status = status_map.get(state, state)
+
+        return OrderResult(
+            order_id=str(order.get("order_id", order_id)),
+            symbol=symbol,
+            side=str(order.get("direction", "")).upper(),
+            quantity=float(order.get("filled_amount") or 0.0),
+            price=float(order.get("price") or 0.0),
+            avg_price=float(order.get("average_price") or 0.0),
+            status=status,
+            fee=float(order.get("commission") or 0.0),
+            raw=order,
+        )
+
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel an open order. Returns True on success."""
+        if self.cfg.simulate_private:
+            return True
+
+        try:
+            self._private_rpc("private/cancel", {"order_id": order_id})
+            return True
+        except Exception as e:
+            logger.error(f"Cancel order {order_id} failed: {e}")
+            return False

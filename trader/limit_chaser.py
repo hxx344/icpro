@@ -28,7 +28,7 @@ from typing import Any
 
 from loguru import logger
 
-from trader.binance_client import BinanceOptionsClient, OrderResult, OptionTicker
+from trader.binance_client import OrderResult, OptionTicker
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ class LimitChaser:
 
     def __init__(
         self,
-        client: BinanceOptionsClient,
+        client: Any,
         config: ChaserConfig | None = None,
     ):
         self.client = client

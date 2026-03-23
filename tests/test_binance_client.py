@@ -442,6 +442,77 @@ class TestGetMarkPrices:
         assert prices == {}
 
 
+class TestGetGreeks:
+    """get_greeks 和 enrich_greeks 测试."""
+
+    def test_returns_delta_and_iv(self, client):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [
+            {"symbol": "ETH-260321-2000-C", "markPrice": "125", "underlyingPrice": "2500",
+             "delta": "0.55", "markIV": "0.72"},
+            {"symbol": "ETH-260321-2000-P", "markPrice": "80", "underlyingPrice": "2500",
+             "delta": "-0.45", "markIV": "0.70"},
+            {"symbol": "BTC-260321-85000-C", "markPrice": "1000", "underlyingPrice": "85000",
+             "delta": "0.60", "markIV": "0.50"},
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=mock_resp):
+            greeks = client.get_greeks("ETH")
+        assert len(greeks) == 2
+        assert greeks["ETH-260321-2000-C"]["delta"] == pytest.approx(0.55)
+        assert greeks["ETH-260321-2000-C"]["mark_iv"] == pytest.approx(0.72)
+        assert greeks["ETH-260321-2000-P"]["delta"] == pytest.approx(-0.45)
+
+    def test_error_returns_empty(self, client):
+        with patch.object(client.session, "get", side_effect=Exception("fail")):
+            greeks = client.get_greeks("ETH")
+        assert greeks == {}
+
+    def test_enrich_greeks_populates_tickers(self, client):
+        """enrich_greeks 应将 delta/mark_iv 填入 tickers."""
+        tickers = [
+            OptionTicker(
+                symbol="ETH-260321-2000-C", underlying="ETH", strike=2000.0,
+                option_type="call",
+                expiry=datetime(2026, 3, 21, 8, 0, tzinfo=timezone.utc),
+                bid_price=0.05, ask_price=0.06, mark_price=0.055,
+                last_price=0.054, underlying_price=2500.0,
+                volume_24h=100.0, open_interest=500.0,
+            ),
+        ]
+        assert tickers[0].delta == 0.0  # before
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [
+            {"symbol": "ETH-260321-2000-C", "delta": "0.55", "markIV": "0.72"},
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=mock_resp):
+            client.enrich_greeks(tickers, "ETH")
+        assert tickers[0].delta == pytest.approx(0.55)
+        assert tickers[0].mark_iv == pytest.approx(0.72)
+
+    def test_enrich_greeks_no_match(self, client):
+        """没有匹配的 symbol 时不修改 ticker."""
+        tickers = [
+            OptionTicker(
+                symbol="ETH-260321-2000-C", underlying="ETH", strike=2000.0,
+                option_type="call",
+                expiry=datetime(2026, 3, 21, 8, 0, tzinfo=timezone.utc),
+                bid_price=0.05, ask_price=0.06, mark_price=0.055,
+                last_price=0.054, underlying_price=2500.0,
+                volume_24h=100.0, open_interest=500.0,
+            ),
+        ]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = [
+            {"symbol": "ETH-260321-3000-C", "delta": "0.20", "markIV": "0.80"},
+        ]
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=mock_resp):
+            client.enrich_greeks(tickers, "ETH")
+        assert tickers[0].delta == 0.0  # unchanged
+
+
 # ======================================================================
 # 6. Account
 # ======================================================================

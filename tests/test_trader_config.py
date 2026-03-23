@@ -3,9 +3,7 @@
 覆盖:
   - ExchangeConfig 默认值 & __post_init__
   - 环境变量覆盖
-  - TraderConfig 向后兼容 (deribit alias)
   - load_config YAML 加载
-  - legacy client_id/client_secret 映射
   - 缺失文件处理
 """
 
@@ -20,7 +18,6 @@ import yaml
 
 from trader.config import (
     ExchangeConfig,
-    DeribitConfig,  # backward compat alias
     StrategyConfig,
     StorageConfig,
     MonitorConfig,
@@ -71,10 +68,6 @@ class TestExchangeConfig:
         assert cfg.api_key == "from_yaml"
         assert cfg.api_secret == "from_yaml_secret"
 
-    def test_backward_compat_alias(self):
-        """DeribitConfig 应是 ExchangeConfig 的别名."""
-        assert DeribitConfig is ExchangeConfig
-
 
 # ======================================================================
 # 2. StrategyConfig / StorageConfig / MonitorConfig
@@ -84,9 +77,12 @@ class TestExchangeConfig:
 class TestStrategyConfig:
     def test_defaults(self):
         cfg = StrategyConfig()
+        assert cfg.mode == "strangle"
         assert cfg.underlying == "ETH"
-        assert cfg.otm_pct == 0.08
+        assert cfg.otm_pct == 0.10
         assert cfg.wing_width_pct == 0.02
+        assert cfg.target_dte_days == 7
+        assert cfg.dte_window_hours == 48
         assert cfg.entry_time_utc == "08:00"
         assert cfg.compound is True
 
@@ -115,11 +111,6 @@ class TestTraderConfig:
         assert isinstance(cfg.exchange, ExchangeConfig)
         assert isinstance(cfg.strategy, StrategyConfig)
 
-    def test_deribit_alias(self):
-        """cfg.deribit 应返回 cfg.exchange (向后兼容)."""
-        cfg = TraderConfig()
-        assert cfg.deribit is cfg.exchange
-
 
 # ======================================================================
 # 4. load_config
@@ -130,13 +121,13 @@ class TestLoadConfig:
     def test_load_none(self):
         """path=None 返回全部默认值."""
         cfg = load_config(None)
-        assert cfg.name == "Iron Condor 0DTE +8%"
+        assert cfg.name == "Short Strangle 7DTE ±10%"
         assert cfg.exchange.testnet is True
 
     def test_load_missing_file(self, tmp_path):
         """文件不存在时使用默认值 (不报错)."""
         cfg = load_config(tmp_path / "nonexistent.yaml")
-        assert cfg.name == "Iron Condor 0DTE +8%"
+        assert cfg.name == "Short Strangle 7DTE ±10%"
 
     def test_load_yaml(self, tmp_path, monkeypatch):
         """从 YAML 加载配置并合并."""
@@ -168,30 +159,12 @@ class TestLoadConfig:
         assert cfg.strategy.underlying == "BTC"
         assert cfg.strategy.otm_pct == 0.10
 
-    def test_load_legacy_deribit_key(self, tmp_path, monkeypatch):
-        """旧格式 'deribit' YAML key 也能正确加载."""
-        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
-        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
-
-        config_data = {
-            "deribit": {
-                "api_key": "legacy_key",
-                "api_secret": "legacy_secret",
-            }
-        }
-        yaml_path = tmp_path / "legacy.yaml"
-        with open(yaml_path, "w") as f:
-            yaml.dump(config_data, f)
-
-        cfg = load_config(yaml_path)
-        assert cfg.exchange.api_key == "legacy_key"
-
     def test_load_empty_yaml(self, tmp_path):
         """空 YAML 文件不报错."""
         yaml_path = tmp_path / "empty.yaml"
         yaml_path.write_text("")
         cfg = load_config(yaml_path)
-        assert cfg.name == "Iron Condor 0DTE +8%"
+        assert cfg.name == "Short Strangle 7DTE ±10%"
 
     def test_all_sections_merge(self, tmp_path, monkeypatch):
         """所有配置节都能正确合并."""

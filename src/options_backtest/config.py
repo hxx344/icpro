@@ -39,6 +39,7 @@ class ExecutionConfig(BaseModel):
     """Order execution / fee settings (Deribit rates)."""
 
     slippage: float = 0.0001
+    market_quote_spread_pct: float = 0.10
     taker_fee: float = 0.0003
     maker_fee: float = 0.0003
     min_fee: float = 0.0003

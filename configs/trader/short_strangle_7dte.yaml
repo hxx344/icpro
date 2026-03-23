@@ -1,0 +1,44 @@
+# ============================================================
+# Short Strangle 7DTE ±10% (ETH) — Binance
+# ============================================================
+# DTE=7  OTM=10%  裸卖双卖策略
+# 回测最优参数: Sharpe=2.02, Return=+85.3%, MaxDD=-14.5%
+# ============================================================
+
+name: Short Strangle 7DTE ±10% (ETH)
+exchange:
+  api_key: ''
+  api_secret: ''
+  testnet: false
+  timeout: 10
+  account_currency: USDT
+  simulate_private: false
+strategy:
+  mode: strangle
+  underlying: ETH
+  otm_pct: 0.10
+  wing_width_pct: 0.0
+  target_dte_days: 7
+  dte_window_hours: 48
+  entry_time_utc: '08:00'
+  quantity: 1.0
+  max_positions: 1
+  max_capital_pct: 0.3
+  compound: true
+  wait_for_midpoint: false
+storage:
+  db_path: ./data/trader.db
+  log_dir: ./logs
+  log_level: INFO
+  log_rotation: 1 day
+  log_retention: 30 days
+monitor:
+  check_interval_sec: 60
+  heartbeat_interval_sec: 60
+  equity_snapshot_interval_sec: 300
+chaser:
+  window_seconds: 1800
+  poll_interval_sec: 60
+  tick_size_usdt: 0.01
+  market_fallback_sec: 60
+  max_amend_attempts: 180

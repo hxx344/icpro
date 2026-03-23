@@ -388,6 +388,7 @@ class DataLoader:
         ohlcv_cursor: dict | None = None,
         ohlcv_arith: dict | None = None,
         inst_arrays: dict | None = None,
+        market_price_field: str = "close",
     ) -> "ArrayChain":
         """Build an option‑chain snapshot – **fully vectorised**.
 
@@ -397,10 +398,10 @@ class DataLoader:
         Parameters
         ----------
         ohlcv_index : optional pre-indexed dict mapping instrument name to
-            (ts_arr, close_arr, low_arr, high_arr, vol_arr) numpy arrays.
+            (ts_arr, open_arr, close_arr, low_arr, high_arr, vol_arr) numpy arrays.
             When provided, uses O(log n) searchsorted instead of boolean masks.
         ohlcv_arith : optional pre-built dict mapping instrument name to
-            (start_ns, step_ns, length, close, low, high, vol) for O(1)
+            (start_ns, step_ns, length, open, close, low, high, vol) for O(1)
             arithmetic index lookups on regular hourly grids.
         inst_arrays : optional pre-extracted dict of numpy arrays from
             instruments_df, avoids per-call DataFrame column lookups.
@@ -482,30 +483,32 @@ class DataLoader:
                     if _arith_get is not None:
                         arith = _arith_get(nm)
                         if arith is not None:
-                            start_ns, step_ns, a_len, a_close, a_low, a_high, a_vol = arith
+                            start_ns, step_ns, a_len, a_open, a_close, a_low, a_high, a_vol = arith
                             j = (ts_ns_val - start_ns) // step_ns
+                            price_arr = a_open if market_price_field == "open" else a_close
                             if 0 <= j < a_len:
-                                mark_arr[i] = a_close[j]
-                                bid_arr[i] = a_low[j]
-                                ask_arr[i] = a_high[j]
+                                mark_arr[i] = price_arr[j]
+                                bid_arr[i] = price_arr[j] if market_price_field == "open" else a_low[j]
+                                ask_arr[i] = price_arr[j] if market_price_field == "open" else a_high[j]
                                 vol_arr[i] = a_vol[j]
                             elif j >= a_len:
                                 # past end: use last available
-                                mark_arr[i] = a_close[a_len - 1]
-                                bid_arr[i] = a_low[a_len - 1]
-                                ask_arr[i] = a_high[a_len - 1]
+                                mark_arr[i] = price_arr[a_len - 1]
+                                bid_arr[i] = price_arr[a_len - 1] if market_price_field == "open" else a_low[a_len - 1]
+                                ask_arr[i] = price_arr[a_len - 1] if market_price_field == "open" else a_high[a_len - 1]
                                 vol_arr[i] = a_vol[a_len - 1]
                             continue
                     # Fallback: O(log n) searchsorted for irregular grids
                     if _ohlcv_get is not None:
                         idx_data = _ohlcv_get(nm)
                         if idx_data is not None:
-                            ts_a, close_a, low_a, high_a, vol_a_arr = idx_data
+                            ts_a, open_a, close_a, low_a, high_a, vol_a_arr = idx_data
                             j = int(np.searchsorted(ts_a, ts_np, side="right")) - 1
                             if j >= 0:
-                                mark_arr[i] = close_a[j]
-                                bid_arr[i] = low_a[j]
-                                ask_arr[i] = high_a[j]
+                                px = open_a[j] if market_price_field == "open" else close_a[j]
+                                mark_arr[i] = px
+                                bid_arr[i] = px if market_price_field == "open" else low_a[j]
+                                ask_arr[i] = px if market_price_field == "open" else high_a[j]
                                 vol_arr[i] = vol_a_arr[j]
             elif option_data:
                 ts_np64 = ts.to_datetime64() if hasattr(ts, "to_datetime64") else np.datetime64(ts)
@@ -517,9 +520,11 @@ class DataLoader:
                     if not row_mask.any():
                         continue
                     j = np.flatnonzero(row_mask)[-1]
-                    mark_arr[i] = ohlcv.iloc[j]["close"]
-                    bid_arr[i] = ohlcv.iloc[j]["low"]
-                    ask_arr[i] = ohlcv.iloc[j]["high"]
+                    px_col = "open" if market_price_field == "open" and "open" in ohlcv.columns else "close"
+                    px = ohlcv.iloc[j][px_col]
+                    mark_arr[i] = px
+                    bid_arr[i] = px if market_price_field == "open" else ohlcv.iloc[j]["low"]
+                    ask_arr[i] = px if market_price_field == "open" else ohlcv.iloc[j]["high"]
                     vol_arr[i] = ohlcv.iloc[j].get("volume", 0)
 
         # --- Vectorised Black-76 synthetic fill for missing marks ---------------

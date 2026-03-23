@@ -11,7 +11,6 @@ from typing import Any
 
 from loguru import logger
 
-from trader.binance_client import BinanceOptionsClient
 from trader.position_manager import PositionManager
 from trader.storage import Storage
 
@@ -28,7 +27,7 @@ class EquityTracker:
 
     def __init__(
         self,
-        client: BinanceOptionsClient,
+        client: Any,
         position_mgr: PositionManager,
         storage: Storage,
         underlying: str = "ETH",

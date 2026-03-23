@@ -173,11 +173,11 @@ class BacktestEngine:
         self._settlements_df: pd.DataFrame = pd.DataFrame()
 
         # Pre-indexed data for fast lookups (built in _load_data)
-        self._ohlcv_index: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._ohlcv_index: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         self._instrument_dict: dict[str, dict] = {}
         self._settlement_index: dict[str, float] = {}  # instrument_name → index_price
-        # Arithmetic OHLCV index: name → (start_ns, step_ns, length, close, low, high, vol)
-        self._ohlcv_arith: dict[str, tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        # Arithmetic OHLCV index: name → (start_ns, step_ns, length, open, close, low, high, vol)
+        self._ohlcv_arith: dict[str, tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
         self._iv_observations: dict[str, tuple[int, float]] = {}
         self._realized_vol_ts: np.ndarray = np.array([], dtype="datetime64[ns]")
         self._realized_vol_values: np.ndarray = np.array([], dtype=float)
@@ -209,7 +209,11 @@ class BacktestEngine:
 
         # 2. Pre-extract numpy arrays for fast iteration
         ts_values = self._underlying_df["timestamp"].values          # datetime64[ns, UTC]
+        open_values = (self._underlying_df["open"].values.astype(np.float64)
+                   if "open" in self._underlying_df.columns
+                   else self._underlying_df["close"].values.astype(np.float64))
         close_values = self._underlying_df["close"].values.astype(np.float64)
+        daily_open_close_mode = cfg.time_step == "1d"
         n_steps = len(ts_values)
         if n_steps == 0:
             raise RuntimeError("No underlying data for the given period")
@@ -218,7 +222,7 @@ class BacktestEngine:
 
         # 2b. USD margin: convert initial balance from coin to USD
         if self._margin_usd:
-            first_price = float(close_values[0])
+            first_price = float(open_values[0] if daily_open_close_mode else close_values[0])
             if first_price > 0:
                 usd_balance = self.account.initial_balance * first_price
                 self.account.initial_balance = usd_balance
@@ -228,7 +232,7 @@ class BacktestEngine:
 
         # 3. Initialise strategy
         ts0 = pd.Timestamp(ts_values[0])
-        initial_ctx = self._build_context(ts0, float(close_values[0]))
+        initial_ctx = self._build_context(ts0, float(open_values[0] if daily_open_close_mode else close_values[0]))
         self.strategy.initialize(initial_ctx)
 
         # Local references for hot-path (avoid repeated attribute lookups)
@@ -247,17 +251,17 @@ class BacktestEngine:
         # 4. Iterate
         for i in tqdm(range(n_steps), desc="Backtesting"):
             ts_np = ts_values[i]               # numpy datetime64
-            price = float(close_values[i])
+            open_price = float(open_values[i])
+            close_price = float(close_values[i])
             ts_pd = ts_pd_all[i]               # pre-converted pd.Timestamp
 
             has_positions = bool(position_mgr.positions)
 
-            # 4a. Update marks on existing positions (skip if none)
-            if has_positions:
-                mark_prices = self._get_mark_prices_fast(ts_np, price)
+            # 4a. Update marks / settle for non-daily modes before strategy acts
+            if has_positions and not daily_open_close_mode:
+                mark_prices = self._get_mark_prices_fast(ts_np, close_price)
                 position_mgr.update_marks(mark_prices)
 
-                # 4b. Check and settle expired positions
                 check_and_settle(
                     ts_np, position_mgr, account,
                     matcher, instrument_dict, settlements_df,
@@ -266,16 +270,26 @@ class BacktestEngine:
                 )
 
             # 4c. Build context (lazy chain) and call strategy
-            ctx = self._build_context(ts_pd, price)
+            ctx = self._build_context(ts_pd, open_price if daily_open_close_mode else close_price)
             pending_orders.clear()
             strategy.on_step(ctx)
 
             # 4d. Process pending orders (reuse ctx)
             if pending_orders:
-                self._process_orders(ts_np, price, ctx)
+                self._process_orders(
+                    ts_np,
+                    open_price if daily_open_close_mode else close_price,
+                    ctx,
+                    price_field="open" if daily_open_close_mode else "close",
+                )
+
+            if daily_open_close_mode and position_mgr.positions:
+                mark_prices = self._get_mark_prices_fast(ts_np, close_price)
+                position_mgr.update_marks(mark_prices)
+                self._close_expiring_positions_at_bar_close(ts_np, close_price, ctx)
 
             # 4e. Record equity
-            account.record_equity(ts_pd, position_mgr.total_unrealized_pnl, price)
+            account.record_equity(ts_pd, position_mgr.total_unrealized_pnl, close_price)
 
         # 5. Force‑close remaining positions at last mark
         if position_mgr.positions:
@@ -284,7 +298,7 @@ class BacktestEngine:
             last_price = float(close_values[-1])
             ctx = self._build_context(last_ts, last_price)
             ctx.close_all()
-            self._process_orders(ts_values[-1], last_price, ctx)
+            self._process_orders(ts_values[-1], last_price, ctx, price_field="close")
             account.record_equity(last_ts, position_mgr.total_unrealized_pnl, last_price)
 
         # 6. Call strategy on_end (no‑op in base, but strategies can use it)
@@ -358,6 +372,8 @@ class BacktestEngine:
         _HOUR_NS = 3600 * 1_000_000_000
         for name, df in self._option_data.items():
             ts_arr = np.asarray(df["timestamp"].values)  # sorted datetime64
+            open_arr = (np.asarray(df["open"].values, dtype=np.float64)
+                        if "open" in df.columns else np.asarray(df["close"].values, dtype=np.float64))
             close_arr = np.asarray(df["close"].values, dtype=np.float64)
             low_arr = (np.asarray(df["low"].values, dtype=np.float64)
                        if "low" in df.columns else close_arr.copy())
@@ -365,7 +381,7 @@ class BacktestEngine:
                         if "high" in df.columns else close_arr.copy())
             vol_arr = (np.asarray(df["volume"].values, dtype=np.float64)
                        if "volume" in df.columns else np.zeros(len(df), dtype=np.float64))
-            self._ohlcv_index[name] = (ts_arr, close_arr, low_arr, high_arr, vol_arr)
+            self._ohlcv_index[name] = (ts_arr, open_arr, close_arr, low_arr, high_arr, vol_arr)
 
             # Build O(1) arithmetic index for regularly-spaced (hourly) grids
             n_rows = len(ts_arr)
@@ -380,13 +396,13 @@ class BacktestEngine:
                         # Regular grid → O(1) index
                         self._ohlcv_arith[name] = (
                             start_ns, step_ns, n_rows,
-                            close_arr, low_arr, high_arr, vol_arr,
+                            open_arr, close_arr, low_arr, high_arr, vol_arr,
                         )
             elif n_rows == 1:
                 ts_ns = ts_arr.view("int64")  # zero-copy view
                 self._ohlcv_arith[name] = (
                     int(ts_ns[0]), _HOUR_NS, 1,
-                    close_arr, low_arr, high_arr, vol_arr,
+                    open_arr, close_arr, low_arr, high_arr, vol_arr,
                 )
 
         # --- Pre-build instrument dict for O(1) lookup (fast vectorised) ---
@@ -431,6 +447,7 @@ class BacktestEngine:
                 prefer_market_data=not self.config.backtest.use_bs_only,
                 ohlcv_arith=self._ohlcv_arith,
                 inst_arrays=self._inst_arrays,
+                market_price_field="open" if self.config.backtest.time_step == "1d" else "close",
             )
             self._chain_source_market += sc["market"]
             self._chain_source_synth += sc["synth"]
@@ -469,7 +486,7 @@ class BacktestEngine:
             if use_market_data:
                 arith = ohlcv_arith.get(name)
                 if arith is not None:
-                    start_ns, step_ns, a_len, a_close = arith[0], arith[1], arith[2], arith[3]
+                    start_ns, step_ns, a_len, a_close = arith[0], arith[1], arith[2], arith[4]
                     j = (_ts_ns_val - start_ns) // step_ns
                     if j < 0:
                         j = -1
@@ -485,7 +502,7 @@ class BacktestEngine:
                 # Fallback: O(log n) searchsorted
                 idx_data = ohlcv_index.get(name)
                 if idx_data is not None:
-                    ts_arr, close_arr = idx_data[0], idx_data[1]
+                    ts_arr, close_arr = idx_data[0], idx_data[2]
                     j = np.searchsorted(ts_arr, ts_np, side="right") - 1
                     if j >= 0:
                         market_mark = float(close_arr[j])
@@ -519,12 +536,12 @@ class BacktestEngine:
     # Order processing
     # ------------------------------------------------------------------
 
-    def _process_orders(self, ts_np, underlying_price: float, ctx=None) -> None:
+    def _process_orders(self, ts_np, underlying_price: float, ctx=None, price_field: str = "close") -> None:
         from options_backtest.data.models import Direction
 
         for order in self._pending_orders:
             # Look up current bid / ask / mark for the instrument
-            bid, ask, mark = self._get_quotes_fast(order.instrument_name, ts_np, underlying_price)
+            bid, ask, mark = self._get_quotes_fast(order.instrument_name, ts_np, underlying_price, price_field=price_field)
             if mark is None or mark <= 0:
                 logger.warning(f"No quote for {order.instrument_name}, skipping order")
                 continue
@@ -550,7 +567,7 @@ class BacktestEngine:
 
         self._pending_orders.clear()
 
-    def _get_quotes_fast(self, instrument_name: str, ts_np, underlying_price: float = 0.0):
+    def _get_quotes_fast(self, instrument_name: str, ts_np, underlying_price: float = 0.0, price_field: str = "close"):
         """Return (bid, ask, mark) using pre-indexed OHLCV + searchsorted.
 
         Falls back to Black-76 when no OHLCV data is available.
@@ -561,7 +578,7 @@ class BacktestEngine:
             # O(1) arithmetic index for regular grids
             arith = self._ohlcv_arith.get(instrument_name)
             if arith is not None:
-                start_ns, step_ns, a_len, a_close, a_low, a_high, _ = arith
+                start_ns, step_ns, a_len, a_open, a_close, a_low, a_high, _ = arith
                 _ts_ns = int(np.datetime64(ts_np, 'ns').view('int64')) if not isinstance(ts_np, (int, np.integer)) else int(ts_np)
                 j = (_ts_ns - start_ns) // step_ns
                 if j < 0:
@@ -569,29 +586,31 @@ class BacktestEngine:
                 elif j >= a_len:
                     j = a_len - 1
                 if j >= 0:
-                    market_mark = float(a_close[j])
+                    market_mark = float(a_open[j] if price_field == "open" else a_close[j])
                     self._quote_source_market += 1
                     self._update_iv_observation(instrument_name, ts_np, market_mark, underlying_price)
-                    if margin_usd:
-                        return (float(a_low[j]) * underlying_price,
-                                float(a_high[j]) * underlying_price,
-                                market_mark * underlying_price)
-                    return float(a_low[j]), float(a_high[j]), market_mark
+                    if self.config.backtest.time_step == "1d" and price_field in {"open", "close"}:
+                        px = market_mark * underlying_price if margin_usd else market_mark
+                        return px, px, px
+                    mark = market_mark * underlying_price if margin_usd else market_mark
+                    bid, ask = self._derive_market_bid_ask(mark)
+                    return bid, ask, mark
 
             # Fallback: O(log n) searchsorted
             idx_data = self._ohlcv_index.get(instrument_name)
             if idx_data is not None:
-                ts_arr, close_arr, low_arr, high_arr, _ = idx_data
+                ts_arr, open_arr, close_arr, low_arr, high_arr, _ = idx_data
                 j = np.searchsorted(ts_arr, ts_np, side="right") - 1
                 if j >= 0:
-                    market_mark = float(close_arr[j])
+                    market_mark = float(open_arr[j] if price_field == "open" else close_arr[j])
                     self._quote_source_market += 1
                     self._update_iv_observation(instrument_name, ts_np, market_mark, underlying_price)
-                    if margin_usd:
-                        return (float(low_arr[j]) * underlying_price,
-                                float(high_arr[j]) * underlying_price,
-                                market_mark * underlying_price)
-                    return float(low_arr[j]), float(high_arr[j]), market_mark
+                    if self.config.backtest.time_step == "1d" and price_field in {"open", "close"}:
+                        px = market_mark * underlying_price if margin_usd else market_mark
+                        return px, px, px
+                    mark = market_mark * underlying_price if margin_usd else market_mark
+                    bid, ask = self._derive_market_bid_ask(mark)
+                    return bid, ask, mark
 
         # Synthetic pricing
         if underlying_price <= 0:
@@ -615,6 +634,62 @@ class BacktestEngine:
         spread = mark * 0.02
         self._quote_source_synth += 1
         return max(mark - spread, 0.0), mark + spread, mark
+
+    def _close_expiring_positions_at_bar_close(self, ts_np, underlying_price: float, ctx=None) -> None:
+        """For 1D bars, close positions expiring within the current bar at the bar close price."""
+        from options_backtest.data.models import Direction, Fill
+
+        bar_end_ns = int(np.datetime64(ts_np, 'ns').view('int64')) + 86400 * 1_000_000_000
+        for name in list(self.position_mgr.positions.keys()):
+            inst_data = self._instrument_dict.get(name)
+            if not inst_data:
+                continue
+
+            exp_ns = inst_data.get("_expiry_ns")
+            if exp_ns is None or int(exp_ns) > bar_end_ns:
+                continue
+
+            _, _, close_mark = self._get_quotes_fast(name, ts_np, underlying_price, price_field="close")
+            if close_mark is None or close_mark <= 0:
+                continue
+
+            pos = self.position_mgr.positions.get(name)
+            if pos is None:
+                continue
+
+            exit_dir = Direction.LONG if pos.direction == Direction.SHORT else Direction.SHORT
+            fee = self.matcher._compute_fee(close_mark, pos.quantity, underlying_price)
+            fill = Fill(
+                timestamp=pd.Timestamp(ts_np) if not isinstance(ts_np, pd.Timestamp) else ts_np,
+                instrument_name=name,
+                direction=exit_dir,
+                quantity=pos.quantity,
+                fill_price=close_mark,
+                fee=fee,
+                underlying_price=underlying_price,
+            )
+            self.position_mgr.apply_fill(fill)
+            self.account.pay_fee(fill.fee)
+
+            if exit_dir == Direction.LONG:
+                self.account.withdraw(fill.fill_price * fill.quantity)
+            else:
+                self.account.deposit(fill.fill_price * fill.quantity)
+
+            if ctx is not None:
+                self.strategy.on_fill(ctx, fill)
+
+    def _derive_market_bid_ask(self, mark: float) -> tuple[float, float]:
+        """Build a conservative quote proxy from OHLC-only market data.
+
+        Daily CDD files do not contain real order-book bid/ask. Using OHLC low/high
+        as instantaneous bid/ask introduces look-ahead bias, so we instead apply a
+        fixed spread around the observed close/mark.
+        """
+        spread_pct = max(float(self.config.execution.market_quote_spread_pct), 0.0)
+        spread = max(mark * spread_pct, self.config.execution.slippage * 2)
+        half_spread = spread / 2.0
+        return max(mark - half_spread, 0.0), mark + half_spread
 
     def _resolve_dynamic_iv(
         self,

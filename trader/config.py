@@ -86,7 +86,7 @@ def _auto_load_dotenv(config_path: Path | None) -> None:
 
 @dataclass
 class ExchangeConfig:
-    """Exchange API connection settings (Binance European Options)."""
+    """Exchange API connection settings (Binance USD margin)."""
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = True
@@ -98,7 +98,6 @@ class ExchangeConfig:
     def __post_init__(self):
         self.api_key = os.environ.get("BINANCE_API_KEY", self.api_key)
         self.api_secret = os.environ.get("BINANCE_API_SECRET", self.api_secret)
-
         if not self.base_url:
             self.base_url = (
                 "https://testnet.binancefuture.com"
@@ -107,19 +106,35 @@ class ExchangeConfig:
             )
 
 
-# Backward-compatible alias
-DeribitConfig = ExchangeConfig
-
-
 @dataclass
 class StrategyConfig:
-    """Iron Condor 0DTE strategy parameters."""
+    """Options selling strategy parameters.
+
+    Modes:
+      - strangle      : 2-leg naked sell (OTM%-based strikes)
+      - iron_condor   : 4-leg IC  (OTM%-based strikes)
+      - weekend_vol   : Weekend vol selling IC (delta-based, Friday→Sunday)
+    """
+    mode: str = "strangle"               # "strangle" / "iron_condor" / "weekend_vol"
     underlying: str = "ETH"
-    otm_pct: float = 0.08               # 8% OTM for short legs
-    wing_width_pct: float = 0.02         # additional 2% for long legs (protection)
-    entry_time_utc: str = "08:00"         # daily entry at HH:MM UTC
+
+    # --- OTM%-based strike selection (strangle / iron_condor) ---
+    otm_pct: float = 0.10                # 10% OTM for short legs
+    wing_width_pct: float = 0.02         # additional 2% for long legs
+    target_dte_days: int = 7             # target DTE in days (0 = 0DTE)
+    dte_window_hours: int = 48           # accept options within ±window of target DTE
+
+    # --- Delta-based strike selection (weekend_vol) ---
+    target_delta: float = 0.40           # |delta| for short legs
+    wing_delta: float = 0.05            # |delta| for protection legs (0 = no wings)
+    leverage: float = 1.0                # notional leverage multiplier
+    entry_day: str = "friday"            # day of week to enter (lowercase)
+    default_iv: float = 0.60             # fallback IV if mark_iv unavailable
+
+    # --- Common ---
+    entry_time_utc: str = "08:00"         # entry at HH:MM UTC
     quantity: float = 0.01               # base order quantity (in contracts)
-    max_positions: int = 1               # max concurrent iron condors
+    max_positions: int = 1               # max concurrent positions
     max_capital_pct: float = 0.30        # max 30% of account for positions
     compound: bool = True                # scale quantity to equity
     wait_for_midpoint: bool = False      # wait for spot to reach strike midpoint before entry
@@ -156,17 +171,14 @@ class ChaserConfig:
 @dataclass
 class TraderConfig:
     """Top-level trader configuration."""
-    name: str = "Iron Condor 0DTE +8%"
+    name: str = "Short Strangle 7DTE ±10%"
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     chaser: ChaserConfig = field(default_factory=ChaserConfig)
 
-    # Backward-compat alias so old code using cfg.deribit still works
-    @property
-    def deribit(self) -> ExchangeConfig:
-        return self.exchange
+
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +220,12 @@ def load_config(path: str | Path | None = None) -> TraderConfig:
             if "name" in raw:
                 cfg.name = raw["name"]
 
-            # Support both 'exchange' (new) and 'deribit' (legacy) keys
-            raw_exchange = raw.get("exchange") or raw.get("deribit")
+            raw_exchange = raw.get("exchange")
             _merge_section(cfg.exchange, raw_exchange)
             _merge_section(cfg.strategy, raw.get("strategy"))
             _merge_section(cfg.storage, raw.get("storage"))
             _merge_section(cfg.monitor, raw.get("monitor"))
             _merge_section(cfg.chaser, raw.get("chaser"))
-
-            # Map legacy deribit field names to new ones
-            if hasattr(cfg.exchange, "client_id") and not cfg.exchange.api_key:
-                cfg.exchange.api_key = getattr(cfg.exchange, "client_id", "")
-            if hasattr(cfg.exchange, "client_secret") and not cfg.exchange.api_secret:
-                cfg.exchange.api_secret = getattr(cfg.exchange, "client_secret", "")
 
             # If YAML did not explicitly set base_url, clear it so
             # __post_init__ recalculates from the (possibly changed) testnet flag.

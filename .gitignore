@@ -27,7 +27,16 @@ Thumbs.db
 
 # Reports & sandbox outputs
 reports/
-sandbox/logs/
+sandbox/
+
+# Logs
+logs/
+test_logs/
+*.log
+
+# Checkpoints & temp
+scripts/.cdd_0dte_checkpoint.json
+*.db
 
 # Environment
 .env

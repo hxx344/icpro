@@ -1,0 +1,70 @@
+# ============================================================
+# Weekend Volatility Selling — BTC Iron Condor (Binance USD)
+# ============================================================
+# 策略: 每周五 16:00 UTC 卖出周末到期铁鹰
+#   - Short delta ≈ 0.40 (call + put)
+#   - Wing  delta ≈ 0.05 (保护翼)
+#   - 3x USD 杠杆, 复利
+#   - 持有至周日 08:00 UTC 自动结算
+#
+# 回测绩效 (2022-01 ~ 2024-12, $16,821 起始):
+#   APR 321.1%  |  MaxDD 18.7%  |  Calmar 17.16
+#   Sharpe 3.69 |  Win Rate 81.4%
+# ============================================================
+
+name: Weekend Vol BTC Iron Condor (Binance 3x USD)
+
+exchange:
+  api_key: ''                  # 或设置环境变量 BINANCE_API_KEY
+  api_secret: ''               # 或设置环境变量 BINANCE_API_SECRET
+  testnet: false
+  base_url: ''                 # 留空自动选择 (prod: eapi.binance.com)
+  timeout: 15
+  account_currency: USDT
+  simulate_private: true       # 模拟模式, 上线时改为 false
+
+strategy:
+  mode: weekend_vol
+  underlying: BTC
+
+  # Delta-based strike selection
+  target_delta: 0.40           # |δ| for short legs (sell call / sell put)
+  wing_delta: 0.05             # |δ| for protection legs (buy call / buy put)
+  default_iv: 0.60             # fallback IV if mark_iv unavailable
+
+  # Entry timing
+  entry_day: friday
+  entry_time_utc: '16:00'      # Friday 16:00 UTC (weekend vol window)
+
+  # Position sizing
+  leverage: 3.0                # 3x notional leverage
+  quantity: 0.1                # minimum qty (BTC)
+  max_positions: 1
+  max_capital_pct: 1.0         # leverage already accounted in qty calc
+  compound: true               # scale qty to account equity
+
+  # Legacy fields (unused in weekend_vol mode)
+  otm_pct: 0.10
+  wing_width_pct: 0.0
+  target_dte_days: 0
+  dte_window_hours: 48
+  wait_for_midpoint: false
+
+storage:
+  db_path: ./data/trader_weekend_vol.db
+  log_dir: ./logs
+  log_level: INFO
+  log_rotation: 1 day
+  log_retention: 30 days
+
+monitor:
+  check_interval_sec: 60       # 每 60 秒检查一次
+  heartbeat_interval_sec: 300  # 每 5 分钟心跳
+  equity_snapshot_interval_sec: 1800  # 每 30 分钟快照 (周末交易时间短)
+
+chaser:
+  window_seconds: 600          # 10 分钟追单窗口 (周末期权流动性一般)
+  poll_interval_sec: 30        # 每 30 秒检查
+  tick_size_usdt: 0.0005       # BTC 期权最小步长
+  market_fallback_sec: 60      # 最后 60 秒切市价
+  max_amend_attempts: 30

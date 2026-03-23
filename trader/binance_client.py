@@ -46,6 +46,8 @@ class OptionTicker:
     underlying_price: float
     volume_24h: float
     open_interest: float
+    delta: float = 0.0
+    mark_iv: float = 0.0
 
     @property
     def mid_price(self) -> float:
@@ -257,6 +259,50 @@ class BinanceOptionsClient:
             ))
 
         return tickers
+
+
+    def enrich_greeks(self, tickers: list, underlying: str = "ETH") -> None:
+        """Fetch Greeks from /eapi/v1/mark and populate delta/mark_iv on tickers.
+
+        Binance /eapi/v1/ticker does not return Greeks; only /eapi/v1/mark does.
+        Call this after get_tickers() to populate delta and mark_iv fields.
+        """
+        greeks = self.get_greeks(underlying)
+        if not greeks:
+            return
+        for t in tickers:
+            if t.symbol in greeks:
+                g = greeks[t.symbol]
+                t.delta = g["delta"]
+                t.mark_iv = g["mark_iv"]
+
+    def get_greeks(self, underlying: str = "ETH") -> dict:
+        """Fetch delta and mark IV for all options from /eapi/v1/mark.
+
+        Returns
+        -------
+        dict  : {symbol: {"delta": float, "mark_iv": float}}
+        """
+        ul = underlying.upper()
+        try:
+            result = self._public_get("/eapi/v1/mark")
+        except Exception:
+            return {}
+
+        greeks = {}
+        if not isinstance(result, list):
+            return greeks
+
+        for item in result:
+            symbol = str(item.get("symbol", ""))
+            if not symbol.startswith(f"{ul}-"):
+                continue
+            greeks[symbol] = {
+                "delta": float(item.get("delta") or 0),
+                "mark_iv": float(item.get("markIV") or 0),
+            }
+
+        return greeks
 
     def get_mark_prices(self, underlying: str = "ETH"):
         ul = underlying.upper()
@@ -592,6 +638,8 @@ class BinanceOptionsClient:
                 underlying_price=spot,
                 volume_24h=float(item.get("volume") or 0),
                 open_interest=float(item.get("amount") or 0),
+                delta=float(item.get("delta") or 0),
+                mark_iv=float(item.get("markIV") or 0),
             )
 
         return None

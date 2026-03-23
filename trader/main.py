@@ -27,7 +27,7 @@ from trader.config import TraderConfig, load_config
 from trader.equity import EquityTracker
 from trader.position_manager import PositionManager
 from trader.storage import Storage
-from trader.strategy import IronCondor0DTEStrategy
+from trader.strategy import IronCondor0DTEStrategy, WeekendVolStrategy
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,9 @@ class TraderApp:
 
         self.storage = Storage(config.storage.db_path)
 
+        # Binance USD margin client
+        strategy_mode = getattr(config.strategy, "mode", "strangle")
+
         self.client = BinanceOptionsClient(config.exchange)
         logger.info(
             f"Binance client: {'TESTNET' if config.exchange.testnet else 'PRODUCTION'} "
@@ -105,12 +108,21 @@ class TraderApp:
 
         self.pos_mgr = PositionManager(self.client, self.storage)
 
-        self.strategy = IronCondor0DTEStrategy(
-            client=self.client,
-            position_mgr=self.pos_mgr,
-            storage=self.storage,
-            config=config.strategy,
-        )
+        # Select strategy based on mode
+        if strategy_mode == "weekend_vol":
+            self.strategy = WeekendVolStrategy(
+                client=self.client,
+                position_mgr=self.pos_mgr,
+                storage=self.storage,
+                config=config.strategy,
+            )
+        else:
+            self.strategy = IronCondor0DTEStrategy(
+                client=self.client,
+                position_mgr=self.pos_mgr,
+                storage=self.storage,
+                config=config.strategy,
+            )
 
         self.equity_tracker = EquityTracker(
             client=self.client,
@@ -119,6 +131,7 @@ class TraderApp:
             underlying=config.strategy.underlying,
         )
 
+        logger.info(f"Strategy: {strategy_mode} | Exchange: Binance")
         logger.info("All modules initialized")
 
     # ------------------------------------------------------------------
@@ -134,9 +147,19 @@ class TraderApp:
         logger.info("=" * 60)
         logger.info(f"  {self.cfg.name}")
         logger.info(f"  Underlying:    {self.cfg.strategy.underlying}")
-        logger.info(f"  OTM:           ±{self.cfg.strategy.otm_pct*100:.0f}%")
-        logger.info(f"  Wing width:    {self.cfg.strategy.wing_width_pct*100:.0f}%")
-        logger.info(f"  Entry time:    {self.cfg.strategy.entry_time_utc} UTC")
+
+        mode = getattr(self.cfg.strategy, "mode", "strangle")
+        if mode == "weekend_vol":
+            logger.info(f"  Mode:          Weekend Vol Selling")
+            logger.info(f"  Target delta:  {self.cfg.strategy.target_delta}")
+            logger.info(f"  Wing delta:    {self.cfg.strategy.wing_delta}")
+            logger.info(f"  Leverage:      {self.cfg.strategy.leverage}x")
+            logger.info(f"  Entry:         {self.cfg.strategy.entry_day} {self.cfg.strategy.entry_time_utc} UTC")
+        else:
+            logger.info(f"  OTM:           ±{self.cfg.strategy.otm_pct*100:.0f}%")
+            logger.info(f"  Wing width:    {self.cfg.strategy.wing_width_pct*100:.0f}%")
+            logger.info(f"  Entry time:    {self.cfg.strategy.entry_time_utc} UTC")
+
         logger.info(f"  DB:            {self.cfg.storage.db_path}")
         logger.info(f"  Check interval:{self.cfg.monitor.check_interval_sec}s")
         logger.info("=" * 60)
@@ -370,7 +393,7 @@ def cmd_close_all(args) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="期权铁鹰 0DTE 交易程序",
+        description="期权交易程序 – Weekend Vol / Iron Condor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
@@ -382,7 +405,7 @@ Commands:
   close-all   紧急平仓所有持仓
 
 Examples:
-  python -m trader.main run --config configs/trader/iron_condor_0dte.yaml
+  python -m trader.main run --config configs/trader/weekend_vol_btc.yaml
   python -m trader.main status
   python -m trader.main trades --limit 50
   python -m trader.main stats
@@ -391,8 +414,8 @@ Examples:
 
     parser.add_argument(
         "--config", "-c",
-        default="configs/trader/iron_condor_0dte.yaml",
-        help="配置文件路径 (默认: configs/trader/iron_condor_0dte.yaml)",
+        default="configs/trader/weekend_vol_btc.yaml",
+        help="配置文件路径 (默认: configs/trader/weekend_vol_btc.yaml)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="可用命令")

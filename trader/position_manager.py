@@ -14,7 +14,6 @@ from typing import Any
 from loguru import logger
 
 from trader.binance_client import (
-    BinanceOptionsClient,
     OrderResult,
     OptionTicker,
 )
@@ -109,7 +108,7 @@ class PositionManager:
 
     def __init__(
         self,
-        client: BinanceOptionsClient,
+        client: Any,
         storage: Storage,
         chaser_config: ChaserConfig | None = None,
     ):
@@ -171,6 +170,117 @@ class PositionManager:
 
         if self.open_condors:
             logger.info(f"Recovered {len(self.open_condors)} open condor position(s)")
+
+    # ------------------------------------------------------------------
+    # Open a new short strangle (2-leg naked sell)
+    # ------------------------------------------------------------------
+
+    def open_short_strangle(
+        self,
+        sell_call_symbol: str,
+        sell_put_symbol: str,
+        sell_call_strike: float,
+        sell_put_strike: float,
+        quantity: float,
+        underlying_price: float,
+    ) -> IronCondorPosition | None:
+        """Open a naked short strangle via limit-order chaser (2 legs).
+
+        Returns the IronCondorPosition (with buy legs = None) if all legs
+        fill, or None on failure.
+        """
+        group_id = f"SS_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+
+        logger.info(
+            f"Opening Short Strangle {group_id} (limit chaser): "
+            f"sell_put={sell_put_strike} "
+            f"sell_call={sell_call_strike} "
+            f"qty={quantity} spot={underlying_price}"
+        )
+
+        leg_orders = [
+            LegOrder(
+                leg_role="sell_put", symbol=sell_put_symbol, side="SELL",
+                quantity=quantity, strike=sell_put_strike, option_type="put",
+            ),
+            LegOrder(
+                leg_role="sell_call", symbol=sell_call_symbol, side="SELL",
+                quantity=quantity, strike=sell_call_strike, option_type="call",
+            ),
+        ]
+
+        try:
+            results = self.chaser.execute_legs(leg_orders)
+        except Exception as e:
+            logger.error(f"Short Strangle {group_id}: execute_legs exception: {e}")
+            return None
+
+        failed = [r for r in results if r.status != "FILLED"]
+        if failed:
+            logger.error(
+                f"Short Strangle {group_id}: {len(failed)} leg(s) failed to fill – "
+                + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
+            )
+            filled_results = [
+                (r.leg_role, OrderResult(
+                    order_id=r.order_id, symbol=r.symbol, side=r.side,
+                    quantity=r.filled_qty, price=r.avg_price,
+                    avg_price=r.avg_price, status="FILLED",
+                    fee=r.fee, raw={},
+                ))
+                for r in results if r.status == "FILLED"
+            ]
+            self._rollback_legs(filled_results, quantity)
+            return None
+
+        condor = IronCondorPosition(
+            group_id=group_id,
+            entry_time=datetime.now(timezone.utc),
+            underlying_price=underlying_price,
+        )
+
+        total_premium = 0.0
+        for leg_order in results:
+            meta = {
+                "leg_role": leg_order.leg_role,
+                "option_type": leg_order.option_type,
+                "strike": leg_order.strike,
+                "underlying_price": underlying_price,
+                "group_id": group_id,
+            }
+            trade_id = self.storage.record_trade(
+                trade_group=group_id,
+                symbol=leg_order.symbol,
+                side=leg_order.side,
+                quantity=quantity,
+                price=leg_order.avg_price,
+                fee=leg_order.fee,
+                order_id=leg_order.order_id,
+                meta=meta,
+            )
+
+            leg = CondorLeg(
+                symbol=leg_order.symbol,
+                side=leg_order.side,
+                option_type=leg_order.option_type,
+                strike=leg_order.strike,
+                quantity=quantity,
+                entry_price=leg_order.avg_price,
+                trade_id=trade_id,
+                order_id=leg_order.order_id,
+            )
+            setattr(condor, leg_order.leg_role, leg)
+            total_premium += leg_order.avg_price * quantity
+
+        condor.total_premium = total_premium
+        self.open_condors[group_id] = condor
+
+        logger.info(
+            f"Short Strangle {group_id} opened via limit chaser. "
+            f"Net premium: {total_premium:.4f} USD"
+        )
+
+        return condor
 
     # ------------------------------------------------------------------
     # Open a new iron condor
