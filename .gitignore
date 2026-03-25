@@ -37,6 +37,9 @@ test_logs/
 # Checkpoints & temp
 scripts/.cdd_0dte_checkpoint.json
 *.db
+tmp/
+*.seg*
+*.csv.tmp
 
 # Environment
 .env
