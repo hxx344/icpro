@@ -25,7 +25,7 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from loguru import logger
 
@@ -97,6 +97,54 @@ class LimitChaser:
         self._quote_cache: dict[str, tuple[OptionTicker, float]] = {}
         self._quote_cache_ttl_sec = min(max(self.cfg.poll_interval_sec, 1), 5)
         self._market_fallback_steps = 3
+
+    def _legs_snapshot(self, legs: list[LegOrder]) -> list[dict[str, Any]]:
+        return [
+            {
+                "leg_role": leg.leg_role,
+                "symbol": leg.symbol,
+                "side": leg.side,
+                "quantity": leg.quantity,
+                "filled_qty": leg.filled_qty,
+                "remaining_qty": max(leg.quantity - leg.filled_qty, 0.0),
+                "status": leg.status,
+                "attempts": leg.attempts,
+                "current_price": leg.current_price,
+                "avg_price": leg.avg_price,
+                "order_id": leg.order_id,
+                "client_order_id": leg.client_order_id,
+            }
+            for leg in legs
+        ]
+
+    def _emit_progress(
+        self,
+        status_callback: Optional[Callable[[dict[str, Any]], None]],
+        event: str,
+        legs: list[LegOrder],
+        **extra: Any,
+    ) -> None:
+        if status_callback is None:
+            return
+
+        total_qty = sum(max(float(leg.quantity or 0.0), 0.0) for leg in legs)
+        filled_qty = sum(min(max(float(leg.filled_qty or 0.0), 0.0), max(float(leg.quantity or 0.0), 0.0)) for leg in legs)
+        fill_ratio = (filled_qty / total_qty) if total_qty > 0 else 0.0
+        payload = {
+            "event": event,
+            "legs": self._legs_snapshot(legs),
+            "filled_legs": sum(1 for leg in legs if leg.status == "FILLED"),
+            "failed_legs": sum(1 for leg in legs if leg.status == "FAILED"),
+            "done_legs": sum(1 for leg in legs if leg.status in ("FILLED", "FAILED")),
+            "total_legs": len(legs),
+            "fill_ratio": fill_ratio,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        payload.update(extra)
+        try:
+            status_callback(payload)
+        except Exception as e:
+            logger.debug(f"[Chaser] progress callback failed: {e}")
 
     def _remaining_qty(self, leg: LegOrder) -> float:
         """Return the quantity still needing execution."""
@@ -211,6 +259,7 @@ class LimitChaser:
         self,
         legs: list[LegOrder],
         underlying: str = "ETH",
+        status_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> list[LegOrder]:
         """Execute all legs concurrently with adaptive limit orders.
 
@@ -234,11 +283,29 @@ class LimitChaser:
             leg.start_time = t0
             leg.status = "PENDING"
 
+        self._emit_progress(
+            status_callback,
+            "started",
+            legs,
+            message=f"开始追单，共 {len(legs)} 条腿",
+            elapsed_sec=0.0,
+            remaining_sec=self.cfg.window_seconds,
+        )
+
         # Phase 1: Place initial limit orders for all legs
-        self._place_initial_orders(legs, underlying)
+        self._place_initial_orders(legs, underlying, status_callback=status_callback)
 
         # Phase 2: Poll + amend loop
-        self._chase_loop(legs, underlying, t0)
+        self._chase_loop(legs, underlying, t0, status_callback=status_callback)
+
+        self._emit_progress(
+            status_callback,
+            "finished",
+            legs,
+            message="追单结束",
+            elapsed_sec=max(time.monotonic() - t0, 0.0),
+            remaining_sec=0.0,
+        )
 
         return legs
 
@@ -250,6 +317,7 @@ class LimitChaser:
         self,
         legs: list[LegOrder],
         underlying: str,
+        status_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> None:
         """Place the first limit order for each leg."""
         # Fetch all tickers once
@@ -263,10 +331,27 @@ class LimitChaser:
                     f"using market order fallback"
                 )
                 self._market_fallback(leg)
+                self._emit_progress(
+                    status_callback,
+                    "market_fallback",
+                    legs,
+                    message=f"{leg.leg_role} 无有效报价，切换到兜底成交",
+                    leg_role=leg.leg_role,
+                    symbol=leg.symbol,
+                )
                 continue
 
             price = self._compute_limit_price(leg, q, elapsed_ratio=0.0)
             self._place_or_amend(leg, price)
+            self._emit_progress(
+                status_callback,
+                "initial_order",
+                legs,
+                message=f"{leg.leg_role} 已提交初始委托",
+                leg_role=leg.leg_role,
+                symbol=leg.symbol,
+                limit_price=price,
+            )
 
     # ------------------------------------------------------------------
     # Phase 2: Chase loop
@@ -277,12 +362,15 @@ class LimitChaser:
         legs: list[LegOrder],
         underlying: str,
         t0: float,
+        status_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> None:
         """Poll unfilled orders and amend prices until all fill or timeout."""
         deadline = t0 + self.cfg.window_seconds
         market_time = t0 + self.cfg.window_seconds - self.cfg.market_fallback_sec
+        iteration = 0
 
         while True:
+            iteration += 1
             # Check if all legs are done
             pending = [l for l in legs if l.status not in ("FILLED", "FAILED")]
             if not pending:
@@ -297,11 +385,30 @@ class LimitChaser:
                 logger.warning("[Chaser] Past deadline, forcing market fills")
                 for leg in pending:
                     self._cancel_and_market(leg)
+                self._emit_progress(
+                    status_callback,
+                    "deadline_forced_market",
+                    legs,
+                    message="超过追单截止时间，强制进入兜底成交",
+                    elapsed_sec=elapsed,
+                    remaining_sec=max(deadline - now, 0.0),
+                    iteration=iteration,
+                )
                 break
 
             # Check order statuses
             for leg in pending:
                 self._check_fill(leg)
+
+            self._emit_progress(
+                status_callback,
+                "poll",
+                legs,
+                message=f"第 {iteration} 轮检查：{sum(1 for leg in legs if leg.status == 'FILLED')}/{len(legs)} 条腿已成交",
+                elapsed_sec=elapsed,
+                remaining_sec=max(deadline - now, 0.0),
+                iteration=iteration,
+            )
 
             # Re-check pending after status updates
             pending = [l for l in legs if l.status not in ("FILLED", "FAILED")]
@@ -316,6 +423,15 @@ class LimitChaser:
                 )
                 for leg in pending:
                     self._cancel_and_market(leg)
+                self._emit_progress(
+                    status_callback,
+                    "market_fallback_zone",
+                    legs,
+                    message=f"进入最后 {self.cfg.market_fallback_sec} 秒兜底成交区间",
+                    elapsed_sec=elapsed,
+                    remaining_sec=max(deadline - now, 0.0),
+                    iteration=iteration,
+                )
                 break
 
             # Amend prices based on elapsed time
@@ -339,6 +455,16 @@ class LimitChaser:
                 # Only amend if price changed meaningfully
                 if abs(new_price - leg.current_price) >= self.cfg.tick_size_usdt * 0.5:
                     self._cancel_and_replace(leg, new_price)
+
+            self._emit_progress(
+                status_callback,
+                "amend_cycle",
+                legs,
+                message=f"第 {iteration} 轮改价完成，等待下一次轮询",
+                elapsed_sec=elapsed,
+                remaining_sec=max(deadline - now, 0.0),
+                iteration=iteration,
+            )
 
             # Sleep before next poll
             time.sleep(self.cfg.poll_interval_sec)

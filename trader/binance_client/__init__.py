@@ -138,6 +138,29 @@ class BinanceOptionsClient:
             return any(code in str(exc) for code in ("-1001", "-1003", "-1007"))
         return False
 
+    @staticmethod
+    def _format_http_error(exc: Exception) -> str:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            resp = exc.response
+            detail = ""
+            try:
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    code = payload.get("code")
+                    msg = payload.get("msg")
+                    if code is not None or msg:
+                        detail = f" | code={code} msg={msg}"
+                    else:
+                        detail = f" | body={payload}"
+                else:
+                    detail = f" | body={payload}"
+            except Exception:
+                text = (resp.text or "").strip()
+                if text:
+                    detail = f" | body={text[:300]}"
+            return f"{exc}{detail}"
+        return str(exc)
+
     def _request_json(self, method: str, path: str, params=None, retry_get: bool = False):
         url = f"{self._base}{path}"
         attempts = self.GET_RETRY_ATTEMPTS if retry_get else 1
@@ -160,7 +183,7 @@ class BinanceOptionsClient:
                 if retry_get and attempt < attempts and self._is_retryable_get_error(e):
                     sleep_sec = self.GET_RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
                     logger.warning(
-                        f"Binance {method} {path} failed on attempt {attempt}/{attempts}: {e}; retrying in {sleep_sec:.2f}s"
+                        f"Binance {method} {path} failed on attempt {attempt}/{attempts}: {self._format_http_error(e)}; retrying in {sleep_sec:.2f}s"
                     )
                     time.sleep(sleep_sec)
                     continue
@@ -442,14 +465,31 @@ class BinanceOptionsClient:
         lookup = order_id or client_order_id or ""
         if self.cfg.simulate_private:
             return OrderResult(lookup, symbol, "", 0.0, 0.0, 0.0, "FILLED", 0.0, {"simulated": True})
-        params = {"symbol": symbol}
+
+        def _query(params: dict) -> dict:
+            _result = self._private_get("/eapi/v1/order", params)
+            if not isinstance(_result, dict):
+                return {"raw": _result}
+            return _result
+
+        result: dict
         if order_id:
-            params["orderId"] = order_id
+            try:
+                result = _query({"symbol": symbol, "orderId": order_id})
+            except Exception as e:
+                if client_order_id:
+                    logger.warning(
+                        f"Query order by orderId failed for {symbol} orderId={order_id}: "
+                        f"{self._format_http_error(e)}; retrying with clientOrderId"
+                    )
+                    result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+                else:
+                    raise
         elif client_order_id:
-            params["origClientOrderId"] = client_order_id
+            result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
         else:
             raise ValueError("Either order_id or client_order_id is required")
-        result = self._private_get("/eapi/v1/order", params)
+
         if not isinstance(result, dict):
             result = {"raw": result}
         return OrderResult(

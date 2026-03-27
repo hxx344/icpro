@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -306,6 +306,7 @@ class PositionManager:
         buy_put_strike: float,
         quantity: float,
         underlying_price: float,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> IronCondorPosition | None:
         """Open a full iron condor via limit-order chaser.
 
@@ -349,11 +350,33 @@ class PositionManager:
         ]
         underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
 
+        if status_callback is not None:
+            status_callback({
+                "event": "position_open_start",
+                "message": f"开始提交 Iron Condor {group_id}",
+                "group_id": group_id,
+                "legs": [
+                    {"leg_role": leg.leg_role, "symbol": leg.symbol, "side": leg.side, "quantity": leg.quantity, "status": leg.status}
+                    for leg in leg_orders
+                ],
+                "total_legs": len(leg_orders),
+            })
+
         # Execute via limit chaser (blocks up to window_seconds)
         try:
-            results = self.chaser.execute_legs(leg_orders, underlying=underlying)
+            results = self.chaser.execute_legs(
+                leg_orders,
+                underlying=underlying,
+                status_callback=status_callback,
+            )
         except Exception as e:
             logger.error(f"Iron Condor {group_id}: execute_legs exception: {e}")
+            if status_callback is not None:
+                status_callback({
+                    "event": "position_open_error",
+                    "message": f"追单异常: {e}",
+                    "group_id": group_id,
+                })
             return None
 
         # Check for failures
@@ -374,6 +397,25 @@ class PositionManager:
                 for r in results if r.status == "FILLED"
             ]
             self._rollback_legs(filled_results)
+            if status_callback is not None:
+                status_callback({
+                    "event": "position_open_failed",
+                    "message": "至少有一条腿未成交，已触发回滚",
+                    "group_id": group_id,
+                    "failed_legs": [r.leg_role for r in failed],
+                    "legs": [
+                        {
+                            "leg_role": r.leg_role,
+                            "symbol": r.symbol,
+                            "side": r.side,
+                            "quantity": r.quantity,
+                            "filled_qty": r.filled_qty,
+                            "status": r.status,
+                            "avg_price": r.avg_price,
+                        }
+                        for r in results
+                    ],
+                })
             return None
 
         # All filled – build condor position
@@ -429,6 +471,26 @@ class PositionManager:
             f"Iron Condor {group_id} opened via limit chaser. "
             f"Net premium: {total_premium:.4f} USD"
         )
+
+        if status_callback is not None:
+            status_callback({
+                "event": "position_open_success",
+                "message": f"Iron Condor {group_id} 已全部成交",
+                "group_id": group_id,
+                "net_premium": total_premium,
+                "legs": [
+                    {
+                        "leg_role": r.leg_role,
+                        "symbol": r.symbol,
+                        "side": r.side,
+                        "quantity": r.quantity,
+                        "filled_qty": r.filled_qty,
+                        "status": r.status,
+                        "avg_price": r.avg_price,
+                    }
+                    for r in results
+                ],
+            })
 
         return condor
 

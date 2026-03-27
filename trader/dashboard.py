@@ -18,7 +18,10 @@ import os
 import platform
 import requests
 import sys
+import threading
 import time as _time
+import traceback
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -86,6 +89,130 @@ st.set_page_config(
 def init_storage(db_path: str) -> Storage:
     """Initialize SQLite storage (cached across reruns)."""
     return Storage(db_path)
+
+
+_TEST_ORDER_TASKS: dict[str, dict] = {}
+_TEST_ORDER_TASKS_LOCK = threading.Lock()
+
+
+def _get_test_order_task(task_id: str | None) -> dict | None:
+    if not task_id:
+        return None
+    with _TEST_ORDER_TASKS_LOCK:
+        task = _TEST_ORDER_TASKS.get(task_id)
+        if task is None:
+            return None
+        snapshot = dict(task)
+        snapshot["legs"] = [dict(leg) for leg in task.get("legs", [])]
+        return snapshot
+
+
+def _update_test_order_task(task_id: str, **updates) -> None:
+    with _TEST_ORDER_TASKS_LOCK:
+        task = _TEST_ORDER_TASKS.setdefault(task_id, {})
+        task.update(updates)
+        task["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _format_test_order_message(progress: dict) -> str:
+    event = progress.get("event", "")
+    if progress.get("message"):
+        return str(progress["message"])
+    mapping = {
+        "started": "开始追单",
+        "initial_order": "已提交初始委托",
+        "poll": "正在检查成交状态",
+        "amend_cycle": "正在更新挂单价格",
+        "market_fallback_zone": "进入兜底成交阶段",
+        "deadline_forced_market": "已强制进入兜底成交",
+        "finished": "追单结束",
+        "position_open_start": "开始创建测试仓位",
+        "position_open_success": "测试仓位已成交",
+        "position_open_failed": "测试仓位创建失败，已回滚",
+        "position_open_error": "测试下单异常",
+    }
+    return mapping.get(event, "测试下单处理中")
+
+
+def _start_test_order_task(
+    task_id: str,
+    exchange_cfg,
+    storage: Storage,
+    chaser_cfg,
+    order_params: dict,
+    engine_ref: TradingEngine,
+) -> None:
+    def _runner() -> None:
+        def _on_progress(progress: dict) -> None:
+            legs = progress.get("legs") or []
+            fill_ratio = float(progress.get("fill_ratio") or 0.0)
+            _update_test_order_task(
+                task_id,
+                state="running",
+                status=progress.get("event", "running"),
+                message=_format_test_order_message(progress),
+                percent=min(max(int(fill_ratio * 100), 0), 100),
+                legs=[dict(leg) for leg in legs],
+                progress=progress,
+            )
+
+        try:
+            _update_test_order_task(
+                task_id,
+                state="running",
+                status="starting",
+                message="正在初始化测试下单任务",
+                percent=0,
+            )
+            task_client = BinanceOptionsClient(exchange_cfg)
+            task_pos_mgr = PositionManager(
+                task_client,
+                storage,
+                chaser_config=DashboardChaserConfig(
+                    window_seconds=chaser_cfg.window_seconds,
+                    poll_interval_sec=chaser_cfg.poll_interval_sec,
+                    tick_size_usdt=chaser_cfg.tick_size_usdt,
+                    market_fallback_sec=chaser_cfg.market_fallback_sec,
+                    max_amend_attempts=chaser_cfg.max_amend_attempts,
+                ),
+            )
+
+            condor = task_pos_mgr.open_iron_condor(
+                status_callback=_on_progress,
+                **order_params,
+            )
+
+            if condor is not None:
+                if engine_ref.pos_mgr is not None:
+                    engine_ref.pos_mgr.open_condors[condor.group_id] = condor
+                _update_test_order_task(
+                    task_id,
+                    state="success",
+                    status="success",
+                    message=f"测试下单成功：{condor.group_id}",
+                    percent=100,
+                    result_group_id=condor.group_id,
+                )
+            else:
+                _update_test_order_task(
+                    task_id,
+                    state="failed",
+                    status="failed",
+                    message="测试下单失败：至少有一条腿未成交或被回滚",
+                )
+        except Exception as exc:
+            _update_test_order_task(
+                task_id,
+                state="error",
+                status="error",
+                message=f"测试下单异常: {exc}",
+                error=str(exc),
+                traceback=traceback.format_exc(),
+            )
+
+    thread = threading.Thread(target=_runner, name=f"test-order-{task_id[:8]}", daemon=True)
+    _update_test_order_task(task_id, thread_name=thread.name)
+    thread.start()
 
 
 def get_config_path() -> str:
@@ -261,8 +388,10 @@ st.sidebar.divider()
 
 auto_refresh = st.sidebar.checkbox("⏱ 自动刷新", value=True)
 refresh_sec = st.sidebar.selectbox("刷新间隔", [10, 30, 60, 120], index=0)
+_current_nav_page = st.session_state.get("nav_page", "📊 总览")
+_pause_auto_refresh = _current_nav_page == "🔧 策略配置"
 
-if auto_refresh:
+if auto_refresh and not _pause_auto_refresh:
     # Fragment-based auto-refresh: triggers full app rerun without hard browser reload,
     # preserving session_state (selected page, mode, etc.)
     st.session_state["_app_run_ts"] = _time.time()
@@ -275,6 +404,8 @@ if auto_refresh:
 
     _auto_refresh()
     st.sidebar.caption(f"每 {refresh_sec} 秒自动刷新")
+elif auto_refresh and _pause_auto_refresh:
+    st.sidebar.caption("策略配置页已暂停整页自动刷新，避免表单/下单预览卡顿")
 
 # Manual refresh
 if st.sidebar.button("🔄 立即刷新", width='stretch'):
@@ -1577,11 +1708,16 @@ elif page == "🔧 策略配置":
                 # Manual test order
                 st.markdown("##### 🧪 测试下单")
                 _test_qty = 0.01
+                _active_test_task_id = st.session_state.get("preview_test_order_task_id")
+                _active_test_task = _get_test_order_task(_active_test_task_id)
+                _test_task_running = bool(_active_test_task and _active_test_task.get("state") in {"queued", "running"})
                 _test_disabled_reason = None
                 if not _is_ic:
                     _test_disabled_reason = "当前预览不是四条腿组合，测试按钮仅支持四腿下单。"
                 elif not is_trade_mode:
                     _test_disabled_reason = "当前为只读模式，切换到交易模式后才可发送测试单。"
+                elif _test_task_running:
+                    _test_disabled_reason = "已有测试下单任务在执行，请等待完成。"
 
                 st.caption(
                     "按当前预览目标固定发送 4 条腿，每条腿数量 0.01，用于验证真实下单链路。"
@@ -1612,47 +1748,110 @@ elif page == "🔧 策略配置":
                 if _test_disabled_reason:
                     st.info(_test_disabled_reason)
                 elif _preview_test_clicked:
-                    try:
-                        with st.spinner("正在发送四腿测试单，请等待成交结果..."):
-                            _manual_client = engine.client if engine.client is not None else _pv_client
-                            _manual_pos_mgr = engine.pos_mgr
-                            if _manual_pos_mgr is None:
-                                _manual_pos_mgr = PositionManager(
-                                    _manual_client,
-                                    storage,
-                                    chaser_config=DashboardChaserConfig(
-                                        window_seconds=cfg.chaser.window_seconds,
-                                        poll_interval_sec=cfg.chaser.poll_interval_sec,
-                                        tick_size_usdt=cfg.chaser.tick_size_usdt,
-                                        market_fallback_sec=cfg.chaser.market_fallback_sec,
-                                        max_amend_attempts=cfg.chaser.max_amend_attempts,
-                                    ),
-                                )
+                    _new_task_id = uuid.uuid4().hex
+                    st.session_state["preview_test_order_task_id"] = _new_task_id
+                    _update_test_order_task(
+                        _new_task_id,
+                        state="queued",
+                        status="queued",
+                        message="测试下单任务已创建，等待后台执行",
+                        percent=0,
+                        legs=[],
+                        created_at=datetime.now(timezone.utc).isoformat(),
+                        order_summary={
+                            "sell_call": _sell_call.symbol,
+                            "buy_call": _buy_call.symbol,
+                            "sell_put": _sell_put.symbol,
+                            "buy_put": _buy_put.symbol,
+                            "quantity": _test_qty,
+                        },
+                    )
+                    _start_test_order_task(
+                        _new_task_id,
+                        cfg.exchange,
+                        storage,
+                        cfg.chaser,
+                        {
+                            "sell_call_symbol": _sell_call.symbol,
+                            "buy_call_symbol": _buy_call.symbol,
+                            "sell_put_symbol": _sell_put.symbol,
+                            "buy_put_symbol": _buy_put.symbol,
+                            "sell_call_strike": _sell_call.strike,
+                            "buy_call_strike": _buy_call.strike,
+                            "sell_put_strike": _sell_put.strike,
+                            "buy_put_strike": _buy_put.strike,
+                            "quantity": _test_qty,
+                            "underlying_price": _pv_spot,
+                        },
+                        engine,
+                    )
+                    st.rerun()
 
-                            _test_condor = _manual_pos_mgr.open_iron_condor(
-                                sell_call_symbol=_sell_call.symbol,
-                                buy_call_symbol=_buy_call.symbol,
-                                sell_put_symbol=_sell_put.symbol,
-                                buy_put_symbol=_buy_put.symbol,
-                                sell_call_strike=_sell_call.strike,
-                                buy_call_strike=_buy_call.strike,
-                                sell_put_strike=_sell_put.strike,
-                                buy_put_strike=_buy_put.strike,
-                                quantity=_test_qty,
-                                underlying_price=_pv_spot,
-                            )
+                _active_test_task_id = st.session_state.get("preview_test_order_task_id")
+                _active_test_task = _get_test_order_task(_active_test_task_id)
+                if _active_test_task:
+                    @st.fragment(run_every=1)
+                    def _render_test_order_progress(task_id: str):
+                        _task = _get_test_order_task(task_id)
+                        if not _task:
+                            return
 
-                        if _test_condor:
-                            st.success(
-                                f"测试下单成功：{_test_condor.group_id} | "
-                                f"4 条腿各 {_test_qty:.2f} 张已提交并成交。"
-                            )
-                        else:
-                            st.error("测试下单失败：至少有一条腿未成交或被回滚，请检查日志。")
-                    except Exception as _test_ex:
-                        st.error(f"测试下单异常: {_test_ex}")
-                        import traceback as _tb
-                        st.code(_tb.format_exc())
+                        _state = _task.get("state", "unknown")
+                        _message = _task.get("message", "-")
+                        _percent = int(_task.get("percent") or 0)
+                        _progress = _task.get("progress") or {}
+                        _legs = _task.get("legs") or []
+
+                        st.progress(max(0, min(_percent, 100)), text=f"测试下单进度：{_percent}% | {_message}")
+                        if _state in {"queued", "running"}:
+                            st.info(_message)
+                        elif _state == "success":
+                            st.success(_message)
+                        elif _state in {"failed", "error"}:
+                            st.error(_message)
+
+                        _elapsed = _progress.get("elapsed_sec")
+                        _remaining = _progress.get("remaining_sec")
+                        _filled_legs = _progress.get("filled_legs", 0)
+                        _total_legs = _progress.get("total_legs", len(_legs))
+                        _meta_cols = st.columns(4)
+                        with _meta_cols[0]:
+                            st.metric("任务状态", _state)
+                        with _meta_cols[1]:
+                            st.metric("已成交腿数", f"{_filled_legs}/{_total_legs}")
+                        with _meta_cols[2]:
+                            st.metric("已耗时", f"{_elapsed:.0f}s" if isinstance(_elapsed, (int, float)) else "-")
+                        with _meta_cols[3]:
+                            st.metric("剩余追单时长", f"{_remaining:.0f}s" if isinstance(_remaining, (int, float)) else "-")
+
+                        if _legs:
+                            _legs_df = pd.DataFrame([
+                                {
+                                    "腿": leg.get("leg_role", "-"),
+                                    "合约": leg.get("symbol", "-"),
+                                    "方向": leg.get("side", "-"),
+                                    "状态": leg.get("status", "-"),
+                                    "已成交": f"{float(leg.get('filled_qty') or 0.0):.4f}/{float(leg.get('quantity') or 0.0):.4f}",
+                                    "当前委托价": f"${float(leg.get('current_price') or 0.0):.2f}" if leg.get("current_price") else "-",
+                                    "成交均价": f"${float(leg.get('avg_price') or 0.0):.2f}" if leg.get("avg_price") else "-",
+                                    "尝试次数": int(leg.get("attempts") or 0),
+                                }
+                                for leg in _legs
+                            ])
+                            st.dataframe(_legs_df, width="stretch", hide_index=True)
+
+                        if _task.get("traceback"):
+                            with st.expander("查看异常堆栈"):
+                                st.code(_task["traceback"])
+
+                        if _state in {"success", "failed", "error"}:
+                            if st.button("清除测试进度", key=f"clear_test_task_{task_id}"):
+                                with _TEST_ORDER_TASKS_LOCK:
+                                    _TEST_ORDER_TASKS.pop(task_id, None)
+                                st.session_state.pop("preview_test_order_task_id", None)
+                                st.rerun()
+
+                    _render_test_order_progress(_active_test_task_id)
 
                 # P&L summary
                 st.markdown("##### 💰 盈亏概要")
