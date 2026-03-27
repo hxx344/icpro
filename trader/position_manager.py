@@ -306,20 +306,21 @@ class PositionManager:
         buy_put_strike: float,
         quantity: float,
         underlying_price: float,
+        execution_mode: str = "chaser",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> IronCondorPosition | None:
-        """Open a full iron condor via limit-order chaser.
+        """Open a full iron condor.
 
-        All 4 legs are submitted as adaptive limit orders that drift
-        toward market price over a 30-minute window.  If a leg cannot
-        fill within the window it falls back to a market order.
-
-        Returns the IronCondorPosition if all legs fill, or None on failure.
+        `execution_mode="chaser"` uses the adaptive limit chaser.
+        `execution_mode="market"` submits each leg as a market order.
         """
         group_id = f"IC_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        execution_mode_norm = str(execution_mode or "chaser").strip().lower()
+        if execution_mode_norm not in {"chaser", "market"}:
+            raise ValueError(f"Unsupported execution_mode: {execution_mode}")
 
         logger.info(
-            f"Opening Iron Condor {group_id} (limit chaser): "
+            f"Opening Iron Condor {group_id} ({execution_mode_norm}): "
             f"sell_put={sell_put_strike} buy_put={buy_put_strike} "
             f"sell_call={sell_call_strike} buy_call={buy_call_strike} "
             f"qty={quantity} spot={underlying_price}"
@@ -348,13 +349,13 @@ class PositionManager:
                 client_order_prefix=f"{group_id}:sell_call",
             ),
         ]
-        underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
 
         if status_callback is not None:
             status_callback({
                 "event": "position_open_start",
-                "message": f"开始提交 Iron Condor {group_id}",
+                "message": f"开始提交 Iron Condor {group_id}（{execution_mode_norm}）",
                 "group_id": group_id,
+                "execution_mode": execution_mode_norm,
                 "legs": [
                     {"leg_role": leg.leg_role, "symbol": leg.symbol, "side": leg.side, "quantity": leg.quantity, "status": leg.status}
                     for leg in leg_orders
@@ -362,22 +363,35 @@ class PositionManager:
                 "total_legs": len(leg_orders),
             })
 
-        # Execute via limit chaser (blocks up to window_seconds)
-        try:
-            results = self.chaser.execute_legs(
-                leg_orders,
-                underlying=underlying,
+        if execution_mode_norm == "market":
+            results = self._execute_market_iron_condor(
+                group_id=group_id,
+                leg_orders=leg_orders,
+                quantity=quantity,
                 status_callback=status_callback,
             )
-        except Exception as e:
-            logger.error(f"Iron Condor {group_id}: execute_legs exception: {e}")
-            if status_callback is not None:
-                status_callback({
-                    "event": "position_open_error",
-                    "message": f"追单异常: {e}",
-                    "group_id": group_id,
-                })
-            return None
+            if results is None:
+                return None
+        else:
+            underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
+
+            # Execute via limit chaser (blocks up to window_seconds)
+            try:
+                results = self.chaser.execute_legs(
+                    leg_orders,
+                    underlying=underlying,
+                    status_callback=status_callback,
+                )
+            except Exception as e:
+                logger.error(f"Iron Condor {group_id}: execute_legs exception: {e}")
+                if status_callback is not None:
+                    status_callback({
+                        "event": "position_open_error",
+                        "message": f"追单异常: {e}",
+                        "group_id": group_id,
+                        "execution_mode": execution_mode_norm,
+                    })
+                return None
 
         # Check for failures
         failed = [r for r in results if r.status != "FILLED"]
@@ -402,6 +416,7 @@ class PositionManager:
                     "event": "position_open_failed",
                     "message": "至少有一条腿未成交，已触发回滚",
                     "group_id": group_id,
+                    "execution_mode": execution_mode_norm,
                     "failed_legs": [r.leg_role for r in failed],
                     "legs": [
                         {
@@ -468,7 +483,7 @@ class PositionManager:
         self.open_condors[group_id] = condor
 
         logger.info(
-            f"Iron Condor {group_id} opened via limit chaser. "
+            f"Iron Condor {group_id} opened via {execution_mode_norm}. "
             f"Net premium: {total_premium:.4f} USD"
         )
 
@@ -477,6 +492,7 @@ class PositionManager:
                 "event": "position_open_success",
                 "message": f"Iron Condor {group_id} 已全部成交",
                 "group_id": group_id,
+                "execution_mode": execution_mode_norm,
                 "net_premium": total_premium,
                 "legs": [
                     {
@@ -493,6 +509,129 @@ class PositionManager:
             })
 
         return condor
+
+    def _execute_market_iron_condor(
+        self,
+        group_id: str,
+        leg_orders: list[LegOrder],
+        quantity: float,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[LegOrder] | None:
+        """Submit iron condor legs sequentially as market orders."""
+        results: list[LegOrder] = []
+        total_legs = len(leg_orders)
+
+        for idx, leg_order in enumerate(leg_orders, start=1):
+            if status_callback is not None:
+                status_callback({
+                    "event": "market_order_submit",
+                    "message": f"正在发送 {leg_order.leg_role} 市价单",
+                    "group_id": group_id,
+                    "execution_mode": "market",
+                    "filled_legs": sum(1 for leg in results if leg.status == "FILLED"),
+                    "total_legs": total_legs,
+                    "fill_ratio": (idx - 1) / total_legs,
+                    "legs": [
+                        {
+                            "leg_role": leg.leg_role,
+                            "symbol": leg.symbol,
+                            "side": leg.side,
+                            "quantity": leg.quantity,
+                            "filled_qty": leg.filled_qty,
+                            "status": leg.status,
+                            "avg_price": leg.avg_price,
+                            "attempts": leg.attempts,
+                        }
+                        for leg in [*results, leg_order, *leg_orders[idx:]]
+                    ],
+                })
+
+            try:
+                order_result = self.client.place_order(
+                    symbol=leg_order.symbol,
+                    side=leg_order.side,
+                    quantity=leg_order.quantity,
+                    order_type="MARKET",
+                    client_order_id=f"{leg_order.client_order_prefix}:mkt",
+                )
+            except Exception as e:
+                logger.error(f"Iron Condor {group_id}: market order failed for {leg_order.leg_role}: {e}")
+                rollback_fills = [
+                    (leg.leg_role, OrderResult(
+                        order_id=leg.order_id,
+                        symbol=leg.symbol,
+                        side=leg.side,
+                        quantity=leg.filled_qty,
+                        price=leg.avg_price,
+                        avg_price=leg.avg_price,
+                        status="FILLED",
+                        fee=leg.fee,
+                        raw={},
+                    ))
+                    for leg in results if leg.filled_qty > 0
+                ]
+                if rollback_fills:
+                    self._rollback_legs(rollback_fills)
+                if status_callback is not None:
+                    status_callback({
+                        "event": "position_open_error",
+                        "message": f"市价单提交失败: {leg_order.leg_role} | {e}",
+                        "group_id": group_id,
+                        "execution_mode": "market",
+                        "failed_leg": leg_order.leg_role,
+                        "filled_legs": sum(1 for leg in results if leg.status == "FILLED"),
+                        "total_legs": total_legs,
+                        "fill_ratio": sum(1 for leg in results if leg.status == "FILLED") / total_legs,
+                        "legs": [
+                            {
+                                "leg_role": leg.leg_role,
+                                "symbol": leg.symbol,
+                                "side": leg.side,
+                                "quantity": leg.quantity,
+                                "filled_qty": leg.filled_qty,
+                                "status": leg.status,
+                                "avg_price": leg.avg_price,
+                                "attempts": leg.attempts,
+                            }
+                            for leg in results
+                        ],
+                    })
+                return None
+
+            leg_order.order_id = order_result.order_id
+            leg_order.status = order_result.status or "FILLED"
+            leg_order.filled_qty = order_result.quantity or quantity
+            leg_order.avg_price = order_result.avg_price
+            leg_order.fee = order_result.fee
+            leg_order.attempts = 1
+            results.append(leg_order)
+
+            if status_callback is not None:
+                filled_count = sum(1 for leg in results if leg.status == "FILLED")
+                status_callback({
+                    "event": "market_order_filled" if leg_order.status == "FILLED" else "market_order_result",
+                    "message": f"{leg_order.leg_role} 市价单结果: {leg_order.status}",
+                    "group_id": group_id,
+                    "execution_mode": "market",
+                    "filled_legs": filled_count,
+                    "total_legs": total_legs,
+                    "fill_ratio": filled_count / total_legs,
+                    "legs": [
+                        {
+                            "leg_role": leg.leg_role,
+                            "symbol": leg.symbol,
+                            "side": leg.side,
+                            "quantity": leg.quantity,
+                            "filled_qty": leg.filled_qty,
+                            "status": leg.status,
+                            "avg_price": leg.avg_price,
+                            "attempts": leg.attempts,
+                        }
+                        for leg in [*results, *leg_orders[idx:]]
+                    ],
+                })
+
+        return results
 
     def _rollback_legs(
         self,

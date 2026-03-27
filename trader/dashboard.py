@@ -126,6 +126,9 @@ def _format_test_order_message(progress: dict) -> str:
         "market_fallback_zone": "进入兜底成交阶段",
         "deadline_forced_market": "已强制进入兜底成交",
         "finished": "追单结束",
+        "market_order_submit": "正在发送市价单",
+        "market_order_filled": "市价单已成交",
+        "market_order_result": "市价单返回结果",
         "position_open_start": "开始创建测试仓位",
         "position_open_success": "测试仓位已成交",
         "position_open_failed": "测试仓位创建失败，已回滚",
@@ -178,6 +181,7 @@ def _start_test_order_task(
             )
 
             condor = task_pos_mgr.open_iron_condor(
+                execution_mode="market",
                 status_callback=_on_progress,
                 **order_params,
             )
@@ -1720,12 +1724,12 @@ elif page == "🔧 策略配置":
                     _test_disabled_reason = "已有测试下单任务在执行，请等待完成。"
 
                 st.caption(
-                    "按当前预览目标固定发送 4 条腿，每条腿数量 0.01，用于验证真实下单链路。"
+                    "按当前预览目标固定发送 4 条腿市价单，每条腿数量 0.01，用于验证真实下单链路。"
                 )
                 _tc1, _tc2 = st.columns([1, 2])
                 with _tc1:
                     _preview_test_clicked = st.button(
-                        "🧪 测试四腿下单 0.01",
+                        "🧪 测试四腿市价单 0.01",
                         key=(
                             f"preview_test_iron_condor_{_pv_mode}_"
                             f"{_sell_put.symbol}_{_sell_call.symbol}_"
@@ -1764,6 +1768,7 @@ elif page == "🔧 策略配置":
                             "sell_put": _sell_put.symbol,
                             "buy_put": _buy_put.symbol,
                             "quantity": _test_qty,
+                            "execution_mode": "market",
                         },
                     )
                     _start_test_order_task(
