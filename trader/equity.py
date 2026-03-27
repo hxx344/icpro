@@ -73,7 +73,7 @@ class EquityTracker:
 
         spot = self.client.get_spot_price(self.underlying)
 
-        total_equity = account.total_balance + upnl
+        total_equity = account.total_balance
         pos_count = self.pos_mgr.open_position_count
 
         self.storage.record_equity_snapshot(

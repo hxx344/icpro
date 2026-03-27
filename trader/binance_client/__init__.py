@@ -79,6 +79,24 @@ class AccountInfo:
     raw: dict
 
 
+class OrderNotFoundError(RuntimeError):
+    """Raised when Binance reports that an order no longer exists."""
+
+    def __init__(
+        self,
+        symbol: str,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+        message: str = "Order does not exist",
+    ):
+        lookup = order_id or client_order_id or ""
+        super().__init__(f"Order not found for {symbol}: {lookup} ({message})")
+        self.symbol = symbol
+        self.order_id = order_id
+        self.client_order_id = client_order_id
+        self.message = message
+
+
 BINANCE_SYMBOL_RE = re.compile(
     r"^(?P<ul>[A-Z]+)-(?P<yymmdd>\d{6})-(?P<strike>\d+(?:\.\d+)?)-(?P<cp>[CP])$"
 )
@@ -137,6 +155,31 @@ class BinanceOptionsClient:
         if isinstance(exc, RuntimeError):
             return any(code in str(exc) for code in ("-1001", "-1003", "-1007"))
         return False
+
+    @staticmethod
+    def _extract_api_error(exc: Exception) -> tuple[int | None, str | None]:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            try:
+                payload = exc.response.json()
+            except Exception:
+                return None, None
+            if isinstance(payload, dict):
+                code = payload.get("code")
+                msg = payload.get("msg")
+                try:
+                    code = int(code) if code is not None else None
+                except Exception:
+                    code = None
+                return code, str(msg) if msg is not None else None
+            return None, None
+        if isinstance(exc, RuntimeError):
+            match = re.search(r"Binance error\s+(-?\d+):\s*(.*)", str(exc))
+            if match:
+                try:
+                    return int(match.group(1)), match.group(2).strip() or None
+                except Exception:
+                    return None, None
+        return None, None
 
     @staticmethod
     def _format_http_error(exc: Exception) -> str:
@@ -202,7 +245,7 @@ class BinanceOptionsClient:
         try:
             return self._request_json("GET", path, params=self._sign(dict(params or {})), retry_get=True)
         except Exception as e:
-            logger.error(f"Binance private GET {path} failed: {e}")
+            logger.error(f"Binance private GET {path} failed: {self._format_http_error(e)}")
             raise
 
     def _private_post(self, path: str, params=None):
@@ -211,7 +254,7 @@ class BinanceOptionsClient:
         try:
             return self._request_json("POST", path, params=self._sign(dict(params or {})))
         except Exception as e:
-            logger.error(f"Binance private POST {path} failed: {e}")
+            logger.error(f"Binance private POST {path} failed: {self._format_http_error(e)}")
             raise
 
     def _private_delete(self, path: str, params=None):
@@ -220,7 +263,7 @@ class BinanceOptionsClient:
         try:
             return self._request_json("DELETE", path, params=self._sign(dict(params or {})))
         except Exception as e:
-            logger.error(f"Binance DELETE {path} failed: {e}")
+            logger.error(f"Binance DELETE {path} failed: {self._format_http_error(e)}")
             raise
 
     @staticmethod
@@ -344,7 +387,17 @@ class BinanceOptionsClient:
         assets = result.get("asset", [])
         if not isinstance(assets, list):
             assets = []
-        total = sum(float(a.get("marginBalance") or 0) for a in assets if isinstance(a, dict))
+        total = sum(
+            float(
+                a.get("equity")
+                or a.get("totalEquity")
+                or a.get("balance")
+                or a.get("marginBalance")
+                or 0
+            )
+            for a in assets
+            if isinstance(a, dict)
+        )
         avail = sum(float(a.get("available") or a.get("availableBalance") or 0) for a in assets if isinstance(a, dict))
         upnl = sum(float(a.get("unrealizedPNL") or a.get("unrealizedPnl") or 0) for a in assets if isinstance(a, dict))
         return AccountInfo(total, avail, upnl, result)
@@ -472,21 +525,40 @@ class BinanceOptionsClient:
                 return {"raw": _result}
             return _result
 
-        result: dict
+        def _raise_not_found(err: Exception) -> None:
+            code, msg = self._extract_api_error(err)
+            if code == -2013:
+                raise OrderNotFoundError(
+                    symbol=symbol,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                    message=msg or "Order does not exist",
+                ) from err
+            raise err
+
+        result: dict = {}
         if order_id:
             try:
                 result = _query({"symbol": symbol, "orderId": order_id})
             except Exception as e:
                 if client_order_id:
-                    logger.warning(
+                    code, _ = self._extract_api_error(e)
+                    log_fn = logger.debug if code == -2013 else logger.warning
+                    log_fn(
                         f"Query order by orderId failed for {symbol} orderId={order_id}: "
                         f"{self._format_http_error(e)}; retrying with clientOrderId"
                     )
-                    result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+                    try:
+                        result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+                    except Exception as fallback_exc:
+                        _raise_not_found(fallback_exc)
                 else:
-                    raise
+                    _raise_not_found(e)
         elif client_order_id:
-            result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+            try:
+                result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+            except Exception as e:
+                _raise_not_found(e)
         else:
             raise ValueError("Either order_id or client_order_id is required")
 
@@ -524,7 +596,13 @@ class BinanceOptionsClient:
             self._private_delete("/eapi/v1/order", params)
             return True
         except Exception as e:
-            logger.error(f"Cancel order {lookup} failed: {e}")
+            code, msg = self._extract_api_error(e)
+            if code == -2013:
+                logger.debug(
+                    f"Cancel order {lookup} ignored because exchange reports missing order: {msg or 'Order does not exist'}"
+                )
+                return False
+            logger.error(f"Cancel order {lookup} failed: {self._format_http_error(e)}")
             return False
 
     def get_ticker(self, symbol: str) -> OptionTicker | None:

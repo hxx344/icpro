@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 
 from loguru import logger
 
-from trader.binance_client import OrderResult, OptionTicker
+from trader.binance_client import OrderNotFoundError, OrderResult, OptionTicker
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +603,15 @@ class LimitChaser:
 
             self._mark_filled_if_done(leg)
 
+        except OrderNotFoundError:
+            if self._mark_filled_if_done(leg):
+                return
+            logger.debug(
+                f"[Chaser] {leg.leg_role} order not found on exchange, treating it as inactive"
+            )
+            leg.status = "PENDING"
+            leg.order_id = ""
+            leg.client_order_id = ""
         except Exception as e:
             logger.error(f"[Chaser] Query failed for {leg.leg_role}: {e}")
 
@@ -610,21 +619,34 @@ class LimitChaser:
         """Cancel current order and place a new one at new_price."""
         if leg.order_id:
             try:
-                self.client.cancel_order(
+                cancelled = self.client.cancel_order(
                     leg.symbol,
                     order_id=leg.order_id or None,
                     client_order_id=leg.client_order_id or None,
                 )
                 self._check_fill(leg)
-                logger.debug(
-                    f"[Chaser] Cancelled {leg.leg_role} order {leg.order_id}"
-                )
+                if leg.status == "FILLED":
+                    return
+                if cancelled:
+                    logger.debug(
+                        f"[Chaser] Cancelled {leg.leg_role} order {leg.order_id}"
+                    )
+                else:
+                    logger.debug(
+                        f"[Chaser] {leg.leg_role} cancel not confirmed; order already missing or terminal"
+                    )
             except Exception as e:
                 logger.warning(f"[Chaser] Cancel failed for {leg.leg_role}: {e}")
                 # Check if it filled in the meantime
                 self._check_fill(leg)
                 if leg.status == "FILLED":
                     return
+
+        if leg.order_id:
+            logger.warning(
+                f"[Chaser] {leg.leg_role} cancel state unresolved for order {leg.order_id}, skip replace to avoid duplicate execution"
+            )
+            return
 
         if self._mark_filled_if_done(leg):
             return
@@ -638,17 +660,22 @@ class LimitChaser:
         # Cancel outstanding limit
         if leg.order_id:
             try:
-                self.client.cancel_order(
+                cancelled = self.client.cancel_order(
                     leg.symbol,
                     order_id=leg.order_id or None,
                     client_order_id=leg.client_order_id or None,
                 )
             except Exception:
-                pass
+                cancelled = False
 
             # Check if it filled during cancel
             self._check_fill(leg)
             if leg.status == "FILLED" or self._mark_filled_if_done(leg):
+                return
+            if not cancelled and leg.order_id:
+                logger.warning(
+                    f"[Chaser] {leg.leg_role} cancel not confirmed for order {leg.order_id}, skip fallback to avoid duplicate execution"
+                )
                 return
 
         logger.info(

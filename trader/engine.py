@@ -323,7 +323,7 @@ class TradingEngine:
             account = self.client.get_account()
             if account.raw.get("simulated"):
                 return
-            equity = account.total_balance + account.unrealized_pnl
+            equity = account.total_balance
             self.equity_tracker.on_day_start(equity)
         except Exception as e:
             logger.warning(f"Could not init day equity: {e}")
@@ -340,7 +340,7 @@ class TradingEngine:
                 account = self.client.get_account()
                 if account.raw.get("simulated"):
                     return
-                equity = account.total_balance + account.unrealized_pnl
+                equity = account.total_balance
                 self.equity_tracker.on_day_end(equity)
                 self.equity_tracker.on_day_start(equity)
             except Exception as e:
@@ -376,7 +376,7 @@ class TradingEngine:
                 try:
                     account = self.client.get_account()
                     if not account.raw.get("simulated"):
-                        equity = account.total_balance + account.unrealized_pnl
+                        equity = account.total_balance
                         self.equity_tracker.on_day_end(equity)
                 except Exception as e:
                     logger.warning(f"Shutdown day-end recording failed: {e}")
