@@ -21,7 +21,7 @@ exchange:
   base_url: ''                 # 留空自动选择 (prod: eapi.binance.com)
   timeout: 15
   account_currency: USDT
-  simulate_private: true       # 模拟模式, 上线时改为 false
+  simulate_private: false      # 真实私有接口模式
 
 strategy:
   mode: weekend_vol

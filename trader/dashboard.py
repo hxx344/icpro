@@ -63,6 +63,8 @@ from trader.config import load_config, TraderConfig
 from trader.storage import Storage
 from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.binance_client import BinanceOptionsClient
+from trader.position_manager import PositionManager
+from trader.limit_chaser import ChaserConfig as DashboardChaserConfig
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -1571,6 +1573,86 @@ elif page == "🔧 策略配置":
                         },
                     ]
                 st.dataframe(pd.DataFrame(_legs_data), width="stretch", hide_index=True)
+
+                # Manual test order
+                st.markdown("##### 🧪 测试下单")
+                _test_qty = 0.01
+                _test_disabled_reason = None
+                if not _is_ic:
+                    _test_disabled_reason = "当前预览不是四条腿组合，测试按钮仅支持四腿下单。"
+                elif not is_trade_mode:
+                    _test_disabled_reason = "当前为只读模式，切换到交易模式后才可发送测试单。"
+
+                st.caption(
+                    "按当前预览目标固定发送 4 条腿，每条腿数量 0.01，用于验证真实下单链路。"
+                )
+                _tc1, _tc2 = st.columns([1, 2])
+                with _tc1:
+                    _preview_test_clicked = st.button(
+                        "🧪 测试四腿下单 0.01",
+                        key=(
+                            f"preview_test_iron_condor_{_pv_mode}_"
+                            f"{_sell_put.symbol}_{_sell_call.symbol}_"
+                            f"{_buy_put.symbol if _buy_put else 'none'}_"
+                            f"{_buy_call.symbol if _buy_call else 'none'}"
+                        ),
+                        width='stretch',
+                        type="secondary",
+                        disabled=_test_disabled_reason is not None,
+                    )
+                with _tc2:
+                    st.write(
+                        f"固定数量: {_test_qty:.2f} | "
+                        f"Long Put `{_buy_put.symbol if _buy_put else '-'}` / "
+                        f"Short Put `{_sell_put.symbol}` / "
+                        f"Short Call `{_sell_call.symbol}` / "
+                        f"Long Call `{_buy_call.symbol if _buy_call else '-'}`"
+                    )
+
+                if _test_disabled_reason:
+                    st.info(_test_disabled_reason)
+                elif _preview_test_clicked:
+                    try:
+                        with st.spinner("正在发送四腿测试单，请等待成交结果..."):
+                            _manual_client = engine.client if engine.client is not None else _pv_client
+                            _manual_pos_mgr = engine.pos_mgr
+                            if _manual_pos_mgr is None:
+                                _manual_pos_mgr = PositionManager(
+                                    _manual_client,
+                                    storage,
+                                    chaser_config=DashboardChaserConfig(
+                                        window_seconds=cfg.chaser.window_seconds,
+                                        poll_interval_sec=cfg.chaser.poll_interval_sec,
+                                        tick_size_usdt=cfg.chaser.tick_size_usdt,
+                                        market_fallback_sec=cfg.chaser.market_fallback_sec,
+                                        max_amend_attempts=cfg.chaser.max_amend_attempts,
+                                    ),
+                                )
+
+                            _test_condor = _manual_pos_mgr.open_iron_condor(
+                                sell_call_symbol=_sell_call.symbol,
+                                buy_call_symbol=_buy_call.symbol,
+                                sell_put_symbol=_sell_put.symbol,
+                                buy_put_symbol=_buy_put.symbol,
+                                sell_call_strike=_sell_call.strike,
+                                buy_call_strike=_buy_call.strike,
+                                sell_put_strike=_sell_put.strike,
+                                buy_put_strike=_buy_put.strike,
+                                quantity=_test_qty,
+                                underlying_price=_pv_spot,
+                            )
+
+                        if _test_condor:
+                            st.success(
+                                f"测试下单成功：{_test_condor.group_id} | "
+                                f"4 条腿各 {_test_qty:.2f} 张已提交并成交。"
+                            )
+                        else:
+                            st.error("测试下单失败：至少有一条腿未成交或被回滚，请检查日志。")
+                    except Exception as _test_ex:
+                        st.error(f"测试下单异常: {_test_ex}")
+                        import traceback as _tb
+                        st.code(_tb.format_exc())
 
                 # P&L summary
                 st.markdown("##### 💰 盈亏概要")
