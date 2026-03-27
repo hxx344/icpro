@@ -39,6 +39,6 @@ monitor:
 chaser:
   window_seconds: 1800
   poll_interval_sec: 60
-  tick_size_usdt: 0.01
+  tick_size_usdt: 5.0
   market_fallback_sec: 60
   max_amend_attempts: 180

@@ -1324,6 +1324,40 @@ elif page == "🔧 策略配置":
                         best_t = _t
                 return best_t
 
+            def _format_preview_delta(ticker, spot_val, fallback_iv):
+                """Format contract delta for preview table.
+
+                Prefer exchange delta; fall back to Black-76 estimate when missing.
+                Uses `~` prefix for estimated values.
+                """
+                if ticker is None:
+                    return "-"
+
+                if ticker.delta != 0.0:
+                    return f"{ticker.delta:+.3f}"
+
+                try:
+                    from options_backtest.pricing.black76 import delta as _bs_delta
+
+                    _iv = ticker.mark_iv or fallback_iv
+                    if _iv <= 0:
+                        _iv = fallback_iv
+                    if _iv <= 0 or spot_val <= 0:
+                        return "-"
+
+                    _T_yr = max(ticker.dte_hours / (24 * 365.25), 1e-6)
+                    _d = _bs_delta(
+                        spot_val,
+                        ticker.strike,
+                        _T_yr,
+                        sigma=_iv,
+                        option_type=ticker.option_type,
+                        r=0.0,
+                    )
+                    return f"~{_d:+.3f}"
+                except Exception:
+                    return "-"
+
             if _pv_mode == "weekend_vol":
                 # Enrich tickers with greeks from exchange
                 try:
@@ -1398,11 +1432,12 @@ elif page == "🔧 策略配置":
                     except Exception:
                         _pv_equity_src = "权益获取失败, 用基础数量"
 
-                # Prices in USDT
-                _sc_bid = _sell_call.bid_price * _pv_spot
-                _sc_ask = _sell_call.ask_price * _pv_spot
-                _sp_bid = _sell_put.bid_price * _pv_spot
-                _sp_ask = _sell_put.ask_price * _pv_spot
+                # Prices in USD (Binance option native quote unit)
+                _preview_fallback_iv = getattr(cfg.strategy, "default_iv", 0.60)
+                _sc_bid = _sell_call.bid_price
+                _sc_ask = _sell_call.ask_price
+                _sp_bid = _sell_put.bid_price
+                _sp_ask = _sell_put.ask_price
 
                 if not _is_ic:
                     # ---- Strangle / weekend_vol without wings P&L ----
@@ -1416,10 +1451,10 @@ elif page == "🔧 策略配置":
                     _be_lower = _sell_put.strike - _premium_per
                 else:
                     # ---- Iron Condor P&L ----
-                    _lc_bid = _buy_call.bid_price * _pv_spot
-                    _lc_ask = _buy_call.ask_price * _pv_spot
-                    _lp_bid = _buy_put.bid_price * _pv_spot
-                    _lp_ask = _buy_put.ask_price * _pv_spot
+                    _lc_bid = _buy_call.bid_price
+                    _lc_ask = _buy_call.ask_price
+                    _lp_bid = _buy_put.bid_price
+                    _lp_ask = _buy_put.ask_price
                     _premium_per = (_sc_bid + _sp_bid) - (_lc_ask + _lp_ask)
                     _call_width = _buy_call.strike - _sell_call.strike
                     _put_width = _sell_put.strike - _buy_put.strike
@@ -1462,6 +1497,7 @@ elif page == "🔧 策略配置":
                             "合约": _sell_put.symbol,
                             "行权价": f"${_sell_put.strike:,.0f}",
                             "距Spot": f"{(_sell_put.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_put, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sp_bid:.2f}",
                             "Ask (USDT)": f"${_sp_ask:.2f}",
@@ -1472,6 +1508,7 @@ elif page == "🔧 策略配置":
                             "合约": _sell_call.symbol,
                             "行权价": f"${_sell_call.strike:,.0f}",
                             "距Spot": f"{(_sell_call.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_call, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sc_bid:.2f}",
                             "Ask (USDT)": f"${_sc_ask:.2f}",
@@ -1486,6 +1523,7 @@ elif page == "🔧 策略配置":
                             "合约": _buy_put.symbol,
                             "行权价": f"${_buy_put.strike:,.0f}",
                             "距Spot": f"{(_buy_put.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_buy_put, _pv_spot, _preview_fallback_iv),
                             "方向": "🟢 买入",
                             "Bid (USDT)": f"${_lp_bid:.2f}",
                             "Ask (USDT)": f"${_lp_ask:.2f}",
@@ -1496,6 +1534,7 @@ elif page == "🔧 策略配置":
                             "合约": _sell_put.symbol,
                             "行权价": f"${_sell_put.strike:,.0f}",
                             "距Spot": f"{(_sell_put.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_put, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sp_bid:.2f}",
                             "Ask (USDT)": f"${_sp_ask:.2f}",
@@ -1506,6 +1545,7 @@ elif page == "🔧 策略配置":
                             "合约": _sell_call.symbol,
                             "行权价": f"${_sell_call.strike:,.0f}",
                             "距Spot": f"{(_sell_call.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_call, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sc_bid:.2f}",
                             "Ask (USDT)": f"${_sc_ask:.2f}",
@@ -1516,6 +1556,7 @@ elif page == "🔧 策略配置":
                             "合约": _buy_call.symbol,
                             "行权价": f"${_buy_call.strike:,.0f}",
                             "距Spot": f"{(_buy_call.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_buy_call, _pv_spot, _preview_fallback_iv),
                             "方向": "🟢 买入",
                             "Bid (USDT)": f"${_lc_bid:.2f}",
                             "Ask (USDT)": f"${_lc_ask:.2f}",
@@ -1616,7 +1657,7 @@ elif page == "🔧 策略配置":
                 _fig.add_trace(go.Scatter(
                     x=_prices, y=_pnl,
                     mode="lines", line=dict(color="royalblue", width=2.5),
-                    name="P&L", hovertemplate="ETH: $%{x:,.0f}<br>P&L: $%{y:,.2f}<extra></extra>",
+                    name="P&L", hovertemplate=f"{_pv_ul}: $%{{x:,.0f}}<br>P&L: $%{{y:,.2f}}<extra></extra>",
                 ))
                 _pnl_pos = _np.where(_pnl > 0, _pnl, 0)
                 _fig.add_trace(go.Scatter(
@@ -1988,12 +2029,12 @@ elif page == "📡 期权行情":
     with _hdr_col2:
         price_unit = st.radio(
             "计价单位",
-            [f"{ul} (原始)", "USD"],
+            ["USD (原始)", f"{ul} (折算)"],
             key="mkt_price_unit",
             horizontal=True,
-            help=f"Binance 期权价格已转换为 {ul} 计价。选择 USD 会自动乘以标的价格换算",
+            help=f"Binance 期权原始报价为 USD。选择 {ul} (折算) 会按当前标的价格换算。",
         )
-    _is_usd = price_unit == "USD"
+    _is_usd = price_unit.startswith("USD")
 
     rows = []
     if tickers:
@@ -2013,11 +2054,11 @@ elif page == "📡 期权行情":
                 "Mid": round(t.mid_price, 6),
                 "Mark": t.mark_price,
                 "Last": t.last_price,
-                "Bid$": round(t.bid_price * ul_px, 2),
-                "Ask$": round(t.ask_price * ul_px, 2),
-                "Mid$": round(t.mid_price * ul_px, 2),
-                "Mark$": round(t.mark_price * ul_px, 2),
-                "Last$": round(t.last_price * ul_px, 2),
+                "BidCoin": round(t.bid_price / ul_px, 6) if ul_px > 0 else 0.0,
+                "AskCoin": round(t.ask_price / ul_px, 6) if ul_px > 0 else 0.0,
+                "MidCoin": round(t.mid_price / ul_px, 6) if ul_px > 0 else 0.0,
+                "MarkCoin": round(t.mark_price / ul_px, 6) if ul_px > 0 else 0.0,
+                "LastCoin": round(t.last_price / ul_px, 6) if ul_px > 0 else 0.0,
                 "价差%": round(spread_pct, 2),
                 "OTM%": round(moneyness, 2),
                 "24h量": t.volume_24h,
@@ -2052,18 +2093,16 @@ elif page == "📡 期权行情":
                     last_u = float(item.get("lastPrice") or 0)
                     mark_u = (bid_u + ask_u) / 2 if bid_u > 0 and ask_u > 0 else last_u
 
-                    if ul_px > 0:
-                        bid = bid_u / ul_px
-                        ask = ask_u / ul_px
-                        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else (mark_u / ul_px if ul_px > 0 else 0)
-                        mark = mark_u / ul_px
-                        last = last_u / ul_px
-                    else:
-                        bid = bid_u
-                        ask = ask_u
-                        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else mark_u
-                        mark = mark_u
-                        last = last_u
+                    bid = bid_u
+                    ask = ask_u
+                    mid = (bid + ask) / 2 if bid > 0 and ask > 0 else mark_u
+                    mark = mark_u
+                    last = last_u
+                    bid_coin = (bid_u / ul_px) if ul_px > 0 else 0.0
+                    ask_coin = (ask_u / ul_px) if ul_px > 0 else 0.0
+                    mid_coin = (mid / ul_px) if ul_px > 0 else 0.0
+                    mark_coin = (mark_u / ul_px) if ul_px > 0 else 0.0
+                    last_coin = (last_u / ul_px) if ul_px > 0 else 0.0
 
                     spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 0
                     dte_h = max((expiry - now_utc).total_seconds() / 3600.0, 0.0)
@@ -2080,11 +2119,11 @@ elif page == "📡 期权行情":
                         "Mid": round(mid, 6),
                         "Mark": mark,
                         "Last": last,
-                        "Bid$": round(bid * ul_px, 2),
-                        "Ask$": round(ask * ul_px, 2),
-                        "Mid$": round(mid * ul_px, 2),
-                        "Mark$": round(mark * ul_px, 2),
-                        "Last$": round(last * ul_px, 2),
+                        "BidCoin": round(bid_coin, 6),
+                        "AskCoin": round(ask_coin, 6),
+                        "MidCoin": round(mid_coin, 6),
+                        "MarkCoin": round(mark_coin, 6),
+                        "LastCoin": round(last_coin, 6),
                         "价差%": round(spread_pct, 2),
                         "OTM%": round(moneyness, 2),
                         "24h量": float(item.get("volume") or 0),
@@ -2148,13 +2187,10 @@ elif page == "📡 期权行情":
 
         # --- Select display columns based on pricing unit ---
         if _is_usd:
-            _price_cols = ["Bid$", "Ask$", "Mid$", "Mark$", "Last$"]
+            _price_cols = ["Bid", "Ask", "Mid", "Mark", "Last"]
             _display = df_show[["合约", "类型", "行权价", "到期", "DTE(h)"]
                                + _price_cols
                                + ["价差%", "OTM%", "24h量", "OI", "标的价"]].copy()
-            _display = _display.rename(columns={
-                "Bid$": "Bid", "Ask$": "Ask", "Mid$": "Mid", "Mark$": "Mark", "Last$": "Last",
-            })
             _col_cfg = {
                 "行权价": st.column_config.NumberColumn(format="$%.0f"),
                 "Bid": st.column_config.NumberColumn("Bid (USD)", format="$%.2f"),
@@ -2167,10 +2203,13 @@ elif page == "📡 期权行情":
                 "OTM%": st.column_config.NumberColumn(format="%.2f%%"),
             }
         else:
-            _price_cols = ["Bid", "Ask", "Mid", "Mark", "Last"]
+            _price_cols = ["BidCoin", "AskCoin", "MidCoin", "MarkCoin", "LastCoin"]
             _display = df_show[["合约", "类型", "行权价", "到期", "DTE(h)"]
                                + _price_cols
                                + ["价差%", "OTM%", "24h量", "OI", "标的价"]].copy()
+            _display = _display.rename(columns={
+                "BidCoin": "Bid", "AskCoin": "Ask", "MidCoin": "Mid", "MarkCoin": "Mark", "LastCoin": "Last",
+            })
             _col_cfg = {
                 "行权价": st.column_config.NumberColumn(format="$%.0f"),
                 "Bid": st.column_config.NumberColumn(f"Bid ({ul})", format="%.6f"),
@@ -2214,9 +2253,9 @@ elif page == "📡 期权行情":
                 display_strikes = all_strikes
 
             # Choose price column keys based on unit
-            _bid_key = "Bid$" if _is_usd else "Bid"
-            _ask_key = "Ask$" if _is_usd else "Ask"
-            _mark_key = "Mark$" if _is_usd else "Mark"
+            _bid_key = "Bid" if _is_usd else "BidCoin"
+            _ask_key = "Ask" if _is_usd else "AskCoin"
+            _mark_key = "Mark" if _is_usd else "MarkCoin"
 
             # Build T-shaped rows: Call side | Strike | Put side
             chain_rows = []

@@ -163,7 +163,7 @@ class ChaserConfig:
     """Limit-order chaser settings."""
     window_seconds: int = 1800          # 30 minutes total window
     poll_interval_sec: int = 60         # check / amend every 60 seconds
-    tick_size_usdt: float = 0.01        # min price increment in USDT
+    tick_size_usdt: float = 5.0         # min price increment in USD
     market_fallback_sec: int = 60       # switch to market order last N seconds
     max_amend_attempts: int = 180       # safety cap on re-pricing loops
 

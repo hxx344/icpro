@@ -48,10 +48,13 @@ class LegOrder:
     # Current order state
     order_id: str = ""
     current_price: float = 0.0
-    status: str = "PENDING"     # PENDING / NEW / FILLED / FAILED
+    status: str = "PENDING"     # PENDING / NEW / PARTIALLY_FILLED / FILLED / FAILED
     avg_price: float = 0.0
     fee: float = 0.0
-    filled_qty: float = 0.0
+    filled_qty: float = 0.0      # cumulative filled quantity across all child orders
+    current_order_filled_qty: float = 0.0
+    current_order_avg_price: float = 0.0
+    current_order_fee: float = 0.0
 
     # Tracking
     attempts: int = 0
@@ -63,7 +66,7 @@ class ChaserConfig:
     """Configuration for the limit-order chaser."""
     window_seconds: int = 1800          # 30 minutes total window
     poll_interval_sec: int = 60         # check / amend every 60 seconds
-    tick_size_usdt: float = 0.01        # min price increment in USDT
+    tick_size_usdt: float = 5.0         # min price increment in USD
     market_fallback_sec: int = 60       # switch to market order last N seconds
     max_amend_attempts: int = 180       # safety cap on re-pricing loops
 
@@ -88,6 +91,54 @@ class LimitChaser:
     ):
         self.client = client
         self.cfg = config or ChaserConfig()
+
+    def _remaining_qty(self, leg: LegOrder) -> float:
+        """Return the quantity still needing execution."""
+        remaining = leg.quantity - leg.filled_qty
+        if remaining <= 1e-9:
+            return 0.0
+        return remaining
+
+    def _record_fill_progress(self, leg: LegOrder, result: OrderResult) -> None:
+        """Accumulate fills reported for the current child order."""
+        executed_qty = max(float(result.quantity or 0.0), 0.0)
+        prev_qty = leg.current_order_filled_qty
+        if executed_qty < prev_qty:
+            executed_qty = prev_qty
+
+        delta_qty = executed_qty - prev_qty
+        if delta_qty > 1e-9:
+            prev_notional = leg.current_order_avg_price * prev_qty
+            new_notional = float(result.avg_price or 0.0) * executed_qty
+            delta_notional = max(new_notional - prev_notional, 0.0)
+
+            total_qty = leg.filled_qty + delta_qty
+            if total_qty > 1e-9:
+                total_notional = leg.avg_price * leg.filled_qty + delta_notional
+                leg.avg_price = total_notional / total_qty
+            leg.filled_qty = total_qty
+
+        reported_fee = max(float(result.fee or 0.0), 0.0)
+        delta_fee = reported_fee - leg.current_order_fee
+        if delta_fee > 1e-9:
+            leg.fee += delta_fee
+
+        leg.current_order_filled_qty = executed_qty
+        leg.current_order_avg_price = float(result.avg_price or leg.current_order_avg_price or 0.0)
+        leg.current_order_fee = reported_fee
+
+    def _start_new_child_order(self, leg: LegOrder) -> None:
+        """Reset per-order fill trackers before placing a replacement order."""
+        leg.current_order_filled_qty = 0.0
+        leg.current_order_avg_price = 0.0
+        leg.current_order_fee = 0.0
+
+    def _mark_filled_if_done(self, leg: LegOrder) -> bool:
+        """Mark the leg filled when the target quantity has been reached."""
+        if self._remaining_qty(leg) <= 1e-9:
+            leg.status = "FILLED"
+            return True
+        return False
 
     def execute_legs(
         self,
@@ -240,9 +291,12 @@ class LimitChaser:
         SELL: start at ask - 1 tick, drift toward bid
         BUY:  start at bid + 1 tick, drift toward ask
 
+        If the spread is only 1 tick, prefer the passive price first
+        instead of crossing immediately.
+
         Uses quadratic aggression curve: slow at start, fast at end.
         """
-        bid = quote.bid_price   # in USDT (we work in USDT for Binance)
+        bid = quote.bid_price   # Binance option limit prices are quoted in USD/USDT
         ask = quote.ask_price
         tick = self.cfg.tick_size_usdt
 
@@ -254,19 +308,22 @@ class LimitChaser:
 
         # Quadratic aggression: 0 at start → 1 at deadline
         aggression = elapsed_ratio ** 2
+        one_tick_spread = (ask - bid) <= (tick + 1e-9)
 
         if leg.side == "SELL":
-            # Start: ask - tick (aggressive maker, just under the ask)
+            # For 1-tick spreads, stay passive at the ask first.
+            # Otherwise start just under the ask.
             # End:   bid (take the bid if needed)
-            start_price = ask - tick
+            start_price = ask if one_tick_spread else ask - tick
             end_price = bid
             price = start_price - aggression * (start_price - end_price)
             # Never below bid
             price = max(price, bid)
         else:  # BUY
-            # Start: bid + tick (aggressive maker, just above the bid)
+            # For 1-tick spreads, stay passive at the bid first.
+            # Otherwise start just above the bid.
             # End:   ask (take the ask if needed)
-            start_price = bid + tick
+            start_price = bid if one_tick_spread else bid + tick
             end_price = ask
             price = start_price + aggression * (end_price - start_price)
             # Never above ask
@@ -284,11 +341,17 @@ class LimitChaser:
 
     def _place_or_amend(self, leg: LegOrder, price: float) -> None:
         """Place a new limit order for a leg."""
+        remaining_qty = self._remaining_qty(leg)
+        if remaining_qty <= 1e-9:
+            self._mark_filled_if_done(leg)
+            return
+
         try:
+            self._start_new_child_order(leg)
             result = self.client.place_order(
                 symbol=leg.symbol,
                 side=leg.side,
-                quantity=leg.quantity,
+                quantity=remaining_qty,
                 order_type="LIMIT",
                 price=price,
             )
@@ -298,19 +361,25 @@ class LimitChaser:
             leg.attempts += 1
 
             if result.status == "FILLED":
+                self._record_fill_progress(leg, result)
                 leg.status = "FILLED"
-                leg.avg_price = result.avg_price
-                leg.fee = result.fee
-                leg.filled_qty = result.quantity
                 logger.info(
                     f"[Chaser] {leg.leg_role} {leg.symbol} FILLED immediately "
                     f"at {result.avg_price:.4f}"
+                )
+            elif result.status == "PARTIALLY_FILLED":
+                self._record_fill_progress(leg, result)
+                leg.status = "PARTIALLY_FILLED"
+                logger.info(
+                    f"[Chaser] {leg.leg_role} {leg.symbol} partially filled "
+                    f"{leg.filled_qty:.4f}/{leg.quantity:.4f} @ {result.avg_price:.4f}"
                 )
             else:
                 leg.status = "NEW"
                 logger.info(
                     f"[Chaser] {leg.leg_role} {leg.symbol} limit {leg.side} "
-                    f"@ {price:.4f} placed (attempt #{leg.attempts})"
+                    f"@ {price:.4f} for {remaining_qty:.4f} placed "
+                    f"(attempt #{leg.attempts})"
                 )
 
         except Exception as e:
@@ -325,28 +394,32 @@ class LimitChaser:
         try:
             result = self.client.query_order(leg.symbol, leg.order_id)
 
+            if result.status in ("FILLED", "PARTIALLY_FILLED", "CANCELLED", "EXPIRED"):
+                self._record_fill_progress(leg, result)
+
             if result.status == "FILLED":
                 leg.status = "FILLED"
-                leg.avg_price = result.avg_price
-                leg.fee = result.fee
-                leg.filled_qty = result.quantity
                 logger.info(
                     f"[Chaser] {leg.leg_role} {leg.symbol} FILLED "
                     f"at {result.avg_price:.4f}"
                 )
             elif result.status == "PARTIALLY_FILLED":
-                leg.filled_qty = result.quantity
+                leg.status = "PARTIALLY_FILLED"
                 logger.debug(
                     f"[Chaser] {leg.leg_role} partial fill: "
                     f"{result.quantity}/{leg.quantity}"
                 )
             elif result.status in ("CANCELLED", "EXPIRED", "REJECTED"):
+                if self._mark_filled_if_done(leg):
+                    return
                 # Order was killed externally
                 leg.status = "PENDING"
                 leg.order_id = ""
                 logger.warning(
                     f"[Chaser] {leg.leg_role} order {result.status}, will retry"
                 )
+
+            self._mark_filled_if_done(leg)
 
         except Exception as e:
             logger.error(f"[Chaser] Query failed for {leg.leg_role}: {e}")
@@ -356,6 +429,7 @@ class LimitChaser:
         if leg.order_id:
             try:
                 self.client.cancel_order(leg.symbol, leg.order_id)
+                self._check_fill(leg)
                 logger.debug(
                     f"[Chaser] Cancelled {leg.leg_role} order {leg.order_id}"
                 )
@@ -366,11 +440,14 @@ class LimitChaser:
                 if leg.status == "FILLED":
                     return
 
+        if self._mark_filled_if_done(leg):
+            return
+
         leg.order_id = ""
         self._place_or_amend(leg, new_price)
 
     def _cancel_and_market(self, leg: LegOrder) -> None:
-        """Cancel limit order and fill with market order."""
+        """Cancel limit order and fill with market-like aggressive limit order."""
         # Cancel outstanding limit
         if leg.order_id:
             try:
@@ -380,34 +457,44 @@ class LimitChaser:
 
             # Check if it filled during cancel
             self._check_fill(leg)
-            if leg.status == "FILLED":
+            if leg.status == "FILLED" or self._mark_filled_if_done(leg):
                 return
 
         logger.info(
-            f"[Chaser] {leg.leg_role} {leg.symbol} switching to MARKET order"
+            f"[Chaser] {leg.leg_role} {leg.symbol} switching to market-like LIMIT fallback"
         )
         self._market_fallback(leg)
 
     def _market_fallback(self, leg: LegOrder) -> None:
-        """Execute a market order as last resort."""
+        """Execute a market-like aggressive limit order as last resort."""
+        remaining_qty = self._remaining_qty(leg)
+        if remaining_qty <= 1e-9:
+            self._mark_filled_if_done(leg)
+            return
+
         try:
+            self._start_new_child_order(leg)
             result = self.client.place_order(
                 symbol=leg.symbol,
                 side=leg.side,
-                quantity=leg.quantity,
+                quantity=remaining_qty,
                 order_type="MARKET",
             )
 
             if result.status in ("FILLED", "PARTIALLY_FILLED"):
-                leg.status = "FILLED"
-                leg.avg_price = result.avg_price
-                leg.fee = result.fee
-                leg.filled_qty = result.quantity
+                self._record_fill_progress(leg, result)
                 leg.order_id = result.order_id
-                logger.info(
-                    f"[Chaser] {leg.leg_role} MARKET filled at "
-                    f"{result.avg_price:.4f}"
-                )
+                if self._mark_filled_if_done(leg):
+                    logger.info(
+                        f"[Chaser] {leg.leg_role} MARKET filled at "
+                        f"{result.avg_price:.4f}"
+                    )
+                else:
+                    leg.status = "FAILED"
+                    logger.error(
+                        f"[Chaser] {leg.leg_role} MARKET only partially filled: "
+                        f"{leg.filled_qty:.4f}/{leg.quantity:.4f}"
+                    )
             else:
                 leg.status = "FAILED"
                 logger.error(

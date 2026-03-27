@@ -1,4 +1,4 @@
-"""Binance European Options API client.
+﻿"""Binance European Options API client.
 
 Provides a unified interface for the trader modules:
 - Market data (spot/index, option tickers, mark prices)
@@ -18,7 +18,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -197,6 +197,22 @@ class BinanceOptionsClient:
             logger.error(f"Binance private POST {path} failed: {e}")
             raise
 
+    def _private_delete(self, path: str, params=None):
+        if self.cfg.simulate_private:
+            return None
+        signed = self._sign(dict(params or {}))
+        url = f"{self._base}{path}"
+        try:
+            resp = self.session.delete(url, params=signed, timeout=self.cfg.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and data.get("code") and int(data["code"]) < 0:
+                raise RuntimeError(f"Binance error {data['code']}: {data.get('msg', '')}")
+            return data
+        except Exception as e:
+            logger.error(f"Binance DELETE {path} failed: {e}")
+            raise
+
     # ------------------------------------------------------------------
     # Market data
     # ------------------------------------------------------------------
@@ -209,7 +225,7 @@ class BinanceOptionsClient:
         except Exception:
             return 0.0
 
-    def get_tickers(self, underlying: str = "ETH"):
+    def get_tickers(self, underlying: str = "ETH") -> list[OptionTicker]:
         ul = underlying.upper()
         try:
             result = self._public_get("/eapi/v1/ticker")
@@ -217,7 +233,7 @@ class BinanceOptionsClient:
             logger.error(f"Failed to fetch tickers: {e}")
             return []
 
-        tickers = []
+        tickers: list[OptionTicker] = []
         if not isinstance(result, list):
             return tickers
 
@@ -229,19 +245,11 @@ class BinanceOptionsClient:
             if not parsed:
                 continue
 
-            spot = float(item.get("exercisePrice", 0)) or 0
-            bid_usdt = float(item.get("bidPrice") or 0)
-            ask_usdt = float(item.get("askPrice") or 0)
-            last_usdt = float(item.get("lastPrice") or 0)
-            mark_usdt = (bid_usdt + ask_usdt) / 2 if bid_usdt > 0 and ask_usdt > 0 else last_usdt
-
-            if spot > 0:
-                bid_coin = bid_usdt / spot
-                ask_coin = ask_usdt / spot
-                mark_coin = mark_usdt / spot
-                last_coin = last_usdt / spot
-            else:
-                bid_coin = ask_coin = mark_coin = last_coin = 0.0
+            spot = float(item.get("underlyingPrice") or item.get("exercisePrice") or 0)
+            bid_price = float(item.get("bidPrice") or 0)
+            ask_price = float(item.get("askPrice") or 0)
+            last_price = float(item.get("lastPrice") or 0)
+            mark_price = (bid_price + ask_price) / 2 if bid_price > 0 and ask_price > 0 else last_price
 
             tickers.append(OptionTicker(
                 symbol=symbol,
@@ -249,10 +257,10 @@ class BinanceOptionsClient:
                 strike=parsed["strike"],
                 option_type=parsed["option_type"],
                 expiry=parsed["expiry"],
-                bid_price=bid_coin,
-                ask_price=ask_coin,
-                mark_price=mark_coin,
-                last_price=last_coin,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                mark_price=mark_price,
+                last_price=last_price,
                 underlying_price=spot,
                 volume_24h=float(item.get("volume") or 0),
                 open_interest=float(item.get("amount") or 0),
@@ -260,36 +268,26 @@ class BinanceOptionsClient:
 
         return tickers
 
-
-    def enrich_greeks(self, tickers: list, underlying: str = "ETH") -> None:
-        """Fetch Greeks from /eapi/v1/mark and populate delta/mark_iv on tickers.
-
-        Binance /eapi/v1/ticker does not return Greeks; only /eapi/v1/mark does.
-        Call this after get_tickers() to populate delta and mark_iv fields.
-        """
+    def enrich_greeks(self, tickers: list[OptionTicker], underlying: str = "ETH") -> None:
+        """Fetch Greeks from /eapi/v1/mark and populate delta/mark_iv on tickers."""
         greeks = self.get_greeks(underlying)
         if not greeks:
             return
-        for t in tickers:
-            if t.symbol in greeks:
-                g = greeks[t.symbol]
-                t.delta = g["delta"]
-                t.mark_iv = g["mark_iv"]
+        for ticker in tickers:
+            if ticker.symbol in greeks:
+                g = greeks[ticker.symbol]
+                ticker.delta = g["delta"]
+                ticker.mark_iv = g["mark_iv"]
 
-    def get_greeks(self, underlying: str = "ETH") -> dict:
-        """Fetch delta and mark IV for all options from /eapi/v1/mark.
-
-        Returns
-        -------
-        dict  : {symbol: {"delta": float, "mark_iv": float}}
-        """
+    def get_greeks(self, underlying: str = "ETH") -> dict[str, dict[str, float]]:
+        """Fetch delta and mark IV for all options from /eapi/v1/mark."""
         ul = underlying.upper()
         try:
             result = self._public_get("/eapi/v1/mark")
         except Exception:
             return {}
 
-        greeks = {}
+        greeks: dict[str, dict[str, float]] = {}
         if not isinstance(result, list):
             return greeks
 
@@ -304,14 +302,14 @@ class BinanceOptionsClient:
 
         return greeks
 
-    def get_mark_prices(self, underlying: str = "ETH"):
+    def get_mark_prices(self, underlying: str = "ETH") -> dict[str, float]:
         ul = underlying.upper()
         try:
             result = self._public_get("/eapi/v1/mark")
         except Exception:
             return {}
 
-        prices = {}
+        prices: dict[str, float] = {}
         if not isinstance(result, list):
             return prices
 
@@ -319,12 +317,7 @@ class BinanceOptionsClient:
             symbol = str(item.get("symbol", ""))
             if not symbol.startswith(f"{ul}-"):
                 continue
-            mark_usdt = float(item.get("markPrice") or 0)
-            spot = float(item.get("underlyingPrice") or 0)
-            if spot > 0:
-                prices[symbol] = mark_usdt / spot
-            else:
-                prices[symbol] = 0.0
+            prices[symbol] = float(item.get("markPrice") or 0)
 
         return prices
 
@@ -365,22 +358,16 @@ class BinanceOptionsClient:
         available = 0.0
         upnl = 0.0
 
-        for a in assets:
-            if not isinstance(a, dict):
+        for asset in assets:
+            if not isinstance(asset, dict):
                 continue
-            total_balance += float(a.get("marginBalance") or 0)
-            # Binance EAPI uses "available", not "availableBalance"
-            available += float(
-                a.get("available") or a.get("availableBalance") or 0
-            )
-            upnl += float(
-                a.get("unrealizedPNL") or a.get("unrealizedPnl") or 0
-            )
+            total_balance += float(asset.get("marginBalance") or 0)
+            available += float(asset.get("available") or asset.get("availableBalance") or 0)
+            upnl += float(asset.get("unrealizedPNL") or asset.get("unrealizedPnl") or 0)
 
         logger.debug(
-            f"Account: balance={total_balance:.4f}, "
-            f"available={available:.4f}, upnl={upnl:.4f}, "
-            f"assets_count={len(assets)}"
+            f"Account: balance={total_balance:.4f}, available={available:.4f}, "
+            f"upnl={upnl:.4f}, assets_count={len(assets)}"
         )
 
         return AccountInfo(
@@ -432,6 +419,7 @@ class BinanceOptionsClient:
             })
 
         return positions
+
     # ------------------------------------------------------------------
     # Order management
     # ------------------------------------------------------------------
@@ -443,10 +431,12 @@ class BinanceOptionsClient:
         quantity: float,
         order_type: str = "MARKET",
         price=None,
+        time_in_force: Optional[str] = None,
         reduce_only: bool = False,
         client_order_id=None,
     ) -> OrderResult:
         side_norm = side.upper()
+        order_type_norm = order_type.upper()
 
         if self.cfg.simulate_private:
             import uuid
@@ -459,18 +449,48 @@ class BinanceOptionsClient:
                 avg_price=price or 0.0,
                 status="FILLED",
                 fee=0.0,
-                raw={"simulated": True},
+                raw={
+                    "simulated": True,
+                    "requestedType": order_type_norm,
+                    "timeInForce": time_in_force,
+                },
+            )
+
+        effective_type = order_type_norm
+        effective_price = price
+        effective_tif = time_in_force
+
+        if order_type_norm == "MARKET":
+            quote = self.get_ticker(symbol)
+            if quote is None:
+                raise RuntimeError(
+                    f"No live quote available for synthetic market order: {symbol}"
+                )
+
+            effective_price = quote.ask_price if side_norm == "BUY" else quote.bid_price
+            effective_price = float(effective_price)
+            if effective_price <= 0:
+                raise RuntimeError(
+                    f"Invalid synthetic market reference price for {symbol}: "
+                    f"side={side_norm}, bid={quote.bid_price}, ask={quote.ask_price}"
+                )
+
+            effective_type = "LIMIT"
+            effective_tif = effective_tif or "IOC"
+            logger.info(
+                f"Using synthetic marketable limit for {symbol}: "
+                f"side={side_norm}, px={effective_price:.4f}, tif={effective_tif}"
             )
 
         params = {
             "symbol": symbol,
             "side": side_norm,
-            "type": order_type.upper(),
+            "type": effective_type,
             "quantity": str(quantity),
         }
-        if price is not None and order_type.upper() == "LIMIT":
-            params["price"] = str(price)
-            params["timeInForce"] = "GTC"
+        if effective_price is not None and effective_type == "LIMIT":
+            params["price"] = str(effective_price)
+            params["timeInForce"] = effective_tif or "GTC"
         if reduce_only:
             params["reduceOnly"] = "true"
         if client_order_id:
@@ -575,23 +595,6 @@ class BinanceOptionsClient:
             logger.error(f"Cancel order {order_id} failed: {e}")
             return False
 
-    def _private_delete(self, path: str, params=None):
-        """HTTP DELETE for order cancellation."""
-        if self.cfg.simulate_private:
-            return None
-        signed = self._sign(dict(params or {}))
-        url = f"{self._base}{path}"
-        try:
-            resp = self.session.delete(url, params=signed, timeout=self.cfg.timeout)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and data.get("code") and int(data["code"]) < 0:
-                raise RuntimeError(f"Binance error {data['code']}: {data.get('msg', '')}")
-            return data
-        except Exception as e:
-            logger.error(f"Binance DELETE {path} failed: {e}")
-            raise
-
     def get_ticker(self, symbol: str) -> OptionTicker | None:
         """Get a single ticker by exact symbol name."""
         parsed = _parse_symbol(symbol)
@@ -611,19 +614,11 @@ class BinanceOptionsClient:
             if sym != symbol:
                 continue
 
-            spot = float(item.get("exercisePrice", 0)) or 0
-            bid_usdt = float(item.get("bidPrice") or 0)
-            ask_usdt = float(item.get("askPrice") or 0)
-            last_usdt = float(item.get("lastPrice") or 0)
-            mark_usdt = (bid_usdt + ask_usdt) / 2 if bid_usdt > 0 and ask_usdt > 0 else last_usdt
-
-            if spot > 0:
-                bid_coin = bid_usdt / spot
-                ask_coin = ask_usdt / spot
-                mark_coin = mark_usdt / spot
-                last_coin = last_usdt / spot
-            else:
-                bid_coin = ask_coin = mark_coin = last_coin = 0.0
+            spot = float(item.get("underlyingPrice") or item.get("exercisePrice") or 0)
+            bid_price = float(item.get("bidPrice") or 0)
+            ask_price = float(item.get("askPrice") or 0)
+            last_price = float(item.get("lastPrice") or 0)
+            mark_price = (bid_price + ask_price) / 2 if bid_price > 0 and ask_price > 0 else last_price
 
             return OptionTicker(
                 symbol=symbol,
@@ -631,10 +626,10 @@ class BinanceOptionsClient:
                 strike=parsed["strike"],
                 option_type=parsed["option_type"],
                 expiry=parsed["expiry"],
-                bid_price=bid_coin,
-                ask_price=ask_coin,
-                mark_price=mark_coin,
-                last_price=last_coin,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                mark_price=mark_price,
+                last_price=last_price,
                 underlying_price=spot,
                 volume_24h=float(item.get("volume") or 0),
                 open_interest=float(item.get("amount") or 0),
@@ -643,4 +638,3 @@ class BinanceOptionsClient:
             )
 
         return None
-

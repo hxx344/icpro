@@ -65,6 +65,6 @@ monitor:
 chaser:
   window_seconds: 600          # 10 分钟追单窗口 (周末期权流动性一般)
   poll_interval_sec: 30        # 每 30 秒检查
-  tick_size_usdt: 0.0005       # BTC 期权最小步长
+  tick_size_usdt: 5.0          # Binance 期权价格最小跳动 (USD)
   market_fallback_sec: 60      # 最后 60 秒切市价
   max_amend_attempts: 30

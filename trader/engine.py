@@ -41,6 +41,7 @@ class TradingEngine:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._log_handler_id: Optional[int] = None
 
         # State
         self._running = False
@@ -55,6 +56,7 @@ class TradingEngine:
         self.pos_mgr: Optional[PositionManager] = None
         self.strategy: Optional[Any] = None                   # OptionSelling or WeekendVol
         self.equity_tracker: Optional[EquityTracker] = None
+        self.storage: Optional[Storage] = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -86,6 +88,7 @@ class TradingEngine:
             except Exception as e:
                 self._last_error = f"Init failed: {e}"
                 logger.error(f"Engine init failed: {e}")
+                self._cleanup_resources()
                 return False
 
             # Start thread
@@ -109,6 +112,7 @@ class TradingEngine:
         with self._lock:
             if not self.is_running:
                 logger.info("Engine not running, nothing to stop")
+                self._cleanup_resources()
                 return True
 
             logger.info("Stopping trading engine...")
@@ -123,6 +127,7 @@ class TradingEngine:
 
         with self._lock:
             self._running = False
+            self._thread = None
             logger.info("Trading engine stopped")
 
         return True
@@ -216,12 +221,15 @@ class TradingEngine:
 
     def _setup_logging(self) -> None:
         """Configure loguru for the engine."""
+        if self._log_handler_id is not None:
+            return
+
         log_dir = Path(self.cfg.storage.log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
 
         # Don't remove existing handlers (Streamlit may be using stderr)
         # Just add file handler if not already added
-        logger.add(
+        self._log_handler_id = logger.add(
             str(log_dir / "trader_{time:YYYYMMDD}.log"),
             level="DEBUG",
             rotation=self.cfg.storage.log_rotation,
@@ -235,51 +243,51 @@ class TradingEngine:
     def _run_loop(self) -> None:
         """Main trading loop – runs in background thread."""
         logger.info("Engine loop started")
+        try:
+            if not self.client or not self.strategy or not self.equity_tracker:
+                self._last_error = "Engine modules are not initialized"
+                logger.error(self._last_error)
+                return
 
-        if not self.client or not self.strategy or not self.equity_tracker:
-            self._last_error = "Engine modules are not initialized"
-            logger.error(self._last_error)
-            return
+            # Init day tracking
+            self._init_day()
 
-        # Init day tracking
-        self._init_day()
+            last_snapshot = 0.0
+            last_heartbeat = 0.0
 
-        last_snapshot = 0.0
-        last_heartbeat = 0.0
+            while not self._stop_event.is_set():
+                now = time.time()
 
-        while not self._stop_event.is_set():
-            now = time.time()
-
-            # --- Strategy tick ---
-            try:
-                self._check_day_rollover()
-                self.strategy.tick()
-                self._tick_count += 1
-                self._last_tick_time = now
-            except Exception as e:
-                self._error_count += 1
-                self._last_error = f"Tick error: {e}"
-                logger.error(f"Strategy tick error: {e}")
-
-            # --- Equity snapshot ---
-            if now - last_snapshot >= self.cfg.monitor.equity_snapshot_interval_sec:
+                # --- Strategy tick ---
                 try:
-                    self.equity_tracker.take_snapshot()
-                    last_snapshot = now
+                    self._check_day_rollover()
+                    self.strategy.tick()
+                    self._tick_count += 1
+                    self._last_tick_time = now
                 except Exception as e:
-                    logger.error(f"Equity snapshot error: {e}")
+                    self._error_count += 1
+                    self._last_error = f"Tick error: {e}"
+                    logger.error(f"Strategy tick error: {e}")
 
-            # --- Heartbeat ---
-            if now - last_heartbeat >= self.cfg.monitor.heartbeat_interval_sec:
-                self._heartbeat()
-                last_heartbeat = now
+                # --- Equity snapshot ---
+                if now - last_snapshot >= self.cfg.monitor.equity_snapshot_interval_sec:
+                    try:
+                        self.equity_tracker.take_snapshot()
+                        last_snapshot = now
+                    except Exception as e:
+                        logger.error(f"Equity snapshot error: {e}")
 
-            # Sleep with interruptible wait
-            self._stop_event.wait(timeout=self.cfg.monitor.check_interval_sec)
+                # --- Heartbeat ---
+                if now - last_heartbeat >= self.cfg.monitor.heartbeat_interval_sec:
+                    self._heartbeat()
+                    last_heartbeat = now
 
-        # --- Shutdown ---
-        self._on_shutdown()
-        logger.info("Engine loop exited")
+                # Sleep with interruptible wait
+                self._stop_event.wait(timeout=self.cfg.monitor.check_interval_sec)
+        finally:
+            # --- Shutdown ---
+            self._on_shutdown()
+            logger.info("Engine loop exited")
 
     def _init_day(self) -> None:
         if not self.client or not self.equity_tracker:
@@ -336,21 +344,45 @@ class TradingEngine:
 
     def _on_shutdown(self) -> None:
         """Cleanup on loop exit."""
-        if not self.client or not self.equity_tracker:
-            return
         try:
-            account = self.client.get_account()
-            if account.raw.get("simulated"):
-                return
-            equity = account.total_balance + account.unrealized_pnl
-            self.equity_tracker.on_day_end(equity)
-        except Exception:
-            pass
+            if self.client and self.equity_tracker:
+                try:
+                    account = self.client.get_account()
+                    if not account.raw.get("simulated"):
+                        equity = account.total_balance + account.unrealized_pnl
+                        self.equity_tracker.on_day_end(equity)
+                except Exception as e:
+                    logger.warning(f"Shutdown day-end recording failed: {e}")
 
-        try:
-            self.equity_tracker.take_snapshot()
-        except Exception:
-            pass
+                try:
+                    self.equity_tracker.take_snapshot()
+                except Exception as e:
+                    logger.warning(f"Shutdown snapshot failed: {e}")
+        finally:
+            self._cleanup_resources()
+
+    def _cleanup_resources(self) -> None:
+        """Release engine-owned resources so restart does not leak handles."""
+        if self.storage is not None:
+            try:
+                self.storage.close()
+            except Exception as e:
+                logger.warning(f"Storage close failed: {e}")
+            finally:
+                self.storage = None
+
+        if self._log_handler_id is not None:
+            try:
+                logger.remove(self._log_handler_id)
+            except Exception as e:
+                logger.warning(f"Logger handler cleanup failed: {e}")
+            finally:
+                self._log_handler_id = None
+
+        self.client = None
+        self.pos_mgr = None
+        self.strategy = None
+        self.equity_tracker = None
 
     @staticmethod
     def _format_duration(seconds: float) -> str:

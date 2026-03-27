@@ -230,7 +230,7 @@ class PositionManager:
                 ))
                 for r in results if r.status == "FILLED"
             ]
-            self._rollback_legs(filled_results, quantity)
+            self._rollback_legs(filled_results)
             return None
 
         condor = IronCondorPosition(
@@ -241,6 +241,7 @@ class PositionManager:
 
         total_premium = 0.0
         for leg_order in results:
+            leg_qty = leg_order.filled_qty or quantity
             meta = {
                 "leg_role": leg_order.leg_role,
                 "option_type": leg_order.option_type,
@@ -252,7 +253,7 @@ class PositionManager:
                 trade_group=group_id,
                 symbol=leg_order.symbol,
                 side=leg_order.side,
-                quantity=quantity,
+                quantity=leg_qty,
                 price=leg_order.avg_price,
                 fee=leg_order.fee,
                 order_id=leg_order.order_id,
@@ -264,13 +265,13 @@ class PositionManager:
                 side=leg_order.side,
                 option_type=leg_order.option_type,
                 strike=leg_order.strike,
-                quantity=quantity,
+                quantity=leg_qty,
                 entry_price=leg_order.avg_price,
                 trade_id=trade_id,
                 order_id=leg_order.order_id,
             )
             setattr(condor, leg_order.leg_role, leg)
-            total_premium += leg_order.avg_price * quantity
+            total_premium += leg_order.avg_price * leg_qty
 
         condor.total_premium = total_premium
         self.open_condors[group_id] = condor
@@ -360,7 +361,7 @@ class PositionManager:
                 ))
                 for r in results if r.status == "FILLED"
             ]
-            self._rollback_legs(filled_results, quantity)
+            self._rollback_legs(filled_results)
             return None
 
         # All filled – build condor position
@@ -373,6 +374,7 @@ class PositionManager:
         total_premium = 0.0
 
         for leg_order in results:
+            leg_qty = leg_order.filled_qty or quantity
             meta = {
                 "leg_role": leg_order.leg_role,
                 "option_type": leg_order.option_type,
@@ -384,7 +386,7 @@ class PositionManager:
                 trade_group=group_id,
                 symbol=leg_order.symbol,
                 side=leg_order.side,
-                quantity=quantity,
+                quantity=leg_qty,
                 price=leg_order.avg_price,
                 fee=leg_order.fee,
                 order_id=leg_order.order_id,
@@ -396,7 +398,7 @@ class PositionManager:
                 side=leg_order.side,
                 option_type=leg_order.option_type,
                 strike=leg_order.strike,
-                quantity=quantity,
+                quantity=leg_qty,
                 entry_price=leg_order.avg_price,
                 trade_id=trade_id,
                 order_id=leg_order.order_id,
@@ -404,9 +406,9 @@ class PositionManager:
             setattr(condor, leg_order.leg_role, leg)
 
             if leg_order.side == "SELL":
-                total_premium += leg_order.avg_price * quantity
+                total_premium += leg_order.avg_price * leg_qty
             else:
-                total_premium -= leg_order.avg_price * quantity
+                total_premium -= leg_order.avg_price * leg_qty
 
         condor.total_premium = total_premium
         self.open_condors[group_id] = condor
@@ -421,7 +423,6 @@ class PositionManager:
     def _rollback_legs(
         self,
         filled_legs: list[tuple[str, OrderResult]],
-        quantity: float,
     ) -> None:
         """Attempt to close already-filled legs on partial failure."""
         logger.warning(f"Rolling back {len(filled_legs)} filled leg(s)")
@@ -431,7 +432,7 @@ class PositionManager:
                 self.client.place_order(
                     symbol=result.symbol,
                     side=close_side,
-                    quantity=quantity,
+                    quantity=result.quantity,
                     order_type="MARKET",
                     reduce_only=True,
                 )

@@ -786,10 +786,11 @@ class WeekendVolStrategy:
         """Compute position size with leverage + compounding.
 
         USD margin mode:
-          qty_btc = (account_equity_usd × leverage) / spot
-          Rounded down to 0.1 BTC increments.
+          qty_asset = (account_equity_usd × leverage) / spot
+          Rounded down to 0.1 underlying increments.
         """
         base_qty = self.cfg.quantity
+        ul = self.cfg.underlying.upper()
 
         if self.cfg.compound:
             try:
@@ -797,14 +798,14 @@ class WeekendVolStrategy:
                 equity = account.total_balance
                 if equity > 0 and spot > 0:
                     qty = (equity * self.cfg.leverage) / spot
-                    # Round down to 0.1 BTC
+                    # Round down to 0.1 underlying units
                     qty = math.floor(qty * 10) / 10
                     base_qty = max(self.cfg.quantity, qty)
                     logger.info(
                         f"[WeekendVol] qty: equity={equity:.2f} USD, "
                         f"leverage={self.cfg.leverage}x, spot={spot:.2f}, "
                         f"raw={equity * self.cfg.leverage / spot:.4f}, "
-                        f"final={base_qty:.1f} BTC"
+                        f"final={base_qty:.1f} {ul}"
                     )
             except Exception as e:
                 logger.warning(f"[WeekendVol] Could not compute compound qty: {e}")

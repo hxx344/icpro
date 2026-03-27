@@ -229,6 +229,66 @@ class TestOpenIronCondor:
         # 2 filled legs should be rolled back via market orders
         assert mock_client.place_order.call_count == 2
 
+    def test_failed_leg_rollback_uses_actual_filled_qty(self, pos_mgr, mock_client):
+        """回滚应按已成交量，而不是原始请求量。"""
+        def _partial_fill(legs):
+            for i, leg in enumerate(legs):
+                if i < 2:
+                    leg.status = "FILLED"
+                    leg.avg_price = 0.05
+                    leg.fee = 0.001
+                    leg.filled_qty = 0.4
+                    leg.order_id = f"ORD_{i}"
+                else:
+                    leg.status = "FAILED"
+            return legs
+
+        mock_client.place_order.return_value = _make_order_result()
+
+        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_partial_fill):
+            condor = pos_mgr.open_iron_condor(
+                sell_call_symbol="SC", buy_call_symbol="BC",
+                sell_put_symbol="SP", buy_put_symbol="BP",
+                sell_call_strike=2700, buy_call_strike=2750,
+                sell_put_strike=2300, buy_put_strike=2250,
+                quantity=1.0, underlying_price=2500.0,
+            )
+
+        assert condor is None
+        quantities = [call.kwargs["quantity"] for call in mock_client.place_order.call_args_list]
+        assert quantities == [0.4, 0.4]
+
+    def test_successful_open_records_actual_filled_qty(self, pos_mgr, storage):
+        """入库与持仓数量应以实际成交量为准。"""
+        def _filled_partial_size(legs):
+            for leg in legs:
+                leg.status = "FILLED"
+                leg.avg_price = 0.03
+                leg.fee = 0.001
+                leg.filled_qty = 0.6
+                leg.order_id = "ORD_001"
+            return legs
+
+        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_filled_partial_size):
+            condor = pos_mgr.open_iron_condor(
+                sell_call_symbol="ETH-260321-2700-C",
+                buy_call_symbol="ETH-260321-2750-C",
+                sell_put_symbol="ETH-260321-2300-P",
+                buy_put_symbol="ETH-260321-2250-P",
+                sell_call_strike=2700,
+                buy_call_strike=2750,
+                sell_put_strike=2300,
+                buy_put_strike=2250,
+                quantity=1.0,
+                underlying_price=2500.0,
+            )
+
+        assert condor is not None
+        assert all(leg.quantity == pytest.approx(0.6) for leg in condor.legs)
+        trades = storage.get_open_trades(condor.group_id)
+        assert len(trades) == 4
+        assert all(t["quantity"] == pytest.approx(0.6) for t in trades)
+
     def test_exception_triggers_rollback(self, pos_mgr, mock_client):
         """下单抛异常也应回滚."""
         with patch.object(pos_mgr.chaser, "execute_legs", side_effect=Exception("Connection error")):

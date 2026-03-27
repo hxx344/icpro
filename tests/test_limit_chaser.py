@@ -97,7 +97,7 @@ class TestChaserConfig(unittest.TestCase):
         cfg = ChaserConfig()
         self.assertEqual(cfg.window_seconds, 1800)
         self.assertEqual(cfg.poll_interval_sec, 60)
-        self.assertEqual(cfg.tick_size_usdt, 0.01)
+        self.assertEqual(cfg.tick_size_usdt, 5.0)
         self.assertEqual(cfg.market_fallback_sec, 60)
         self.assertEqual(cfg.max_amend_attempts, 180)
 
@@ -155,6 +155,20 @@ class TestLimitPriceComputation(unittest.TestCase):
         price = self.chaser._compute_limit_price(leg, q, elapsed_ratio=1.0)
         # End: ask = 60
         self.assertAlmostEqual(price, 60.0, places=1)
+
+    def test_sell_one_tick_spread_starts_passive(self):
+        """1-tick spread 时 SELL 应先挂 ask，不直接贴 bid。"""
+        leg = LegOrder("sell_call", "SYM", "SELL", 1.0, 2200.0, "call")
+        q = _make_ticker(bid=50.0, ask=51.0)
+        price = self.chaser._compute_limit_price(leg, q, elapsed_ratio=0.0)
+        self.assertAlmostEqual(price, 51.0, places=1)
+
+    def test_buy_one_tick_spread_starts_passive(self):
+        """1-tick spread 时 BUY 应先挂 bid，不直接贴 ask。"""
+        leg = LegOrder("buy_put", "SYM", "BUY", 1.0, 1800.0, "put")
+        q = _make_ticker(bid=50.0, ask=51.0)
+        price = self.chaser._compute_limit_price(leg, q, elapsed_ratio=0.0)
+        self.assertAlmostEqual(price, 50.0, places=1)
 
     def test_buy_at_half(self):
         """BUY at elapsed=0.5: quadratic aggression = 0.25."""
@@ -320,11 +334,25 @@ class TestCheckFill(unittest.TestCase):
         leg.order_id = "ORD-3"
         leg.status = "NEW"
 
-        self.client.query_order.return_value = _make_fill(status="CANCELLED")
+        self.client.query_order.return_value = _make_fill(status="CANCELLED", qty=0.0, fee=0.0)
 
         self.chaser._check_fill(leg)
         self.assertEqual(leg.status, "PENDING")
         self.assertEqual(leg.order_id, "")
+
+    def test_partial_fill_tracks_cumulative_progress(self):
+        leg = LegOrder("sell_put", "SYM", "SELL", 1.0, 1800.0, "put")
+        leg.order_id = "ORD-4"
+        leg.status = "NEW"
+
+        self.client.query_order.return_value = _make_fill(
+            order_id="ORD-4", status="PARTIALLY_FILLED", price=54.0, fee=0.01, qty=0.4
+        )
+
+        self.chaser._check_fill(leg)
+        self.assertEqual(leg.status, "PARTIALLY_FILLED")
+        self.assertAlmostEqual(leg.filled_qty, 0.4, places=6)
+        self.assertAlmostEqual(leg.fee, 0.01, places=6)
 
     def test_skip_already_filled(self):
         """Should not query if already filled."""
@@ -367,6 +395,32 @@ class TestCancelAndReplace(unittest.TestCase):
         self.client.cancel_order.assert_called_once_with("SYM", "OLD-1")
         self.assertEqual(leg.order_id, "NEW-1")
         self.assertEqual(leg.current_price, 53.0)
+
+    def test_cancel_replace_uses_remaining_quantity_after_partial_fill(self):
+        leg = LegOrder("sell_call", "SYM", "SELL", 1.0, 2200.0, "call")
+        leg.order_id = "OLD-1"
+        leg.status = "PARTIALLY_FILLED"
+        leg.filled_qty = 0.4
+        leg.current_order_filled_qty = 0.4
+        leg.current_order_avg_price = 54.0
+
+        self.client.cancel_order.return_value = True
+        self.client.query_order.return_value = _make_fill(
+            order_id="OLD-1", status="CANCELLED", price=54.0, fee=0.0, qty=0.4
+        )
+        self.client.place_order.return_value = _make_fill(
+            order_id="NEW-1", status="NEW", qty=0.0
+        )
+
+        self.chaser._cancel_and_replace(leg, 53.0)
+
+        self.client.place_order.assert_called_once()
+        self.assertAlmostEqual(
+            self.client.place_order.call_args.kwargs["quantity"],
+            0.6,
+            places=6,
+        )
+        self.assertAlmostEqual(leg.filled_qty, 0.4, places=6)
 
     def test_cancel_fails_but_filled(self):
         """If cancel fails because order already filled, detect it."""
@@ -436,7 +490,7 @@ class TestCancelAndMarket(unittest.TestCase):
 
         # cancel succeeds, query shows not filled, market fills
         self.client.cancel_order.return_value = True
-        self.client.query_order.return_value = _make_fill(status="CANCELLED")
+        self.client.query_order.return_value = _make_fill(status="CANCELLED", qty=0.0, fee=0.0)
         self.client.place_order.return_value = _make_fill(
             status="FILLED", price=49.0
         )
@@ -444,6 +498,45 @@ class TestCancelAndMarket(unittest.TestCase):
         self.chaser._cancel_and_market(leg)
         self.assertEqual(leg.status, "FILLED")
         self.assertEqual(leg.avg_price, 49.0)
+
+    def test_market_fallback_uses_remaining_quantity(self):
+        leg = LegOrder("sell_call", "SYM", "SELL", 1.0, 2200.0, "call")
+        leg.status = "PARTIALLY_FILLED"
+        leg.filled_qty = 0.25
+        self.client.place_order.return_value = _make_fill(
+            status="FILLED", price=49.0, qty=0.75
+        )
+
+        self.chaser._market_fallback(leg)
+
+        self.client.place_order.assert_called_once()
+        self.assertAlmostEqual(
+            self.client.place_order.call_args.kwargs["quantity"],
+            0.75,
+            places=6,
+        )
+        self.assertEqual(leg.status, "FILLED")
+        self.assertAlmostEqual(leg.filled_qty, 1.0, places=6)
+
+    def test_cancel_then_market_with_partial_fill_accumulates_weighted_avg(self):
+        leg = LegOrder("sell_call", "SYM", "SELL", 1.0, 2200.0, "call")
+        leg.order_id = "LIMIT-1"
+        leg.status = "NEW"
+
+        self.client.cancel_order.return_value = True
+        self.client.query_order.return_value = _make_fill(
+            order_id="LIMIT-1", status="CANCELLED", price=52.0, fee=0.01, qty=0.4
+        )
+        self.client.place_order.return_value = _make_fill(
+            order_id="MKT-1", status="FILLED", price=49.0, fee=0.02, qty=0.6
+        )
+
+        self.chaser._cancel_and_market(leg)
+
+        self.assertEqual(leg.status, "FILLED")
+        self.assertAlmostEqual(leg.filled_qty, 1.0, places=6)
+        self.assertAlmostEqual(leg.avg_price, 50.2, places=6)
+        self.assertAlmostEqual(leg.fee, 0.03, places=6)
 
     def test_already_filled_during_cancel(self):
         """If order fills during cancel, no market order needed."""

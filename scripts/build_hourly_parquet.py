@@ -3520,8 +3520,8 @@ def main():
                         help="Process a single local .zst file (for testing)")
     parser.add_argument("--start", type=str, default="2023-03-20",
                         help="Start date YYYY-MM-DD (default: 2023-03-20)")
-    parser.add_argument("--end", type=str, default="2025-12-31",
-                        help="End date YYYY-MM-DD (default: 2025-12-31)")
+    parser.add_argument("--end", type=str, default="2026-03-24",
+                        help="End date YYYY-MM-DD (default: 2026-03-24)")
     parser.add_argument("--dry-run", action="store_true",
                         help="List available dates without processing")
     parser.add_argument("--cache-only", action="store_true",

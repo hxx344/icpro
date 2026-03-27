@@ -153,6 +153,54 @@ class TestTradingEngine:
         assert TradingEngine._format_duration(65) == "1m 5s"
         assert TradingEngine._format_duration(3661) == "1h 1m 1s"
 
+    def test_setup_logging_does_not_duplicate_handler(self, sim_config, tmp_path):
+        sim_config.storage.log_dir = str(tmp_path / "logs")
+        engine = TradingEngine(sim_config)
+
+        with patch("trader.engine.logger.add", return_value=123) as add_mock:
+            engine._setup_logging()
+            engine._setup_logging()
+
+        add_mock.assert_called_once()
+        assert engine._log_handler_id == 123
+
+    def test_cleanup_resources_closes_storage_and_removes_handler(self, sim_config):
+        engine = TradingEngine(sim_config)
+        storage_mock = MagicMock(spec=Storage)
+        engine.storage = storage_mock
+        engine._log_handler_id = 123
+
+        with patch("trader.engine.logger.remove") as remove_mock:
+            engine._cleanup_resources()
+
+        storage_mock.close.assert_called_once()
+        assert engine.storage is None
+        assert engine._log_handler_id is None
+        remove_mock.assert_called_once_with(123)
+
+    def test_shutdown_cleans_resources_on_snapshot_error(self, sim_config):
+        engine = TradingEngine(sim_config)
+        engine.client = MagicMock(spec=BinanceOptionsClient)
+        engine.client.get_account.return_value = AccountInfo(
+            total_balance=10.0,
+            available_balance=8.0,
+            unrealized_pnl=0.5,
+            raw={},
+        )
+        engine.equity_tracker = MagicMock(spec=EquityTracker)
+        engine.equity_tracker.take_snapshot.side_effect = RuntimeError("snapshot fail")
+        storage_mock = MagicMock(spec=Storage)
+        engine.storage = storage_mock
+        engine._log_handler_id = 321
+
+        with patch("trader.engine.logger.remove") as remove_mock:
+            engine._on_shutdown()
+
+        storage_mock.close.assert_called_once()
+        remove_mock.assert_called_once_with(321)
+        assert engine.client is None
+        assert engine.equity_tracker is None
+
 
 class TestEngineSingleton:
     def test_get_engine_creates_instance(self, sim_config, tmp_path):

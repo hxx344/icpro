@@ -323,7 +323,7 @@ class TestGetSpotPrice:
 
 
 class TestGetTickers:
-    """get_tickers 应返回 OptionTicker 列表, USDT 价格转为币本位."""
+    """get_tickers 应返回 OptionTicker 列表，且期权价格保持 Binance 原生 USD 报价。"""
 
     def _mock_ticker_data(self):
         return [
@@ -366,36 +366,33 @@ class TestGetTickers:
         assert len(tickers) == 2
         assert all(t.underlying == "ETH" for t in tickers)
 
-    def test_usdt_to_coin_conversion(self, client):
-        """USDT 价格 / 标的价格 = 币本位."""
+    def test_preserves_native_usd_prices(self, client):
+        """Binance 期权盘口价格应保持原生 USD，不再除以 spot。"""
         mock_resp = MagicMock()
         mock_resp.json.return_value = self._mock_ticker_data()
         mock_resp.raise_for_status = MagicMock()
         with patch.object(client.session, "get", return_value=mock_resp):
             tickers = client.get_tickers("ETH")
         call_ticker = [t for t in tickers if t.option_type == "call"][0]
-        # bid_coin = 125 / 2500 = 0.05
-        assert call_ticker.bid_price == pytest.approx(0.05)
-        # ask_coin = 150 / 2500 = 0.06
-        assert call_ticker.ask_price == pytest.approx(0.06)
+        assert call_ticker.bid_price == pytest.approx(125.0)
+        assert call_ticker.ask_price == pytest.approx(150.0)
 
     def test_mark_from_mid(self, client):
-        """mark_price 应从 (bid+ask)/2 转换."""
+        """缺少 markPrice 时，mark_price 应取原生 USD 中间价。"""
         mock_resp = MagicMock()
         mock_resp.json.return_value = self._mock_ticker_data()
         mock_resp.raise_for_status = MagicMock()
         with patch.object(client.session, "get", return_value=mock_resp):
             tickers = client.get_tickers("ETH")
         call_ticker = [t for t in tickers if t.option_type == "call"][0]
-        # mark_usdt = (125+150)/2 = 137.5, mark_coin = 137.5/2500 = 0.055
-        assert call_ticker.mark_price == pytest.approx(0.055)
+        assert call_ticker.mark_price == pytest.approx(137.5)
 
     def test_empty_on_error(self, client):
         with patch.object(client.session, "get", side_effect=Exception("fail")):
             tickers = client.get_tickers("ETH")
         assert tickers == []
 
-    def test_zero_spot_returns_zero_prices(self, client):
+    def test_zero_spot_still_preserves_option_prices(self, client):
         mock_resp = MagicMock()
         mock_resp.json.return_value = [{
             "symbol": "ETH-260321-2000-C",
@@ -410,7 +407,8 @@ class TestGetTickers:
         with patch.object(client.session, "get", return_value=mock_resp):
             tickers = client.get_tickers("ETH")
         assert len(tickers) == 1
-        assert tickers[0].bid_price == 0.0
+        assert tickers[0].bid_price == pytest.approx(100.0)
+        assert tickers[0].underlying_price == pytest.approx(0.0)
 
     def test_non_list_response(self, client):
         mock_resp = MagicMock()
@@ -422,7 +420,7 @@ class TestGetTickers:
 
 
 class TestGetMarkPrices:
-    def test_returns_coin_prices(self, client):
+    def test_returns_native_usd_prices(self, client):
         mock_resp = MagicMock()
         mock_resp.json.return_value = [
             {"symbol": "ETH-260321-2000-C", "markPrice": "125", "underlyingPrice": "2500"},
@@ -433,8 +431,8 @@ class TestGetMarkPrices:
         with patch.object(client.session, "get", return_value=mock_resp):
             prices = client.get_mark_prices("ETH")
         assert len(prices) == 2
-        assert prices["ETH-260321-2000-C"] == pytest.approx(0.05)
-        assert prices["ETH-260321-2000-P"] == pytest.approx(0.032)
+        assert prices["ETH-260321-2000-C"] == pytest.approx(125.0)
+        assert prices["ETH-260321-2000-P"] == pytest.approx(80.0)
 
     def test_error_returns_empty(self, client):
         with patch.object(client.session, "get", side_effect=Exception("fail")):
@@ -580,6 +578,23 @@ class TestGetAccount:
 
 
 class TestPlaceOrder:
+    @staticmethod
+    def _quote():
+        return OptionTicker(
+            symbol="ETH-260321-2000-C",
+            underlying="ETH",
+            strike=2000.0,
+            option_type="call",
+            expiry=datetime(2026, 3, 21, 8, 0, tzinfo=timezone.utc),
+            bid_price=115.0,
+            ask_price=120.0,
+            mark_price=117.5,
+            last_price=118.0,
+            underlying_price=2500.0,
+            volume_24h=10.0,
+            open_interest=20.0,
+        )
+
     def test_simulate_order(self, sim_client):
         result = sim_client.place_order("ETH-260321-2000-C", "SELL", 1.0)
         assert result.status == "FILLED"
@@ -598,7 +613,8 @@ class TestPlaceOrder:
         }
         mock_resp.raise_for_status = MagicMock()
         with patch.object(client.session, "post", return_value=mock_resp):
-            result = client.place_order("ETH-260321-2000-C", "SELL", 1.0)
+            with patch.object(client, "get_ticker", return_value=self._quote()):
+                result = client.place_order("ETH-260321-2000-C", "SELL", 1.0)
         assert result.order_id == "98765"
         assert result.avg_price == pytest.approx(125.5)
         assert result.fee == pytest.approx(0.03)
@@ -624,11 +640,68 @@ class TestPlaceOrder:
             call_kwargs = m.call_args
             params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params", {})
             assert params.get("price") == "100.0" or "100.0" in str(params)
+            assert params.get("timeInForce") == "GTC"
+
+    def test_market_order_uses_synthetic_limit_ioc(self, client):
+        """MARKET 订单应转成对手一档的 LIMIT IOC。"""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "orderId": "222",
+            "status": "FILLED",
+            "executedQty": "1.0",
+            "price": "120.0",
+            "avgPrice": "120.0",
+            "fee": "0.01",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "post", return_value=mock_resp) as m:
+            with patch.object(client, "get_ticker", return_value=self._quote()):
+                client.place_order(
+                    "ETH-260321-2000-C", "SELL", 1.0,
+                    order_type="MARKET",
+                )
+            call_kwargs = m.call_args
+            params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params", {})
+            assert params.get("type") == "LIMIT"
+            assert params.get("price") == "115.0"
+            assert params.get("timeInForce") == "IOC"
+
+    def test_market_order_buy_uses_ask_price(self, client):
+        """BUY 的 synthetic market 应使用 ask1。"""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "orderId": "333",
+            "status": "FILLED",
+            "executedQty": "1.0",
+            "price": "120.0",
+            "avgPrice": "120.0",
+            "fee": "0.01",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "post", return_value=mock_resp) as m:
+            with patch.object(client, "get_ticker", return_value=self._quote()):
+                client.place_order(
+                    "ETH-260321-2000-C", "BUY", 1.0,
+                    order_type="MARKET",
+                )
+            call_kwargs = m.call_args
+            params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params", {})
+            assert params.get("price") == "120.0"
+
+    def test_market_order_without_quote_raises(self, client):
+        """synthetic market 若拿不到盘口，应明确失败。"""
+        with patch.object(client, "get_ticker", return_value=None):
+            with pytest.raises(RuntimeError, match="No live quote available"):
+                client.place_order(
+                    "ETH-260321-2000-C", "BUY", 1.0,
+                    order_type="MARKET",
+                )
 
     def test_order_error_raises(self, client):
         with patch.object(client.session, "post", side_effect=Exception("failed")):
-            with pytest.raises(Exception, match="failed"):
-                client.place_order("ETH-260321-2000-C", "SELL", 1.0)
+            with patch.object(client, "get_ticker", return_value=self._quote()):
+                with pytest.raises(Exception, match="failed"):
+                    client.place_order("ETH-260321-2000-C", "SELL", 1.0)
 
 
 class TestClosePosition:
