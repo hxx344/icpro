@@ -21,10 +21,11 @@ Time-based price interpolation:
 
 from __future__ import annotations
 
+import hashlib
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from loguru import logger
 
@@ -47,6 +48,8 @@ class LegOrder:
 
     # Current order state
     order_id: str = ""
+    client_order_id: str = ""
+    client_order_prefix: str = ""
     current_price: float = 0.0
     status: str = "PENDING"     # PENDING / NEW / PARTIALLY_FILLED / FILLED / FAILED
     avg_price: float = 0.0
@@ -87,10 +90,13 @@ class LimitChaser:
     def __init__(
         self,
         client: Any,
-        config: ChaserConfig | None = None,
+        config: Optional[ChaserConfig] = None,
     ):
         self.client = client
         self.cfg = config or ChaserConfig()
+        self._quote_cache: dict[str, tuple[OptionTicker, float]] = {}
+        self._quote_cache_ttl_sec = min(max(self.cfg.poll_interval_sec, 1), 5)
+        self._market_fallback_steps = 3
 
     def _remaining_qty(self, leg: LegOrder) -> float:
         """Return the quantity still needing execution."""
@@ -139,6 +145,67 @@ class LimitChaser:
             leg.status = "FILLED"
             return True
         return False
+
+    def _make_client_order_id(self, leg: LegOrder, intent: str) -> str:
+        """Build a deterministic short client order id for idempotent recovery."""
+        base = leg.client_order_prefix or (
+            f"{leg.leg_role}|{leg.symbol}|{leg.side}|{leg.strike}|{leg.quantity}|{leg.start_time:.6f}"
+        )
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:12].upper()
+        seq = leg.attempts + 1
+        return f"LC{intent}{digest}{seq:03d}"[:32]
+
+    def _adopt_submitted_order(
+        self,
+        leg: LegOrder,
+        result: OrderResult,
+        price: float,
+        client_order_id: str,
+    ) -> None:
+        """Apply a successfully accepted order result to the leg state."""
+        leg.order_id = result.order_id
+        leg.client_order_id = client_order_id
+        leg.current_price = price
+
+        if result.status == "FILLED":
+            self._record_fill_progress(leg, result)
+            leg.status = "FILLED"
+            logger.info(
+                f"[Chaser] {leg.leg_role} {leg.symbol} FILLED immediately "
+                f"at {result.avg_price:.4f}"
+            )
+        elif result.status == "PARTIALLY_FILLED":
+            self._record_fill_progress(leg, result)
+            leg.status = "PARTIALLY_FILLED"
+            logger.info(
+                f"[Chaser] {leg.leg_role} {leg.symbol} partially filled "
+                f"{leg.filled_qty:.4f}/{leg.quantity:.4f} @ {result.avg_price:.4f}"
+            )
+        else:
+            leg.status = "NEW"
+            logger.info(
+                f"[Chaser] {leg.leg_role} {leg.symbol} limit {leg.side} "
+                f"@ {price:.4f} for {self._remaining_qty(leg):.4f} placed "
+                f"(attempt #{leg.attempts})"
+            )
+
+    def _recover_submit_error(
+        self,
+        leg: LegOrder,
+        price: float,
+        client_order_id: str,
+    ) -> bool:
+        """After a submit error, try to recover the order by client id."""
+        try:
+            result = self.client.query_order(
+                leg.symbol,
+                client_order_id=client_order_id,
+            )
+        except Exception:
+            return False
+
+        self._adopt_submitted_order(leg, result, price, client_order_id)
+        return True
 
     def execute_legs(
         self,
@@ -346,6 +413,9 @@ class LimitChaser:
             self._mark_filled_if_done(leg)
             return
 
+        client_order_id = self._make_client_order_id(leg, "L")
+        leg.attempts += 1
+
         try:
             self._start_new_child_order(leg)
             result = self.client.place_order(
@@ -354,35 +424,17 @@ class LimitChaser:
                 quantity=remaining_qty,
                 order_type="LIMIT",
                 price=price,
+                client_order_id=client_order_id,
             )
-
-            leg.order_id = result.order_id
-            leg.current_price = price
-            leg.attempts += 1
-
-            if result.status == "FILLED":
-                self._record_fill_progress(leg, result)
-                leg.status = "FILLED"
-                logger.info(
-                    f"[Chaser] {leg.leg_role} {leg.symbol} FILLED immediately "
-                    f"at {result.avg_price:.4f}"
-                )
-            elif result.status == "PARTIALLY_FILLED":
-                self._record_fill_progress(leg, result)
-                leg.status = "PARTIALLY_FILLED"
-                logger.info(
-                    f"[Chaser] {leg.leg_role} {leg.symbol} partially filled "
-                    f"{leg.filled_qty:.4f}/{leg.quantity:.4f} @ {result.avg_price:.4f}"
-                )
-            else:
-                leg.status = "NEW"
-                logger.info(
-                    f"[Chaser] {leg.leg_role} {leg.symbol} limit {leg.side} "
-                    f"@ {price:.4f} for {remaining_qty:.4f} placed "
-                    f"(attempt #{leg.attempts})"
-                )
+            self._adopt_submitted_order(leg, result, price, client_order_id)
 
         except Exception as e:
+            if self._recover_submit_error(leg, price, client_order_id):
+                logger.warning(
+                    f"[Chaser] Recovered {leg.leg_role} via client_order_id "
+                    f"after submit error"
+                )
+                return
             logger.error(f"[Chaser] Failed to place {leg.leg_role}: {e}")
             leg.status = "FAILED"
 
@@ -392,7 +444,11 @@ class LimitChaser:
             return
 
         try:
-            result = self.client.query_order(leg.symbol, leg.order_id)
+            result = self.client.query_order(
+                leg.symbol,
+                order_id=leg.order_id,
+                client_order_id=leg.client_order_id or None,
+            )
 
             if result.status in ("FILLED", "PARTIALLY_FILLED", "CANCELLED", "EXPIRED"):
                 self._record_fill_progress(leg, result)
@@ -428,7 +484,11 @@ class LimitChaser:
         """Cancel current order and place a new one at new_price."""
         if leg.order_id:
             try:
-                self.client.cancel_order(leg.symbol, leg.order_id)
+                self.client.cancel_order(
+                    leg.symbol,
+                    order_id=leg.order_id or None,
+                    client_order_id=leg.client_order_id or None,
+                )
                 self._check_fill(leg)
                 logger.debug(
                     f"[Chaser] Cancelled {leg.leg_role} order {leg.order_id}"
@@ -444,6 +504,7 @@ class LimitChaser:
             return
 
         leg.order_id = ""
+        leg.client_order_id = ""
         self._place_or_amend(leg, new_price)
 
     def _cancel_and_market(self, leg: LegOrder) -> None:
@@ -451,7 +512,11 @@ class LimitChaser:
         # Cancel outstanding limit
         if leg.order_id:
             try:
-                self.client.cancel_order(leg.symbol, leg.order_id)
+                self.client.cancel_order(
+                    leg.symbol,
+                    order_id=leg.order_id or None,
+                    client_order_id=leg.client_order_id or None,
+                )
             except Exception:
                 pass
 
@@ -466,64 +531,104 @@ class LimitChaser:
         self._market_fallback(leg)
 
     def _market_fallback(self, leg: LegOrder) -> None:
-        """Execute a market-like aggressive limit order as last resort."""
-        remaining_qty = self._remaining_qty(leg)
-        if remaining_qty <= 1e-9:
-            self._mark_filled_if_done(leg)
-            return
+        """Execute a ladder of aggressive IOC limit orders as last resort."""
+        for step in range(self._market_fallback_steps):
+            remaining_qty = self._remaining_qty(leg)
+            if remaining_qty <= 1e-9:
+                self._mark_filled_if_done(leg)
+                return
 
-        try:
-            self._start_new_child_order(leg)
-            result = self.client.place_order(
-                symbol=leg.symbol,
-                side=leg.side,
-                quantity=remaining_qty,
-                order_type="MARKET",
-            )
-
-            if result.status in ("FILLED", "PARTIALLY_FILLED"):
-                self._record_fill_progress(leg, result)
-                leg.order_id = result.order_id
-                if self._mark_filled_if_done(leg):
-                    logger.info(
-                        f"[Chaser] {leg.leg_role} MARKET filled at "
-                        f"{result.avg_price:.4f}"
-                    )
-                else:
-                    leg.status = "FAILED"
-                    logger.error(
-                        f"[Chaser] {leg.leg_role} MARKET only partially filled: "
-                        f"{leg.filled_qty:.4f}/{leg.quantity:.4f}"
-                    )
-            else:
+            quote = self._get_quotes([leg]).get(leg.symbol)
+            if not quote or quote.bid_price <= 0 or quote.ask_price <= 0:
                 leg.status = "FAILED"
-                logger.error(
-                    f"[Chaser] {leg.leg_role} MARKET order failed: "
-                    f"{result.status}"
+                logger.error(f"[Chaser] No valid quote for fallback on {leg.symbol}")
+                return
+
+            tick = self.cfg.tick_size_usdt
+            if leg.side == "BUY":
+                fallback_price = quote.ask_price + step * tick
+            else:
+                fallback_price = max(quote.bid_price - step * tick, tick)
+
+            client_order_id = self._make_client_order_id(leg, f"M{step}")
+
+            try:
+                self._start_new_child_order(leg)
+                result = self.client.place_order(
+                    symbol=leg.symbol,
+                    side=leg.side,
+                    quantity=remaining_qty,
+                    order_type="LIMIT",
+                    price=fallback_price,
+                    time_in_force="IOC",
+                    client_order_id=client_order_id,
                 )
 
-        except Exception as e:
-            logger.error(f"[Chaser] Market fallback failed for {leg.leg_role}: {e}")
-            leg.status = "FAILED"
+                leg.order_id = result.order_id
+                leg.client_order_id = client_order_id
+
+                if result.status in ("FILLED", "PARTIALLY_FILLED"):
+                    self._record_fill_progress(leg, result)
+                    if self._mark_filled_if_done(leg):
+                        logger.info(
+                            f"[Chaser] {leg.leg_role} IOC fallback filled at {result.avg_price:.4f}"
+                        )
+                        return
+
+                logger.warning(
+                    f"[Chaser] {leg.leg_role} IOC fallback step {step + 1}/{self._market_fallback_steps} "
+                    f"left {self._remaining_qty(leg):.4f}/{leg.quantity:.4f} unfilled"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Chaser] IOC fallback step {step + 1}/{self._market_fallback_steps} failed "
+                    f"for {leg.leg_role}: {e}"
+                )
+
+        leg.status = "FAILED"
+        logger.error(
+            f"[Chaser] {leg.leg_role} IOC fallback exhausted: {leg.filled_qty:.4f}/{leg.quantity:.4f} filled"
+        )
 
     # ------------------------------------------------------------------
     # Quote helpers
     # ------------------------------------------------------------------
 
     def _get_quotes(
-        self, legs: list[LegOrder]
+        self, legs: list[LegOrder], underlying: Optional[str] = None
     ) -> dict[str, OptionTicker]:
         """Fetch current quotes for all leg symbols."""
+        now = time.monotonic()
         quotes: dict[str, OptionTicker] = {}
+        missing: list[str] = []
+
         for leg in legs:
             if leg.status in ("FILLED", "FAILED"):
                 continue
             if leg.symbol in quotes:
                 continue
+            cached = self._quote_cache.get(leg.symbol)
+            if cached and cached[1] > now:
+                quotes[leg.symbol] = cached[0]
+                continue
+            missing.append(leg.symbol)
+
+        if missing and underlying and len(missing) > 1:
             try:
-                ticker = self.client.get_ticker(leg.symbol)
-                if ticker:
-                    quotes[leg.symbol] = ticker
+                batch_quotes = self.client.get_tickers_for_symbols(missing)
+                for symbol, ticker in batch_quotes.items():
+                    quotes[symbol] = ticker
+                    self._quote_cache[symbol] = (ticker, now + self._quote_cache_ttl_sec)
+                missing = [symbol for symbol in missing if symbol not in quotes]
             except Exception as e:
-                logger.debug(f"[Chaser] Quote fetch failed for {leg.symbol}: {e}")
+                logger.debug(f"[Chaser] Batch quote fetch failed for {underlying}: {e}")
+
+        for symbol in missing:
+            try:
+                ticker = self.client.get_ticker(symbol)
+                if ticker:
+                    quotes[symbol] = ticker
+                    self._quote_cache[symbol] = (ticker, now + self._quote_cache_ttl_sec)
+            except Exception as e:
+                logger.debug(f"[Chaser] Quote fetch failed for {symbol}: {e}")
         return quotes

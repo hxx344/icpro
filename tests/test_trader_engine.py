@@ -86,11 +86,13 @@ class TestTradingEngine:
         engine = TradingEngine(sim_config)
         assert engine.is_running is False
         assert engine._tick_count == 0
+        assert engine.status()["state"] == TradingEngine.STATE_STOPPED
 
     def test_status_not_running(self, sim_config):
         engine = TradingEngine(sim_config)
         s = engine.status()
         assert s["running"] is False
+        assert s["state"] == TradingEngine.STATE_STOPPED
         assert s["uptime_sec"] == 0
 
     def test_start_stop(self, sim_config, tmp_path):
@@ -132,6 +134,7 @@ class TestTradingEngine:
 
         s = engine.status()
         assert s["running"] is True
+        assert s["state"] == TradingEngine.STATE_RUNNING
         assert s["uptime_sec"] > 0
         assert s["tick_count"] >= 1
 
@@ -200,6 +203,32 @@ class TestTradingEngine:
         remove_mock.assert_called_once_with(321)
         assert engine.client is None
         assert engine.equity_tracker is None
+
+    def test_start_init_failure_sets_error_state(self, sim_config):
+        engine = TradingEngine(sim_config)
+
+        with patch.object(engine, "_init_modules", side_effect=RuntimeError("boom")):
+            assert engine.start() is False
+
+        assert engine.status()["state"] == TradingEngine.STATE_ERROR
+        assert "Init failed" in engine.status()["last_error"]
+
+    def test_stop_timeout_sets_stuck_state(self, sim_config):
+        engine = TradingEngine(sim_config)
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        engine._thread = thread
+        engine._state = TradingEngine.STATE_RUNNING
+
+        assert engine.stop(timeout=0.01) is False
+        assert engine.status()["state"] == TradingEngine.STATE_STUCK
+
+    def test_run_loop_without_modules_sets_error_state(self, sim_config):
+        engine = TradingEngine(sim_config)
+        engine._run_loop()
+
+        assert engine.status()["state"] == TradingEngine.STATE_ERROR
+        assert engine.status()["last_error"] == "Engine modules are not initialized"
 
 
 class TestEngineSingleton:

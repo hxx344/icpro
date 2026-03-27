@@ -171,6 +171,10 @@ class PositionManager:
         if self.open_condors:
             logger.info(f"Recovered {len(self.open_condors)} open condor position(s)")
 
+    @staticmethod
+    def _infer_underlying(symbol: str) -> str:
+        return str(symbol).split("-", 1)[0].upper() if symbol else "ETH"
+
     # ------------------------------------------------------------------
     # Open a new short strangle (2-leg naked sell)
     # ------------------------------------------------------------------
@@ -202,15 +206,18 @@ class PositionManager:
             LegOrder(
                 leg_role="sell_put", symbol=sell_put_symbol, side="SELL",
                 quantity=quantity, strike=sell_put_strike, option_type="put",
+                client_order_prefix=f"{group_id}:sell_put",
             ),
             LegOrder(
                 leg_role="sell_call", symbol=sell_call_symbol, side="SELL",
                 quantity=quantity, strike=sell_call_strike, option_type="call",
+                client_order_prefix=f"{group_id}:sell_call",
             ),
         ]
+        underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
 
         try:
-            results = self.chaser.execute_legs(leg_orders)
+            results = self.chaser.execute_legs(leg_orders, underlying=underlying)
         except Exception as e:
             logger.error(f"Short Strangle {group_id}: execute_legs exception: {e}")
             return None
@@ -322,24 +329,29 @@ class PositionManager:
             LegOrder(
                 leg_role="buy_put", symbol=buy_put_symbol, side="BUY",
                 quantity=quantity, strike=buy_put_strike, option_type="put",
+                client_order_prefix=f"{group_id}:buy_put",
             ),
             LegOrder(
                 leg_role="buy_call", symbol=buy_call_symbol, side="BUY",
                 quantity=quantity, strike=buy_call_strike, option_type="call",
+                client_order_prefix=f"{group_id}:buy_call",
             ),
             LegOrder(
                 leg_role="sell_put", symbol=sell_put_symbol, side="SELL",
                 quantity=quantity, strike=sell_put_strike, option_type="put",
+                client_order_prefix=f"{group_id}:sell_put",
             ),
             LegOrder(
                 leg_role="sell_call", symbol=sell_call_symbol, side="SELL",
                 quantity=quantity, strike=sell_call_strike, option_type="call",
+                client_order_prefix=f"{group_id}:sell_call",
             ),
         ]
+        underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
 
         # Execute via limit chaser (blocks up to window_seconds)
         try:
-            results = self.chaser.execute_legs(leg_orders)
+            results = self.chaser.execute_legs(leg_orders, underlying=underlying)
         except Exception as e:
             logger.error(f"Iron Condor {group_id}: execute_legs exception: {e}")
             return None
@@ -470,7 +482,8 @@ class PositionManager:
             ))
 
         # Execute close via limit chaser
-        results = self.chaser.execute_legs(close_legs)
+        underlying = self._infer_underlying(condor.legs[0].symbol) if condor.legs else "ETH"
+        results = self.chaser.execute_legs(close_legs, underlying=underlying)
 
         total_pnl = 0.0
         for leg, close_result in zip(condor.legs, results):

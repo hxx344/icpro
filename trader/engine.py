@@ -36,6 +36,13 @@ class TradingEngine:
         engine.stop()        # 优雅停止
     """
 
+    STATE_STOPPED = "STOPPED"
+    STATE_STARTING = "STARTING"
+    STATE_RUNNING = "RUNNING"
+    STATE_STOPPING = "STOPPING"
+    STATE_ERROR = "ERROR"
+    STATE_STUCK = "STUCK"
+
     def __init__(self, config: TraderConfig):
         self.cfg = config
         self._lock = threading.Lock()
@@ -45,6 +52,7 @@ class TradingEngine:
 
         # State
         self._running = False
+        self._state = self.STATE_STOPPED
         self._start_time: Optional[float] = None
         self._last_tick_time: Optional[float] = None
         self._tick_count = 0
@@ -64,7 +72,7 @@ class TradingEngine:
 
     @property
     def is_running(self) -> bool:
-        return self._running and self._thread is not None and self._thread.is_alive()
+        return self._state == self.STATE_RUNNING and self._thread is not None and self._thread.is_alive()
 
     def start(self) -> bool:
         """Start the trading engine in a background thread.
@@ -72,8 +80,11 @@ class TradingEngine:
         Returns True if started successfully, False if already running.
         """
         with self._lock:
-            if self.is_running:
-                logger.warning("Engine already running, ignoring start()")
+            if self._state in (self.STATE_STARTING, self.STATE_RUNNING, self.STATE_STOPPING):
+                logger.warning(f"Engine already active ({self._state}), ignoring start()")
+                return False
+            if self._state == self.STATE_STUCK:
+                logger.error("Engine is STUCK; please reset before starting again")
                 return False
 
             # Reset state
@@ -81,12 +92,14 @@ class TradingEngine:
             self._last_error = None
             self._error_count = 0
             self._tick_count = 0
+            self._state = self.STATE_STARTING
 
             # Initialize modules
             try:
                 self._init_modules()
             except Exception as e:
                 self._last_error = f"Init failed: {e}"
+                self._state = self.STATE_ERROR
                 logger.error(f"Engine init failed: {e}")
                 self._cleanup_resources()
                 return False
@@ -98,6 +111,7 @@ class TradingEngine:
                 daemon=True,
             )
             self._running = True
+            self._state = self.STATE_RUNNING
             self._start_time = time.time()
             self._thread.start()
 
@@ -110,12 +124,16 @@ class TradingEngine:
         Returns True if stopped successfully.
         """
         with self._lock:
-            if not self.is_running:
+            if self._state == self.STATE_STUCK:
+                logger.error("Engine is STUCK and cannot be stopped cleanly")
+                return False
+            if self._state == self.STATE_STOPPED:
                 logger.info("Engine not running, nothing to stop")
                 self._cleanup_resources()
                 return True
 
             logger.info("Stopping trading engine...")
+            self._state = self.STATE_STOPPING
             self._stop_event.set()
 
         # Wait outside the lock
@@ -123,11 +141,14 @@ class TradingEngine:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
                 logger.error("Engine thread did not stop within timeout")
+                with self._lock:
+                    self._state = self.STATE_STUCK
                 return False
 
         with self._lock:
             self._running = False
             self._thread = None
+            self._state = self.STATE_STOPPED
             logger.info("Trading engine stopped")
 
         return True
@@ -141,6 +162,7 @@ class TradingEngine:
 
         return {
             "running": self.is_running,
+            "state": self._state,
             "uptime_sec": round(uptime, 1),
             "uptime_str": self._format_duration(uptime) if uptime > 0 else "-",
             "tick_count": self._tick_count,
@@ -246,6 +268,7 @@ class TradingEngine:
         try:
             if not self.client or not self.strategy or not self.equity_tracker:
                 self._last_error = "Engine modules are not initialized"
+                self._state = self.STATE_ERROR
                 logger.error(self._last_error)
                 return
 
@@ -264,6 +287,8 @@ class TradingEngine:
                     self.strategy.tick()
                     self._tick_count += 1
                     self._last_tick_time = now
+                    if self._state != self.STATE_RUNNING:
+                        self._state = self.STATE_RUNNING
                 except Exception as e:
                     self._error_count += 1
                     self._last_error = f"Tick error: {e}"
@@ -287,6 +312,8 @@ class TradingEngine:
         finally:
             # --- Shutdown ---
             self._on_shutdown()
+            if self._state != self.STATE_STUCK:
+                self._state = self.STATE_STOPPED if self._stop_event.is_set() else self.STATE_ERROR
             logger.info("Engine loop exited")
 
     def _init_day(self) -> None:

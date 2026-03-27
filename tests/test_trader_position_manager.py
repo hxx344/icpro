@@ -169,7 +169,7 @@ class TestIronCondorPosition:
 
 class TestOpenIronCondor:
     @staticmethod
-    def _make_filled_legs(legs: list[LegOrder]) -> list[LegOrder]:
+    def _make_filled_legs(legs: list[LegOrder], **kwargs) -> list[LegOrder]:
         """Simulate LimitChaser filling all legs."""
         for leg in legs:
             leg.status = "FILLED"
@@ -181,7 +181,7 @@ class TestOpenIronCondor:
 
     def test_successful_open(self, pos_mgr, mock_client):
         """4 腿全部 FILLED → 返回 condor."""
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=self._make_filled_legs):
+        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=self._make_filled_legs) as exec_mock:
             condor = pos_mgr.open_iron_condor(
                 sell_call_symbol="ETH-260321-2700-C",
                 buy_call_symbol="ETH-260321-2750-C",
@@ -198,10 +198,11 @@ class TestOpenIronCondor:
         assert condor is not None
         assert len(condor.legs) == 4
         assert condor.is_open is True
+        assert exec_mock.call_args.kwargs["underlying"] == "ETH"
 
     def test_failed_leg_triggers_rollback(self, pos_mgr, mock_client):
         """某腿挂单失败时应回滚已成交的腿."""
-        def _partial_fill(legs):
+        def _partial_fill(legs, **kwargs):
             """前 2 腿 FILLED, 第 3 腿 FAILED."""
             for i, leg in enumerate(legs):
                 if i < 2:
@@ -231,7 +232,7 @@ class TestOpenIronCondor:
 
     def test_failed_leg_rollback_uses_actual_filled_qty(self, pos_mgr, mock_client):
         """回滚应按已成交量，而不是原始请求量。"""
-        def _partial_fill(legs):
+        def _partial_fill(legs, **kwargs):
             for i, leg in enumerate(legs):
                 if i < 2:
                     leg.status = "FILLED"
@@ -260,7 +261,7 @@ class TestOpenIronCondor:
 
     def test_successful_open_records_actual_filled_qty(self, pos_mgr, storage):
         """入库与持仓数量应以实际成交量为准。"""
-        def _filled_partial_size(legs):
+        def _filled_partial_size(legs, **kwargs):
             for leg in legs:
                 leg.status = "FILLED"
                 leg.avg_price = 0.03
@@ -335,7 +336,7 @@ class TestCloseIronCondor:
     def test_close_all_legs(self, pos_mgr, mock_client, storage):
         gid = self._setup_open_condor(pos_mgr, storage)
 
-        def _fill_close_legs(legs):
+        def _fill_close_legs(legs, **kwargs):
             for leg in legs:
                 leg.status = "FILLED"
                 leg.avg_price = 0.0
@@ -355,7 +356,7 @@ class TestCloseIronCondor:
     def test_close_all(self, pos_mgr, mock_client, storage):
         gid1 = self._setup_open_condor(pos_mgr, storage)
 
-        def _fill_close_legs(legs):
+        def _fill_close_legs(legs, **kwargs):
             for leg in legs:
                 leg.status = "FILLED"
                 leg.avg_price = 0.0

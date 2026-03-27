@@ -60,6 +60,14 @@ class TestInit:
         assert "daily_pnl" in names
         assert "strategy_state" in names
 
+    def test_connection_pragmas(self, db):
+        conn = db._get_conn()
+        busy_timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+
+        assert busy_timeout == 5000
+        assert synchronous == 1
+
 
 # ======================================================================
 # 2. Trades

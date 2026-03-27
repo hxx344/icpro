@@ -225,6 +225,7 @@ class TestMarketFallback(unittest.TestCase):
 
     def setUp(self):
         self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client.get_ticker.return_value = _make_ticker(bid=50.0, ask=55.0)
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
     def test_market_fallback_fills(self):
@@ -247,12 +248,32 @@ class TestMarketFallback(unittest.TestCase):
         self.assertEqual(leg.status, "FAILED")
 
     def test_market_fallback_unfilled_status(self):
-        """Market fallback with non-FILLED status marks as FAILED."""
+        """Market fallback exhausting all IOC attempts should mark as FAILED."""
         leg = LegOrder("sell_put", "SYM", "SELL", 1.0, 1800.0, "put")
-        self.client.place_order.return_value = _make_fill(status="REJECTED")
+        self.client.place_order.return_value = _make_fill(status="EXPIRED", qty=0.0)
 
         self.chaser._market_fallback(leg)
         self.assertEqual(leg.status, "FAILED")
+        self.assertEqual(self.client.place_order.call_count, 3)
+
+    def test_market_fallback_ladders_remaining_quantity(self):
+        """IOC fallback should retry only the remaining quantity at more aggressive prices."""
+        leg = LegOrder("buy_put", "SYM", "BUY", 1.0, 1800.0, "put")
+        self.client.place_order.side_effect = [
+            _make_fill(status="PARTIALLY_FILLED", price=55.0, qty=0.4),
+            _make_fill(status="FILLED", price=60.0, qty=0.6),
+        ]
+
+        self.chaser._market_fallback(leg)
+
+        self.assertEqual(leg.status, "FILLED")
+        self.assertAlmostEqual(leg.filled_qty, 1.0, places=6)
+        first_call = self.client.place_order.call_args_list[0].kwargs
+        second_call = self.client.place_order.call_args_list[1].kwargs
+        self.assertAlmostEqual(first_call["quantity"], 1.0, places=6)
+        self.assertAlmostEqual(first_call["price"], 55.0, places=6)
+        self.assertAlmostEqual(second_call["quantity"], 0.6, places=6)
+        self.assertAlmostEqual(second_call["price"], 60.0, places=6)
 
 
 class TestPlaceOrAmend(unittest.TestCase):
@@ -286,11 +307,30 @@ class TestPlaceOrAmend(unittest.TestCase):
         self.assertEqual(leg.order_id, "ORD-123")
         self.assertEqual(leg.current_price, 45.0)
         self.assertEqual(leg.attempts, 1)
+        self.assertTrue(self.client.place_order.call_args.kwargs["client_order_id"].startswith("LCL"))
+
+    def test_submit_error_recovers_by_client_order_id(self):
+        leg = LegOrder("buy_put", "SYM", "BUY", 1.0, 1800.0, "put")
+        self.client.place_order.side_effect = RuntimeError("timeout")
+        self.client.query_order.return_value = _make_fill(
+            order_id="ORD-RECOVER", status="NEW", price=0.0, qty=0.0
+        )
+
+        self.chaser._place_or_amend(leg, 50.0)
+
+        self.assertEqual(leg.status, "NEW")
+        self.assertEqual(leg.order_id, "ORD-RECOVER")
+        self.client.query_order.assert_called_once()
+        self.assertEqual(
+            self.client.query_order.call_args.kwargs["client_order_id"],
+            leg.client_order_id,
+        )
 
     def test_placement_error(self):
         """API error → leg status = FAILED."""
         leg = LegOrder("sell_put", "SYM", "SELL", 1.0, 1800.0, "put")
         self.client.place_order.side_effect = RuntimeError("timeout")
+        self.client.query_order.side_effect = RuntimeError("not found")
 
         self.chaser._place_or_amend(leg, 50.0)
         self.assertEqual(leg.status, "FAILED")
@@ -392,7 +432,9 @@ class TestCancelAndReplace(unittest.TestCase):
 
         self.chaser._cancel_and_replace(leg, 53.0)
 
-        self.client.cancel_order.assert_called_once_with("SYM", "OLD-1")
+        self.client.cancel_order.assert_called_once_with(
+            "SYM", order_id="OLD-1", client_order_id=None
+        )
         self.assertEqual(leg.order_id, "NEW-1")
         self.assertEqual(leg.current_price, 53.0)
 
@@ -481,6 +523,7 @@ class TestCancelAndMarket(unittest.TestCase):
 
     def setUp(self):
         self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client.get_ticker.return_value = _make_ticker(bid=50.0, ask=55.0)
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
     def test_cancel_then_market(self):
@@ -574,6 +617,31 @@ class TestGetQuotes(unittest.TestCase):
         self.assertEqual(len(quotes), 2)
         self.assertIn("SYM1", quotes)
         self.assertIn("SYM2", quotes)
+
+    def test_uses_batch_fetch_when_underlying_given(self):
+        self.client.get_tickers_for_symbols.return_value = {
+            "SYM1": _make_ticker(symbol="SYM1"),
+            "SYM2": _make_ticker(symbol="SYM2"),
+        }
+
+        legs = [
+            LegOrder("buy_put", "SYM1", "BUY", 1.0, 1800.0, "put"),
+            LegOrder("sell_call", "SYM2", "SELL", 1.0, 2200.0, "call"),
+        ]
+        quotes = self.chaser._get_quotes(legs, underlying="ETH")
+
+        self.assertEqual(set(quotes.keys()), {"SYM1", "SYM2"})
+        self.client.get_tickers_for_symbols.assert_called_once_with(["SYM1", "SYM2"])
+        self.client.get_ticker.assert_not_called()
+
+    def test_reuses_cached_quotes_within_ttl(self):
+        self.client.get_ticker.return_value = _make_ticker(symbol="SYM1")
+        legs = [LegOrder("buy_put", "SYM1", "BUY", 1.0, 1800.0, "put")]
+
+        self.chaser._get_quotes(legs)
+        self.chaser._get_quotes(legs)
+
+        self.client.get_ticker.assert_called_once_with("SYM1")
 
     def test_skips_filled_legs(self):
         self.client.get_ticker.return_value = _make_ticker()

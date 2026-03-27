@@ -7,6 +7,7 @@ typed access to all trader settings.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -195,6 +196,65 @@ def _merge_section(dc_instance: Any, section: dict | None) -> None:
             setattr(dc_instance, k, v)
 
 
+def _validate_config(cfg: TraderConfig) -> None:
+    """Validate critical config fields early so startup fails fast."""
+    allowed_modes = {"strangle", "iron_condor", "weekend_vol"}
+    if cfg.strategy.mode not in allowed_modes:
+        raise ValueError(f"strategy.mode must be one of {sorted(allowed_modes)}, got {cfg.strategy.mode!r}")
+
+    if not re.match(r"^\d{2}:\d{2}$", cfg.strategy.entry_time_utc):
+        raise ValueError("strategy.entry_time_utc must be in HH:MM format")
+    hh, mm = [int(x) for x in cfg.strategy.entry_time_utc.split(":", 1)]
+    if hh not in range(24) or mm not in range(60):
+        raise ValueError("strategy.entry_time_utc must be a valid UTC time")
+
+    if not (0 < cfg.strategy.target_delta <= 0.95):
+        raise ValueError("strategy.target_delta must be within (0, 0.95]")
+    if not (0 <= cfg.strategy.wing_delta <= 0.95):
+        raise ValueError("strategy.wing_delta must be within [0, 0.95]")
+    if cfg.strategy.leverage <= 0:
+        raise ValueError("strategy.leverage must be > 0")
+    if cfg.strategy.quantity <= 0:
+        raise ValueError("strategy.quantity must be > 0")
+    if cfg.strategy.max_positions < 1:
+        raise ValueError("strategy.max_positions must be >= 1")
+    if not (0 < cfg.strategy.max_capital_pct <= 1.0):
+        raise ValueError("strategy.max_capital_pct must be within (0, 1]")
+    if cfg.strategy.default_iv <= 0:
+        raise ValueError("strategy.default_iv must be > 0")
+    if cfg.strategy.target_dte_days < 0:
+        raise ValueError("strategy.target_dte_days must be >= 0")
+    if cfg.strategy.dte_window_hours <= 0:
+        raise ValueError("strategy.dte_window_hours must be > 0")
+
+    if cfg.exchange.timeout < 1:
+        raise ValueError("exchange.timeout must be >= 1")
+    if cfg.monitor.check_interval_sec < 1:
+        raise ValueError("monitor.check_interval_sec must be >= 1")
+    if cfg.monitor.heartbeat_interval_sec < 1:
+        raise ValueError("monitor.heartbeat_interval_sec must be >= 1")
+    if cfg.monitor.equity_snapshot_interval_sec < 1:
+        raise ValueError("monitor.equity_snapshot_interval_sec must be >= 1")
+
+    if cfg.chaser.window_seconds <= 0:
+        raise ValueError("chaser.window_seconds must be > 0")
+    if cfg.chaser.poll_interval_sec <= 0:
+        raise ValueError("chaser.poll_interval_sec must be > 0")
+    if cfg.chaser.tick_size_usdt <= 0:
+        raise ValueError("chaser.tick_size_usdt must be > 0")
+    if cfg.chaser.market_fallback_sec < 0:
+        raise ValueError("chaser.market_fallback_sec must be >= 0")
+    if cfg.chaser.market_fallback_sec >= cfg.chaser.window_seconds:
+        raise ValueError("chaser.market_fallback_sec must be smaller than window_seconds")
+    if cfg.chaser.max_amend_attempts < 1:
+        raise ValueError("chaser.max_amend_attempts must be >= 1")
+
+    if not str(cfg.storage.db_path).strip():
+        raise ValueError("storage.db_path must not be empty")
+    if not str(cfg.storage.log_dir).strip():
+        raise ValueError("storage.log_dir must not be empty")
+
+
 def load_config(path: str | Path | None = None) -> TraderConfig:
     """Load trader configuration from YAML file.
 
@@ -236,5 +296,6 @@ def load_config(path: str | Path | None = None) -> TraderConfig:
 
     # Re-trigger __post_init__ for env vars and base_url
     cfg.exchange.__post_init__()
+    _validate_config(cfg)
 
     return cfg

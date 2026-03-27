@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
+import requests
 
 from trader.binance_client import (
     BinanceOptionsClient,
@@ -703,6 +704,56 @@ class TestPlaceOrder:
                 with pytest.raises(Exception, match="failed"):
                     client.place_order("ETH-260321-2000-C", "SELL", 1.0)
 
+    def test_limit_order_passes_client_order_id(self, client):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "orderId": "444",
+            "status": "NEW",
+            "executedQty": "0",
+            "price": "100.0",
+            "avgPrice": "0",
+            "fee": "0",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "post", return_value=mock_resp) as m:
+            client.place_order(
+                "ETH-260321-2000-C", "BUY", 1.0,
+                order_type="LIMIT", price=100.0,
+                client_order_id="CID-001",
+            )
+            params = m.call_args.kwargs.get("params") or m.call_args[1].get("params", {})
+            assert params.get("newClientOrderId") == "CID-001"
+
+
+class TestOrderLookup:
+    def test_query_order_by_client_order_id(self, client):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "orderId": "123",
+            "status": "NEW",
+            "executedQty": "0",
+            "price": "100.0",
+            "avgPrice": "0",
+            "fee": "0",
+            "side": "BUY",
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=mock_resp) as m:
+            client.query_order("ETH-260321-2000-C", client_order_id="CID-XYZ")
+            params = m.call_args.kwargs.get("params") or m.call_args[1].get("params", {})
+            assert params.get("origClientOrderId") == "CID-XYZ"
+            assert "orderId" not in params
+
+    def test_cancel_order_by_client_order_id(self, client):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"orderId": "123", "status": "CANCELED"}
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "delete", return_value=mock_resp) as m:
+            assert client.cancel_order("ETH-260321-2000-C", client_order_id="CID-XYZ") is True
+            params = m.call_args.kwargs.get("params") or m.call_args[1].get("params", {})
+            assert params.get("origClientOrderId") == "CID-XYZ"
+            assert "orderId" not in params
+
 
 class TestClosePosition:
     def test_close_long(self, sim_client):
@@ -730,3 +781,30 @@ class TestBinanceErrorHandling:
         with patch.object(client.session, "get", return_value=mock_resp):
             with pytest.raises(RuntimeError, match="Binance error"):
                 client._public_get("/eapi/v1/index")
+
+    def test_public_get_retries_on_timeout(self, client):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch.object(
+            client.session,
+            "get",
+            side_effect=[requests.Timeout("timeout"), mock_resp],
+        ) as get_mock, patch("trader.binance_client.time.sleep") as sleep_mock:
+            data = client._public_get("/eapi/v1/index")
+
+        assert data == {"ok": True}
+        assert get_mock.call_count == 2
+        sleep_mock.assert_called_once()
+
+    def test_public_get_does_not_retry_non_retryable_http_error(self, client):
+        response = MagicMock()
+        response.status_code = 400
+        http_error = requests.HTTPError("bad request", response=response)
+
+        with patch.object(client.session, "get", side_effect=http_error) as get_mock:
+            with pytest.raises(requests.HTTPError):
+                client._public_get("/eapi/v1/index")
+
+        assert get_mock.call_count == 1

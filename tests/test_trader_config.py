@@ -185,3 +185,19 @@ class TestLoadConfig:
         assert cfg.strategy.max_positions == 3
         assert cfg.storage.log_level == "DEBUG"
         assert cfg.monitor.check_interval_sec == 30
+
+    @pytest.mark.parametrize(
+        "config_data, expected_message",
+        [
+            ({"strategy": {"mode": "bad_mode"}}, "strategy.mode"),
+            ({"strategy": {"entry_time_utc": "25:00"}}, "entry_time_utc"),
+            ({"strategy": {"quantity": 0}}, "strategy.quantity"),
+            ({"chaser": {"window_seconds": 10, "market_fallback_sec": 10}}, "market_fallback_sec"),
+        ],
+    )
+    def test_invalid_config_raises(self, tmp_path, config_data, expected_message):
+        yaml_path = tmp_path / "invalid.yaml"
+        yaml_path.write_text(yaml.dump(config_data), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=expected_message):
+            load_config(yaml_path)

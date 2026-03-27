@@ -30,6 +30,8 @@ from pathlib import Path
 # stays platform-agnostic (only theme / browser settings).
 # ---------------------------------------------------------------------------
 _is_linux = platform.system() == "Linux"
+_dashboard_public = os.environ.get("DASHBOARD_PUBLIC", "false").strip().lower() in {"1", "true", "yes", "on"}
+_allow_no_auth = os.environ.get("DASHBOARD_ALLOW_NO_AUTH", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 def _set_default(env_key: str, value: str) -> None:
     """Set env var only if not already set (allow manual override)."""
@@ -37,12 +39,11 @@ def _set_default(env_key: str, value: str) -> None:
         os.environ[env_key] = value
 
 if _is_linux:
-    # Linux VPS: headless, bind all interfaces, disable CORS+XSRF together
+    # Linux default: safe local bind. Public exposure must be explicit.
     _set_default("STREAMLIT_SERVER_HEADLESS", "true")
-    _set_default("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
+    _set_default("STREAMLIT_SERVER_ADDRESS", "0.0.0.0" if _dashboard_public else "127.0.0.1")
     _set_default("STREAMLIT_SERVER_PORT", "8501")
-    _set_default("STREAMLIT_SERVER_ENABLE_CORS", "false")
-    _set_default("STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION", "false")
+    _set_default("STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION", "true")
 else:
     # Windows / macOS: open browser, localhost only
     _set_default("STREAMLIT_SERVER_HEADLESS", "false")
@@ -111,6 +112,11 @@ def _check_login() -> bool:
 
     # If no credentials configured, skip auth
     if not expected_user or not expected_pass:
+        if _dashboard_public and not _allow_no_auth:
+            st.error("公网访问已启用，但未配置 DASHBOARD_USER / DASHBOARD_PASS。已拒绝访问。")
+            st.stop()
+        if not _allow_no_auth:
+            st.warning("当前未配置 Dashboard 登录凭据，仅建议在本机或受保护网络使用。")
         return True
 
     # Already authenticated this session
@@ -1165,8 +1171,8 @@ elif page == "🔧 策略配置":
         _new_cfg = {
             "name": _raw_yaml.get("name", cfg.name),
             "exchange": {
-                "api_key": _exchange.get("api_key") or _exchange.get("client_id", ""),
-                "api_secret": _exchange.get("api_secret") or _exchange.get("client_secret", ""),
+                "api_key": "",
+                "api_secret": "",
                 "testnet": ed_testnet,
                 "timeout": ed_timeout,
                 "account_currency": _exchange.get("account_currency", "USDT"),
@@ -1222,6 +1228,7 @@ elif page == "🔧 策略配置":
                     sort_keys=False,
                 )
             st.success(f"✅ 配置已保存到 {config_path}")
+            st.caption("出于安全考虑，API Key / Secret 不会由面板写回 YAML，请继续使用环境变量或 .env。")
             st.info("⚠️ 请重启引擎使新配置生效 (先停止再启动)")
         except Exception as _ex:
             st.error(f"保存失败: {_ex}")
