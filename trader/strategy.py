@@ -831,20 +831,48 @@ class WeekendVolStrategy:
             for leg in condor.legs:
                 parsed = _parse_symbol(leg.symbol)
                 if parsed and parsed["expiry"] <= now:
+                    underlying = str(parsed.get("underlying") or self.cfg.underlying).upper()
+                    settlement_spot = self.client.get_spot_price(underlying)
+                    if settlement_spot <= 0:
+                        settlement_spot = condor.underlying_price
                     logger.info(
                         f"[WeekendVol] Position {gid} expired at "
-                        f"{parsed['expiry'].isoformat()} – marking settled"
+                        f"{parsed['expiry'].isoformat()} – marking settled "
+                        f"with {underlying} spot={settlement_spot:.4f}"
                     )
-                    # Mark all legs as settled (PnL is realized by exchange)
+
+                    total_settlement_pnl = 0.0
                     for leg2 in condor.legs:
+                        settlement_price = self._settlement_price(leg2, settlement_spot)
+                        pnl = self._settlement_pnl(leg2, settlement_price)
                         self.storage.close_trade(
                             trade_id=leg2.trade_id,
-                            close_price=0.0,  # settled at delivery
-                            pnl=0.0,  # actual PnL tracked via equity snapshots
+                            close_price=settlement_price,
+                            pnl=pnl,
                         )
+                        total_settlement_pnl += pnl
+                        logger.info(
+                            f"[WeekendVol] Settled {leg2.side} {leg2.option_type} {leg2.symbol}: "
+                            f"entry={leg2.entry_price:.4f} settle={settlement_price:.4f} pnl={pnl:.4f}"
+                        )
+                    logger.info(f"[WeekendVol] Position {gid} settlement pnl={total_settlement_pnl:.4f}")
                     condor.is_open = False
                     del self.pos_mgr.open_condors[gid]
                     break
+
+    @staticmethod
+    def _settlement_price(leg, settlement_spot: float) -> float:
+        if settlement_spot <= 0:
+            return 0.0
+        if leg.option_type == "call":
+            return max(settlement_spot - leg.strike, 0.0)
+        return max(leg.strike - settlement_spot, 0.0)
+
+    @staticmethod
+    def _settlement_pnl(leg, settlement_price: float) -> float:
+        if leg.side == "SELL":
+            return (leg.entry_price - settlement_price) * leg.quantity
+        return (settlement_price - leg.entry_price) * leg.quantity
 
     # ------------------------------------------------------------------
     # Helpers

@@ -137,6 +137,150 @@ def _format_test_order_message(progress: dict) -> str:
     return mapping.get(event, "测试下单处理中")
 
 
+def _build_expiry_payoff_figure(
+    legs: list[dict],
+    underlying: str,
+    chart_title: str,
+    spot_price: float = 0.0,
+) -> go.Figure | None:
+    """Build an expiry payoff chart from current position legs."""
+    import numpy as _np
+
+    valid_legs = [
+        leg for leg in legs
+        if float(leg.get("quantity") or 0.0) > 0 and float(leg.get("strike") or 0.0) > 0
+    ]
+    if not valid_legs:
+        return None
+
+    strikes = [float(leg["strike"]) for leg in valid_legs]
+    anchors = list(strikes)
+    if spot_price > 0:
+        anchors.append(float(spot_price))
+
+    price_lo_anchor = min(anchors)
+    price_hi_anchor = max(anchors)
+    span = max(price_hi_anchor - price_lo_anchor, max(price_hi_anchor * 0.12, 100.0))
+    price_lo = max(0.0, price_lo_anchor - span * 0.25)
+    price_hi = price_hi_anchor + span * 0.25
+    prices = _np.linspace(price_lo, price_hi, 600)
+
+    pnl = _np.zeros_like(prices, dtype=float)
+    for leg in valid_legs:
+        strike = float(leg.get("strike") or 0.0)
+        quantity = float(leg.get("quantity") or 0.0)
+        entry_price = float(leg.get("entry_price") or 0.0)
+        option_type = str(leg.get("option_type") or "").lower()
+        side = str(leg.get("side") or "").upper()
+
+        if option_type == "call":
+            intrinsic = _np.maximum(prices - strike, 0.0)
+        else:
+            intrinsic = _np.maximum(strike - prices, 0.0)
+
+        leg_pnl = (entry_price - intrinsic) if side == "SELL" else (intrinsic - entry_price)
+        pnl += leg_pnl * quantity
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=prices,
+        y=pnl,
+        mode="lines",
+        line=dict(color="royalblue", width=2.5),
+        name="P&L",
+        hovertemplate=f"{underlying}: $%{{x:,.0f}}<br>P&L: $%{{y:,.2f}}<extra></extra>",
+    ))
+
+    pnl_pos = _np.where(pnl > 0, pnl, 0)
+    fig.add_trace(go.Scatter(
+        x=prices, y=pnl_pos,
+        fill="tozeroy",
+        fillcolor="rgba(0,200,83,0.15)",
+        line=dict(width=0),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+    pnl_neg = _np.where(pnl < 0, pnl, 0)
+    fig.add_trace(go.Scatter(
+        x=prices, y=pnl_neg,
+        fill="tozeroy",
+        fillcolor="rgba(255,82,82,0.15)",
+        line=dict(width=0),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    show_strike_labels = len(valid_legs) <= 8
+    seen_markers: set[tuple[float, str, str]] = set()
+    for leg in sorted(valid_legs, key=lambda item: float(item.get("strike") or 0.0)):
+        strike = float(leg.get("strike") or 0.0)
+        side = str(leg.get("side") or "").upper()
+        option_type = str(leg.get("option_type") or "").lower()
+        marker_key = (strike, side, option_type)
+        if marker_key in seen_markers:
+            continue
+        seen_markers.add(marker_key)
+        role = str(leg.get("role") or f"{side} {option_type}")
+        fig.add_vline(
+            x=strike,
+            line_dash="dot",
+            line_color="green" if side == "BUY" else "red",
+            opacity=0.5,
+            annotation_text=f"{role} ${strike:,.0f}" if show_strike_labels else None,
+            annotation_position="top",
+        )
+
+    if spot_price > 0:
+        fig.add_vline(
+            x=spot_price,
+            line_dash="dash",
+            line_color="orange",
+            opacity=0.7,
+            annotation_text=f"Spot ${spot_price:,.0f}",
+            annotation_position="bottom right",
+        )
+
+    crossings = []
+    for idx in range(len(prices) - 1):
+        y0 = float(pnl[idx])
+        y1 = float(pnl[idx + 1])
+        if abs(y0) < 1e-9:
+            crossings.append(float(prices[idx]))
+            continue
+        if y0 * y1 < 0:
+            x0 = float(prices[idx])
+            x1 = float(prices[idx + 1])
+            root = x0 - y0 * (x1 - x0) / (y1 - y0)
+            crossings.append(root)
+
+    dedup_crossings: list[float] = []
+    for root in crossings:
+        if all(abs(root - existing) > 1.0 for existing in dedup_crossings):
+            dedup_crossings.append(root)
+
+    for root in dedup_crossings[:6]:
+        fig.add_vline(
+            x=root,
+            line_dash="dashdot",
+            line_color="purple",
+            opacity=0.35,
+            annotation_text=f"BE ${root:,.0f}",
+        )
+
+    fig.add_hline(y=0, line_dash="solid", line_color="gray", opacity=0.3)
+    fig.update_layout(
+        title=chart_title,
+        xaxis_title=f"{underlying} 到期价格 ($)",
+        yaxis_title="盈亏 ($)",
+        height=420,
+        hovermode="x unified",
+        template="plotly_white",
+        showlegend=False,
+        margin=dict(l=50, r=20, t=56, b=20),
+    )
+    return fig
+
+
 def _start_test_order_task(
     task_id: str,
     exchange_cfg,
@@ -289,17 +433,27 @@ if not _check_login():
 st.sidebar.title("📊 期权交易面板")
 
 # --- Mode selector ---
+_mode_options = ["🔒 只读模式", "🟢 交易模式"]
+_mode_param_to_label = {
+    "readonly": "🔒 只读模式",
+    "trade": "🟢 交易模式",
+}
+_mode_label_to_param = {v: k for k, v in _mode_param_to_label.items()}
+_mode_from_query = _mode_param_to_label.get(str(st.query_params.get("mode", "")).strip().lower())
 if "trading_mode" not in st.session_state:
-    st.session_state.trading_mode = "🔒 只读模式"
+    st.session_state.trading_mode = _mode_from_query or "🔒 只读模式"
+elif _mode_from_query and st.session_state.trading_mode != _mode_from_query:
+    st.session_state.trading_mode = _mode_from_query
 
 trading_mode = st.sidebar.radio(
     "运行模式",
-    ["🔒 只读模式", "🟢 交易模式"],
-    index=["🔒 只读模式", "🟢 交易模式"].index(st.session_state.trading_mode),
+    _mode_options,
+    index=_mode_options.index(st.session_state.trading_mode),
     horizontal=True,
     help="只读模式: 查看行情/持仓/统计，不可启动引擎或下单\n交易模式: 解锁全部功能",
 )
 st.session_state.trading_mode = trading_mode
+st.query_params["mode"] = _mode_label_to_param.get(trading_mode, "readonly")
 is_trade_mode = "交易" in trading_mode
 st.sidebar.markdown(f"**策略:** {cfg.name}")
 st.sidebar.markdown(f"**标的:** {cfg.strategy.underlying}")
@@ -539,6 +693,7 @@ if page == "📊 总览":
     # --- Open Positions (local strategy + exchange) ---
     st.subheader("🔓 当前持仓")
     open_trades = storage.get_open_trades()
+    _overview_spot_cache: dict[str, float] = {}
 
     if open_trades:
         # Group by trade_group
@@ -551,11 +706,17 @@ if page == "📊 总览":
             with st.expander(f"🦅 {gid} ({len(legs)} 腿)", expanded=True):
                 leg_rows = []
                 total_premium = 0.0
+                payoff_legs: list[dict] = []
+                group_underlying = ""
+                group_spot = 0.0
                 for t in legs:
                     meta = json.loads(t.get("meta", "{}"))
                     role = meta.get("leg_role", "?")
                     opt_type = meta.get("option_type", "?")
                     strike = meta.get("strike", 0)
+                    symbol = str(t.get("symbol", ""))
+                    group_underlying = group_underlying or (symbol.split("-", 1)[0].upper() if symbol else "")
+                    group_spot = group_spot or float(meta.get("underlying_price") or 0.0)
                     premium_contrib = t["price"] * t["quantity"]
                     if t["side"] == "SELL":
                         total_premium += premium_contrib
@@ -570,13 +731,41 @@ if page == "📊 总览":
                         "数量": t["quantity"],
                         "开仓价": f"${t['price']:.4f}",
                         "手续费": f"${t['fee']:.4f}",
-                        "合约": t["symbol"],
+                        "合约": symbol,
                         "时间": t["timestamp"][:19],
+                    })
+                    payoff_legs.append({
+                        "role": role,
+                        "symbol": symbol,
+                        "side": str(t.get("side") or "").upper(),
+                        "option_type": str(opt_type).lower(),
+                        "strike": float(strike or 0.0),
+                        "quantity": float(t.get("quantity") or 0.0),
+                        "entry_price": float(t.get("price") or 0.0),
                     })
 
                 df_legs = pd.DataFrame(leg_rows)
                 st.dataframe(df_legs, width='stretch', hide_index=True)
                 st.caption(f"净权利金: **${total_premium:.4f}**")
+
+                if group_underlying:
+                    if group_underlying not in _overview_spot_cache:
+                        try:
+                            _overview_spot_cache[group_underlying] = float(client.get_spot_price(group_underlying) or 0.0)
+                        except Exception:
+                            _overview_spot_cache[group_underlying] = 0.0
+                    chart_spot = _overview_spot_cache.get(group_underlying, 0.0) or group_spot
+                else:
+                    chart_spot = group_spot
+
+                payoff_fig = _build_expiry_payoff_figure(
+                    payoff_legs,
+                    underlying=group_underlying or cfg.strategy.underlying.upper(),
+                    chart_title=f"当前持仓到期盈亏 | {gid}",
+                    spot_price=chart_spot,
+                )
+                if payoff_fig is not None:
+                    st.plotly_chart(payoff_fig, width='stretch')
     elif not exchange_positions:
         st.info("当前无持仓")
     # If no local trades but exchange has positions, skip the "无持仓" message
