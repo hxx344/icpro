@@ -103,6 +103,18 @@ def _log_exception_with_id(message: str, exc: Exception, *, prefix: str = "dash"
     return error_id
 
 
+def _downsample_time_series(df: pd.DataFrame, *, max_points: int = 2000) -> tuple[pd.DataFrame, bool]:
+    """Reduce dense time-series payloads before Plotly rendering."""
+    if len(df) <= max_points:
+        return df, False
+
+    step = max((len(df) + max_points - 1) // max_points, 1)
+    sampled = df.iloc[::step].copy()
+    if sampled.index[-1] != df.index[-1]:
+        sampled = pd.concat([sampled, df.iloc[[-1]].copy()])
+    return sampled, True
+
+
 def _get_test_order_task(task_id: str | None) -> dict | None:
     if not task_id:
         return None
@@ -929,9 +941,10 @@ if page == "📊 总览":
         st.subheader("📈 资产走势")
         df_eq = pd.DataFrame(equity_curve)
         df_eq["timestamp"] = pd.to_datetime(df_eq["timestamp"])
+        df_eq_chart, _eq_downsampled = _downsample_time_series(df_eq, max_points=1200)
         fig_mini = go.Figure()
         fig_mini.add_trace(go.Scatter(
-            x=df_eq["timestamp"], y=df_eq["total_equity"],
+            x=df_eq_chart["timestamp"], y=df_eq_chart["total_equity"],
             fill="tozeroy", line=dict(color="#00e396", width=1.8),
             fillcolor="rgba(0,227,150,0.08)",
             hovertemplate="%{y:,.2f}<extra></extra>",
@@ -946,6 +959,8 @@ if page == "📊 总览":
         )
         fig_mini.update_xaxes(gridcolor="rgba(255,255,255,0.06)", tickfont=dict(color="#b0b0b0"))
         fig_mini.update_yaxes(gridcolor="rgba(255,255,255,0.06)", tickfont=dict(color="#b0b0b0"))
+        if _eq_downsampled:
+            st.caption(f"图表已压缩显示：{len(df_eq_chart):,} / {len(df_eq):,} 个点")
         st.plotly_chart(fig_mini, width='stretch')
 
 
@@ -994,7 +1009,16 @@ elif page == "📈 资产曲线":
         st.info("暂无资产数据。交易程序运行后将自动记录。")
     else:
         df = pd.DataFrame(equity_curve)
+        for _col, _default in {
+            "available_balance": 0.0,
+            "unrealized_pnl": 0.0,
+            "position_count": 0,
+            "underlying_price": 0.0,
+        }.items():
+            if _col not in df.columns:
+                df[_col] = _default
         df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df_chart, _chart_downsampled = _downsample_time_series(df, max_points=1800)
 
         # --- Dark theme constants ---
         _BG = "rgba(0,0,0,0)"
@@ -1043,6 +1067,9 @@ elif page == "📈 资产曲线":
         with k4:
             st.metric("数据点数", f"{len(df):,}")
 
+        if _chart_downsampled:
+            st.caption(f"为避免浏览器卡死，图表已压缩显示为 {len(df_chart):,} / {len(df):,} 个点")
+
         st.divider()
 
         # ======== Main equity chart ========
@@ -1056,7 +1083,7 @@ elif page == "📈 资产曲线":
         # -- Row 1: Equity area + available balance --
         fig.add_trace(
             go.Scatter(
-                x=df["timestamp"], y=df["total_equity"],
+                x=df_chart["timestamp"], y=df_chart["total_equity"],
                 name="权益",
                 line=dict(color=_EQUITY_COLOR, width=2),
                 fill="tozeroy",
@@ -1067,7 +1094,7 @@ elif page == "📈 资产曲线":
         )
         fig.add_trace(
             go.Scatter(
-                x=df["timestamp"], y=df["available_balance"],
+                x=df_chart["timestamp"], y=df_chart["available_balance"],
                 name="可用余额",
                 line=dict(color=_BALANCE_COLOR, width=1.2, dash="dot"),
                 hovertemplate="%{y:,.2f}",
@@ -1076,10 +1103,10 @@ elif page == "📈 资产曲线":
         )
 
         # -- Row 2: Unrealized PnL bars --
-        upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in df["unrealized_pnl"]]
+        upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in df_chart["unrealized_pnl"]]
         fig.add_trace(
             go.Bar(
-                x=df["timestamp"], y=df["unrealized_pnl"],
+            x=df_chart["timestamp"], y=df_chart["unrealized_pnl"],
                 name="未实现 PnL",
                 marker_color=upnl_colors,
                 marker_line_width=0,
@@ -1092,7 +1119,7 @@ elif page == "📈 资产曲线":
         # -- Row 3: Drawdown area (inverted) --
         fig.add_trace(
             go.Scatter(
-                x=df["timestamp"], y=dd_series,
+                x=df_chart["timestamp"], y=dd_series.loc[df_chart.index],
                 name="回撤 %",
                 line=dict(color=_DD_COLOR, width=1.2),
                 fill="tozeroy",
@@ -1154,7 +1181,7 @@ elif page == "📈 资产曲线":
             )
             fig2.add_trace(
                 go.Scatter(
-                    x=df["timestamp"], y=df["underlying_price"],
+                    x=df_chart["timestamp"], y=df_chart["underlying_price"],
                     name="标的价格 (USD)",
                     line=dict(color="#00b4d8", width=1.5),
                     hovertemplate="$%{y:,.2f}",
@@ -1163,7 +1190,7 @@ elif page == "📈 资产曲线":
             )
             fig2.add_trace(
                 go.Scatter(
-                    x=df["timestamp"], y=df["position_count"],
+                    x=df_chart["timestamp"], y=df_chart["position_count"],
                     name="持仓数", mode="lines+markers",
                     line=dict(color=_POS_COLOR, width=1.5),
                     marker=dict(size=4, color=_POS_COLOR),
@@ -1211,7 +1238,7 @@ elif page == "📈 资产曲线":
             # Position count only
             fig_pos = go.Figure()
             fig_pos.add_trace(go.Scatter(
-                x=df["timestamp"], y=df["position_count"],
+                x=df_chart["timestamp"], y=df_chart["position_count"],
                 name="持仓数", mode="lines+markers",
                 line=dict(color=_POS_COLOR, width=2),
                 marker=dict(size=4),
@@ -1254,6 +1281,14 @@ elif page == "💰 损益记录":
         st.info("暂无每日损益数据。")
     else:
         df = pd.DataFrame(daily_pnl)
+        for _col, _default in {
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "total_fees": 0.0,
+            "trade_count": 0,
+        }.items():
+            if _col not in df.columns:
+                df[_col] = _default
         df["date"] = pd.to_datetime(df["date"])
         df["daily_return"] = (df["ending_equity"] - df["starting_equity"])
         df["daily_return_pct"] = df.apply(

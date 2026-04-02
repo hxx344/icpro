@@ -68,6 +68,59 @@ class TestInit:
         assert busy_timeout == 5000
         assert synchronous == 1
 
+    def test_migrates_legacy_schema_columns(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        import sqlite3
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                trade_group TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                price REAL NOT NULL
+            );
+
+            CREATE TABLE equity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                total_equity REAL NOT NULL
+            );
+
+            CREATE TABLE daily_pnl (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                starting_equity REAL NOT NULL,
+                ending_equity REAL NOT NULL
+            );
+
+            CREATE TABLE strategy_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        storage = Storage(str(db_path))
+        migrated = storage._get_conn()
+
+        trades_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(trades)").fetchall()}
+        equity_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(equity_snapshots)").fetchall()}
+        daily_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(daily_pnl)").fetchall()}
+
+        assert {"fee", "order_id", "pnl", "is_open", "close_timestamp", "close_price", "meta"} <= trades_columns
+        assert {"available_balance", "unrealized_pnl", "position_count", "underlying_price", "meta"} <= equity_columns
+        assert {"realized_pnl", "unrealized_pnl", "total_fees", "trade_count", "meta"} <= daily_columns
+
+        storage.close()
+
 
 # ======================================================================
 # 2. Trades

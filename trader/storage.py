@@ -120,7 +120,9 @@ class Storage:
                 value       TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
-
+        """)
+        self._ensure_schema_compatibility(conn)
+        conn.executescript("""
             CREATE INDEX IF NOT EXISTS idx_trades_group ON trades(trade_group);
             CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
             CREATE INDEX IF NOT EXISTS idx_trades_open ON trades(is_open);
@@ -129,6 +131,59 @@ class Storage:
         """)
         conn.commit()
         logger.info(f"Storage initialized: {self.db_path}")
+
+    def _ensure_schema_compatibility(self, conn: sqlite3.Connection) -> None:
+        """Backfill columns for legacy databases created by older releases."""
+        self._ensure_table_columns(
+            conn,
+            "trades",
+            {
+                "fee": "REAL DEFAULT 0",
+                "order_id": "TEXT",
+                "pnl": "REAL DEFAULT 0",
+                "is_open": "INTEGER DEFAULT 1",
+                "close_timestamp": "TEXT",
+                "close_price": "REAL DEFAULT 0",
+                "meta": "TEXT DEFAULT '{}'",
+            },
+        )
+        self._ensure_table_columns(
+            conn,
+            "equity_snapshots",
+            {
+                "available_balance": "REAL NOT NULL DEFAULT 0",
+                "unrealized_pnl": "REAL DEFAULT 0",
+                "position_count": "INTEGER DEFAULT 0",
+                "underlying_price": "REAL DEFAULT 0",
+                "meta": "TEXT DEFAULT '{}'",
+            },
+        )
+        self._ensure_table_columns(
+            conn,
+            "daily_pnl",
+            {
+                "realized_pnl": "REAL DEFAULT 0",
+                "unrealized_pnl": "REAL DEFAULT 0",
+                "total_fees": "REAL DEFAULT 0",
+                "trade_count": "INTEGER DEFAULT 0",
+                "meta": "TEXT DEFAULT '{}'",
+            },
+        )
+
+    def _ensure_table_columns(
+        self,
+        conn: sqlite3.Connection,
+        table_name: str,
+        required_columns: dict[str, str],
+    ) -> None:
+        existing_columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        for column_name, column_sql in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            logger.info(f"Migrating legacy SQLite schema: adding {table_name}.{column_name}")
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
     # ------------------------------------------------------------------
     # Trades
