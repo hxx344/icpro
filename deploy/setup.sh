@@ -127,6 +127,15 @@ load_existing_deploy_config() {
     fi
 }
 
+normalize_service_identity_for_app_dir() {
+    case "$APP_DIR" in
+        /root|/root/*)
+            SERVICE_USER="root"
+            SERVICE_GROUP="root"
+            ;;
+    esac
+}
+
 prompt_value() {
     local var_name="$1"
     local prompt_text="$2"
@@ -315,6 +324,7 @@ install_rendered_service() {
 validate_required_inputs() {
     prompt_value APP_DIR "部署目录" "$APP_DIR"
     VENV_DIR="$APP_DIR/.venv"
+    normalize_service_identity_for_app_dir
 
     if [[ "$EXISTING_DEPLOYMENT" == "1" && "$CONFIG_OVERRIDE_PROVIDED" != "1" ]]; then
         echo "检测到已有部署配置，默认复用现有 env 参数并跳过配置输入。"
@@ -447,7 +457,9 @@ fi
 
 # --- 2. 创建运行用户 ---
 echo "[2/6] 创建服务用户 '$SERVICE_USER'..."
-if ! id "$SERVICE_USER" &>/dev/null; then
+if [[ "$SERVICE_USER" == "root" ]]; then
+    echo "  检测到 /root 部署路径，systemd 服务将直接使用 root 运行"
+elif ! id "$SERVICE_USER" &>/dev/null; then
     sudo useradd -r -m -s /bin/bash "$SERVICE_USER"
     echo "  用户 '$SERVICE_USER' 已创建"
 else
