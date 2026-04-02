@@ -24,7 +24,7 @@ import time as _time
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 # ---------------------------------------------------------------------------
 # OS-aware Streamlit server config (injected before Streamlit reads config)
@@ -58,6 +58,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from loguru import logger
 
 from trader.config import load_config, TraderConfig
@@ -109,9 +110,9 @@ def _downsample_time_series(df: pd.DataFrame, *, max_points: int = 2000) -> tupl
         return df, False
 
     step = max((len(df) + max_points - 1) // max_points, 1)
-    sampled = df.iloc[::step].copy()
+    sampled = cast(pd.DataFrame, df.iloc[::step, :].copy())
     if sampled.index[-1] != df.index[-1]:
-        sampled = pd.concat([sampled, df.iloc[[-1]].copy()])
+        sampled = cast(pd.DataFrame, pd.concat([sampled, df.iloc[[-1], :].copy()]))
     return sampled, True
 
 
@@ -670,17 +671,9 @@ _current_nav_page = st.session_state.get("nav_page", "📊 总览")
 _pause_auto_refresh = _current_nav_page == "🔧 策略配置"
 
 if auto_refresh and not _pause_auto_refresh:
-    # Fragment-based auto-refresh: triggers full app rerun without hard browser reload,
-    # preserving session_state (selected page, mode, etc.)
-    st.session_state["_app_run_ts"] = _time.time()
-
-    @st.fragment(run_every=timedelta(seconds=refresh_sec))
-    def _auto_refresh():
-        # Only trigger full rerun on timer-based fragment reruns, not the initial script run
-        if _time.time() - st.session_state.get("_app_run_ts", 0) > 2:
-            st.rerun(scope="app")
-
-    _auto_refresh()
+    # Use a lightweight timer component instead of fragment reruns.
+    # This avoids browser-side blank-page issues observed during full page refreshes.
+    st_autorefresh(interval=refresh_sec * 1000, key="dashboard_auto_refresh")
     st.sidebar.caption(f"每 {refresh_sec} 秒自动刷新")
 elif auto_refresh and _pause_auto_refresh:
     st.sidebar.caption("策略配置页已暂停整页自动刷新，避免表单/下单预览卡顿")
