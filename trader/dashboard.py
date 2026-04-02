@@ -14,7 +14,6 @@ Usage:
 from __future__ import annotations
 
 import inspect
-import hmac
 import json
 import os
 import platform
@@ -38,6 +37,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 _is_linux = platform.system() == "Linux"
 _dashboard_public = os.environ.get("DASHBOARD_PUBLIC", "false").strip().lower() in {"1", "true", "yes", "on"}
+_allow_no_auth = os.environ.get("DASHBOARD_ALLOW_NO_AUTH", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 def _set_default(env_key: str, value: str) -> None:
     """Set env var only if not already set (allow manual override)."""
@@ -541,84 +541,56 @@ config_path = get_config_path()
 cfg = load_config(config_path)          # ← This also loads .env into os.environ
 storage = init_storage(cfg.storage.db_path)
 
-logger.info(
-    "dashboard_run_start | config_path={} | query_params={} | session_keys={} | authenticated={} | auth_role={}",
-    config_path,
-    dict(st.query_params),
-    sorted(str(key) for key in st.session_state.keys()),
-    st.session_state.get("authenticated"),
-    st.session_state.get("auth_role"),
-)
-
 # ---------------------------------------------------------------------------
-# Login authentication (env: DASHBOARD_READONLY_* / DASHBOARD_TRADER_* / legacy DASHBOARD_*)
+# Login authentication (credentials from env: DASHBOARD_USER / DASHBOARD_PASS)
 # ---------------------------------------------------------------------------
 
-def _get_dashboard_credentials() -> list[dict[str, str]]:
-    credentials: list[dict[str, str]] = []
+def _get_login_credentials() -> tuple[str, str] | None:
+    candidates = [
+        ("DASHBOARD_USER", "DASHBOARD_PASS"),
+        ("DASHBOARD_TRADER_USER", "DASHBOARD_TRADER_PASS"),
+        ("DASHBOARD_READONLY_USER", "DASHBOARD_READONLY_PASS"),
+    ]
 
-    def _append_role(role: str, user_key: str, pass_key: str) -> None:
+    for user_key, pass_key in candidates:
         user = os.environ.get(user_key, "").strip()
         password = os.environ.get(pass_key, "").strip()
         if bool(user) != bool(password):
             raise RuntimeError(f"{user_key} 和 {pass_key} 必须同时配置")
         if user and password:
-            credentials.append({"role": role, "user": user, "password": password})
+            return user, password
 
-    _append_role("readonly", "DASHBOARD_READONLY_USER", "DASHBOARD_READONLY_PASS")
-    _append_role("trader", "DASHBOARD_TRADER_USER", "DASHBOARD_TRADER_PASS")
-
-    readonly_cred = next((item for item in credentials if item["role"] == "readonly"), None)
-    trader_cred = next((item for item in credentials if item["role"] == "trader"), None)
-    if readonly_cred and trader_cred:
-        if hmac.compare_digest(readonly_cred["user"], trader_cred["user"]) and hmac.compare_digest(
-            readonly_cred["password"], trader_cred["password"]
-        ):
-            raise RuntimeError("只读账号与交易账号不能完全相同，否则会始终优先匹配为只读权限")
-
-    return credentials
+    return None
 
 def _check_login() -> bool:
     """Show login form and validate credentials. Returns True if authenticated."""
     try:
-        credentials = _get_dashboard_credentials()
+        credentials = _get_login_credentials()
     except RuntimeError as exc:
         error_id = _log_exception_with_id("Dashboard credential validation failed", exc, prefix="auth")
         st.error(f"Dashboard 当前不可用，请联系管理员。错误编号: {error_id}")
         st.stop()
 
-    logger.info(
-        "dashboard_auth_check | credential_roles={} | authenticated={} | auth_role={} | query_params={}",
-        [item.get("role") for item in credentials],
-        st.session_state.get("authenticated"),
-        st.session_state.get("auth_role"),
-        dict(st.query_params),
-    )
+    if credentials is None:
+        if _dashboard_public and not _allow_no_auth:
+            st.error("公网访问已启用，但未配置 DASHBOARD_USER / DASHBOARD_PASS。已拒绝访问。")
+            st.stop()
+        if not _allow_no_auth:
+            st.warning("当前未配置 Dashboard 登录凭据，仅建议在本机或受保护网络中使用。")
+        return True
 
-    if not credentials:
-        error_id = _new_error_id("auth")
-        logger.error(f"Dashboard credentials missing | error_id={error_id}")
-        st.error(f"Dashboard 当前不可用，请联系管理员。错误编号: {error_id}")
-        st.stop()
+    expected_user, expected_pass = credentials
 
     # Already authenticated this session
-    if st.session_state.get("authenticated") and st.session_state.get("auth_role") in {"readonly", "trader"}:
-        logger.info("dashboard_auth_reuse | auth_role={}", st.session_state.get("auth_role"))
-        return True
     if st.session_state.get("authenticated"):
-        logger.warning(
-            "dashboard_auth_reset | authenticated={} | auth_role={} | query_params={}",
-            st.session_state.get("authenticated"),
-            st.session_state.get("auth_role"),
-            dict(st.query_params),
-        )
-        st.session_state["authenticated"] = False
-        st.session_state.pop("auth_role", None)
+        return True
 
     # --- Login form ---
-    st.markdown("## 🦅 铁鹰交易面板")
-    st.caption("请输入用户名和密码登录")
-    logger.info("dashboard_login_form_render | query_params={}", dict(st.query_params))
+    st.markdown(
+        "<h2 style='text-align:center; margin-top:80px;'>🦅 铁鹰交易面板</h2>"
+        "<p style='text-align:center; color:#888;'>请输入用户名和密码登录</p>",
+        unsafe_allow_html=True,
+    )
     _col_l, col_form, _col_r = st.columns([1, 1.5, 1])
     with col_form:
         with st.form("login_form"):
@@ -627,28 +599,16 @@ def _check_login() -> bool:
             submitted = st.form_submit_button("登录", width='stretch', type="primary")
 
         if submitted:
-            matched = next(
-                (
-                    item for item in credentials
-                    if hmac.compare_digest(username, item["user"])
-                    and hmac.compare_digest(password, item["password"])
-                ),
-                None,
-            )
-            if matched is None:
-                logger.warning("dashboard_login_failed | username={}", username)
-                st.error("用户名或密码错误")
-            else:
+            if username == expected_user and password == expected_pass:
                 st.session_state["authenticated"] = True
-                st.session_state["auth_role"] = matched["role"]
-                logger.info("dashboard_login_success | username={} | role={}", username, matched["role"])
                 st.rerun()
+            else:
+                st.error("用户名或密码错误")
 
     return False
 
 
 if not _check_login():
-    logger.info("dashboard_stop_after_login_gate")
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -658,22 +618,15 @@ if not _check_login():
 st.sidebar.title("📊 期权交易面板")
 
 # --- Mode selector ---
-auth_role = str(st.session_state.get("auth_role", "readonly") or "readonly")
-can_trade = auth_role == "trader"
-_mode_options = ["🔒 只读模式"] + (["🟢 交易模式"] if can_trade else [])
+_mode_options = ["🔒 只读模式", "🟢 交易模式"]
 _mode_param_to_label = {
     "readonly": "🔒 只读模式",
     "trade": "🟢 交易模式",
 }
 _mode_label_to_param = {v: k for k, v in _mode_param_to_label.items()}
 _mode_from_query = _mode_param_to_label.get(str(st.query_params.get("mode", "")).strip().lower())
-if not can_trade:
-    _mode_from_query = "🔒 只读模式"
 if "trading_mode" not in st.session_state:
-    if can_trade:
-        st.session_state.trading_mode = _mode_from_query or "🟢 交易模式"
-    else:
-        st.session_state.trading_mode = "🔒 只读模式"
+    st.session_state.trading_mode = _mode_from_query or "🔒 只读模式"
 elif _mode_from_query and st.session_state.trading_mode != _mode_from_query:
     st.session_state.trading_mode = _mode_from_query
 
@@ -690,7 +643,6 @@ trading_mode = st.sidebar.radio(
 st.session_state.trading_mode = trading_mode
 st.query_params["mode"] = _mode_label_to_param.get(trading_mode, "readonly")
 is_trade_mode = "交易" in trading_mode
-st.sidebar.caption("当前权限: 交易管理员" if can_trade else "当前权限: 只读用户")
 st.sidebar.markdown(f"**策略:** {cfg.name}")
 st.sidebar.markdown(f"**标的:** {cfg.strategy.underlying}")
 _sidebar_mode = getattr(cfg.strategy, 'mode', 'iron_condor')
@@ -814,8 +766,6 @@ page = st.sidebar.radio(
     ["📊 总览", "📈 资产曲线", "💰 损益记录", "📋 成交历史", "📡 期权行情", "🔧 策略配置", "🖥 引擎状态"],
     key="nav_page",
 )
-
-logger.info("dashboard_page_render | page={} | auth_role={} | trading_mode={} | query_params={}", page, auth_role, st.session_state.get("trading_mode"), dict(st.query_params))
 
 # ==========================================================================
 # PAGE: 总览 (Overview)
