@@ -528,7 +528,6 @@ def _check_login() -> bool:
                 st.session_state["auth_role"] = matched["role"]
                 st.session_state["trading_mode"] = "🟢 交易模式" if matched["role"] == "trader" else "🔒 只读模式"
                 st.session_state["_mode_initialized"] = True
-                st.query_params["mode"] = "trade" if matched["role"] == "trader" else "readonly"
                 st.rerun()
 
     return False
@@ -547,19 +546,8 @@ st.sidebar.title("📊 期权交易面板")
 auth_role = str(st.session_state.get("auth_role", "readonly") or "readonly")
 can_trade = auth_role == "trader"
 _mode_options = ["🔒 只读模式"] + (["🟢 交易模式"] if can_trade else [])
-_mode_param_to_label = {
-    "readonly": "🔒 只读模式",
-    "trade": "🟢 交易模式",
-}
-_mode_label_to_param = {v: k for k, v in _mode_param_to_label.items()}
-_mode_from_query = _mode_param_to_label.get(str(st.query_params.get("mode", "")).strip().lower())
-if not can_trade:
-    _mode_from_query = "🔒 只读模式"
 if not st.session_state.get("_mode_initialized"):
-    if can_trade:
-        st.session_state.trading_mode = _mode_from_query or "🟢 交易模式"
-    else:
-        st.session_state.trading_mode = "🔒 只读模式"
+    st.session_state.trading_mode = "🟢 交易模式" if can_trade else "🔒 只读模式"
     st.session_state["_mode_initialized"] = True
 
 if st.session_state.trading_mode not in _mode_options:
@@ -573,7 +561,6 @@ trading_mode = st.sidebar.radio(
     help="只读模式: 查看行情/持仓/统计，不可启动引擎或下单\n交易模式: 解锁全部功能",
 )
 st.session_state.trading_mode = trading_mode
-st.query_params["mode"] = _mode_label_to_param.get(trading_mode, "readonly")
 is_trade_mode = "交易" in trading_mode
 st.sidebar.caption("当前权限: 交易管理员" if can_trade else "当前权限: 只读用户")
 st.sidebar.markdown(f"**策略:** {cfg.name}")
