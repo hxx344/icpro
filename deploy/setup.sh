@@ -63,23 +63,24 @@ prompt_value() {
     local default_value="${3:-}"
     local secret="${4:-0}"
     local current_value="${!var_name:-}"
+    local effective_default="$default_value"
     local input=""
 
     if [[ -n "$current_value" ]]; then
-        return
+        effective_default="$current_value"
     fi
 
     if [[ "$secret" == "1" ]]; then
-        if [[ -n "$default_value" ]]; then
-            printf "%s [%s]: " "$prompt_text" "$default_value"
+        if [[ -n "$effective_default" ]]; then
+            printf "%s [%s]: " "$prompt_text" "已设置"
         else
             printf "%s: " "$prompt_text"
         fi
         read -r -s input
         printf "\n"
     else
-        if [[ -n "$default_value" ]]; then
-            printf "%s [%s]: " "$prompt_text" "$default_value"
+        if [[ -n "$effective_default" ]]; then
+            printf "%s [%s]: " "$prompt_text" "$effective_default"
         else
             printf "%s: " "$prompt_text"
         fi
@@ -87,7 +88,7 @@ prompt_value() {
     fi
 
     if [[ -z "$input" ]]; then
-        input="$default_value"
+        input="$effective_default"
     fi
 
     printf -v "$var_name" '%s' "$input"
@@ -109,15 +110,23 @@ prompt_yes_no() {
     local prompt_text="$2"
     local default_value="${3:-N}"
     local current_value="${!var_name:-}"
+    local effective_default="$default_value"
     local input=""
 
     if [[ -n "$current_value" ]]; then
-        return
+        case "$(printf '%s' "$current_value" | tr '[:lower:]' '[:upper:]')" in
+            Y|YES|1|TRUE)
+                effective_default="Y"
+                ;;
+            N|NO|0|FALSE)
+                effective_default="N"
+                ;;
+        esac
     fi
 
-    printf "%s [%s]: " "$prompt_text" "$default_value"
+    printf "%s [%s]: " "$prompt_text" "$effective_default"
     read -r input
-    input="${input:-$default_value}"
+    input="${input:-$effective_default}"
     input="$(printf '%s' "$input" | tr '[:lower:]' '[:upper:]')"
 
     case "$input" in
