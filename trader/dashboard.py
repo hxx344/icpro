@@ -454,6 +454,15 @@ def _get_dashboard_credentials() -> list[dict[str, str]]:
 
     _append_role("readonly", "DASHBOARD_READONLY_USER", "DASHBOARD_READONLY_PASS")
     _append_role("trader", "DASHBOARD_TRADER_USER", "DASHBOARD_TRADER_PASS")
+
+    readonly_cred = next((item for item in credentials if item["role"] == "readonly"), None)
+    trader_cred = next((item for item in credentials if item["role"] == "trader"), None)
+    if readonly_cred and trader_cred:
+        if hmac.compare_digest(readonly_cred["user"], trader_cred["user"]) and hmac.compare_digest(
+            readonly_cred["password"], trader_cred["password"]
+        ):
+            raise RuntimeError("只读账号与交易账号不能完全相同，否则会始终优先匹配为只读权限")
+
     return credentials
 
 def _check_login() -> bool:
@@ -477,6 +486,8 @@ def _check_login() -> bool:
     if st.session_state.get("authenticated"):
         st.session_state["authenticated"] = False
         st.session_state.pop("auth_role", None)
+        st.session_state.pop("trading_mode", None)
+        st.session_state.pop("_mode_initialized", None)
 
     # --- Login form ---
     st.markdown("## 🦅 铁鹰交易面板")
@@ -502,6 +513,9 @@ def _check_login() -> bool:
             else:
                 st.session_state["authenticated"] = True
                 st.session_state["auth_role"] = matched["role"]
+                st.session_state["trading_mode"] = "🟢 交易模式" if matched["role"] == "trader" else "🔒 只读模式"
+                st.session_state["_mode_initialized"] = True
+                st.query_params["mode"] = "trade" if matched["role"] == "trader" else "readonly"
                 st.rerun()
 
     return False
@@ -528,10 +542,12 @@ _mode_label_to_param = {v: k for k, v in _mode_param_to_label.items()}
 _mode_from_query = _mode_param_to_label.get(str(st.query_params.get("mode", "")).strip().lower())
 if not can_trade:
     _mode_from_query = "🔒 只读模式"
-if "trading_mode" not in st.session_state:
-    st.session_state.trading_mode = _mode_from_query or "🔒 只读模式"
-elif _mode_from_query and st.session_state.trading_mode != _mode_from_query:
-    st.session_state.trading_mode = _mode_from_query
+if not st.session_state.get("_mode_initialized"):
+    if can_trade:
+        st.session_state.trading_mode = _mode_from_query or "🟢 交易模式"
+    else:
+        st.session_state.trading_mode = "🔒 只读模式"
+    st.session_state["_mode_initialized"] = True
 
 if st.session_state.trading_mode not in _mode_options:
     st.session_state.trading_mode = "🔒 只读模式"
