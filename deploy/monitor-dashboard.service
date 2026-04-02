@@ -16,7 +16,6 @@ StandardOutput=journal
 StandardError=journal
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectHome=true
 ProtectSystem=full
 ReadWritePaths=/opt/project_Options/data /opt/project_Options/logs /opt/project_Options/deploy
 UMask=0077

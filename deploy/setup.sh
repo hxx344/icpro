@@ -36,6 +36,8 @@ DASHBOARD_TRADER_USER_VALUE="${DASHBOARD_TRADER_USER:-trader}"
 DASHBOARD_TRADER_PASS_VALUE="${DASHBOARD_TRADER_PASS:-}"
 MONITOR_USER_VALUE="${MONITOR_USER:-monitor}"
 MONITOR_PASS_VALUE="${MONITOR_PASS:-}"
+EXISTING_DEPLOYMENT="0"
+CONFIG_OVERRIDE_PROVIDED="0"
 
 usage() {
     cat <<'EOF'
@@ -59,6 +61,70 @@ Options:
   --no-start
   -h, --help
 EOF
+}
+
+strip_wrapped_quotes() {
+    local value="$1"
+    if [[ ${#value} -ge 2 ]]; then
+        if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+            value="${value:1:${#value}-2}"
+        elif [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+            value="${value:1:${#value}-2}"
+        fi
+    fi
+    printf '%s' "$value"
+}
+
+read_env_value() {
+    local env_file="$1"
+    local key="$2"
+
+    if [[ ! -f "$env_file" ]]; then
+        return 1
+    fi
+
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        local line="$raw_line"
+        line="${line#export }"
+        [[ -n "$line" ]] || continue
+        [[ "${line:0:1}" == "#" ]] && continue
+        [[ "$line" == "$key="* ]] || continue
+        strip_wrapped_quotes "${line#*=}"
+        return 0
+    done < "$env_file"
+
+    return 1
+}
+
+load_existing_deploy_config() {
+    local engine_env="$APP_DIR/deploy/trader-engine.env"
+    local dashboard_env="$APP_DIR/deploy/trader-dashboard.env"
+    local monitor_env="$APP_DIR/deploy/monitor-dashboard.env"
+    local loaded_any="0"
+    local value=""
+
+    [[ -f "$engine_env" || -f "$dashboard_env" || -f "$monitor_env" ]] || return 0
+
+    if value="$(read_env_value "$engine_env" "TRADER_CONFIG_PATH" 2>/dev/null)"; then TRADER_CONFIG_PATH="$value"; loaded_any="1"; fi
+    if value="$(read_env_value "$engine_env" "BINANCE_API_KEY" 2>/dev/null)"; then BINANCE_API_KEY_VALUE="$value"; loaded_any="1"; fi
+    if value="$(read_env_value "$engine_env" "BINANCE_API_SECRET" 2>/dev/null)"; then BINANCE_API_SECRET_VALUE="$value"; loaded_any="1"; fi
+    if value="$(read_env_value "$engine_env" "CDD_API_TOKEN" 2>/dev/null)"; then CDD_API_TOKEN_VALUE="$value"; loaded_any="1"; fi
+
+    if value="$(read_env_value "$dashboard_env" "DASHBOARD_PUBLIC" 2>/dev/null)"; then DASHBOARD_PUBLIC="$value"; loaded_any="1"; fi
+    if value="$(read_env_value "$dashboard_env" "DASHBOARD_READONLY_USER" 2>/dev/null)"; then DASHBOARD_READONLY_USER_VALUE="$value"; loaded_any="1"; fi
+    if value="$(read_env_value "$dashboard_env" "DASHBOARD_READONLY_PASS" 2>/dev/null)"; then DASHBOARD_READONLY_PASS_VALUE="$value"; loaded_any="1"; fi
+    if value="$(read_env_value "$dashboard_env" "DASHBOARD_TRADER_USER" 2>/dev/null)"; then DASHBOARD_TRADER_USER_VALUE="$value"; loaded_any="1"; fi
+    if value="$(read_env_value "$dashboard_env" "DASHBOARD_TRADER_PASS" 2>/dev/null)"; then DASHBOARD_TRADER_PASS_VALUE="$value"; loaded_any="1"; fi
+
+    if [[ -f "$monitor_env" ]]; then
+        WITH_MONITOR="1"
+        if value="$(read_env_value "$monitor_env" "MONITOR_USER" 2>/dev/null)"; then MONITOR_USER_VALUE="$value"; loaded_any="1"; fi
+        if value="$(read_env_value "$monitor_env" "MONITOR_PASS" 2>/dev/null)"; then MONITOR_PASS_VALUE="$value"; loaded_any="1"; fi
+    fi
+
+    if [[ "$loaded_any" == "1" ]]; then
+        EXISTING_DEPLOYMENT="1"
+    fi
 }
 
 prompt_value() {
@@ -150,32 +216,46 @@ prompt_yes_no() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --app-dir)
+            CONFIG_OVERRIDE_PROVIDED="1"
             APP_DIR="$2"; VENV_DIR="$APP_DIR/.venv"; shift 2 ;;
         --python-bin)
+            CONFIG_OVERRIDE_PROVIDED="1"
             PYTHON_BIN="$2"; shift 2 ;;
         --config)
+            CONFIG_OVERRIDE_PROVIDED="1"
             TRADER_CONFIG_PATH="$2"; shift 2 ;;
         --with-monitor)
+            CONFIG_OVERRIDE_PROVIDED="1"
             WITH_MONITOR="1"; shift ;;
         --api-key)
+            CONFIG_OVERRIDE_PROVIDED="1"
             BINANCE_API_KEY_VALUE="$2"; shift 2 ;;
         --api-secret)
+            CONFIG_OVERRIDE_PROVIDED="1"
             BINANCE_API_SECRET_VALUE="$2"; shift 2 ;;
         --cdd-token)
+            CONFIG_OVERRIDE_PROVIDED="1"
             CDD_API_TOKEN_VALUE="$2"; shift 2 ;;
         --dashboard-public)
+            CONFIG_OVERRIDE_PROVIDED="1"
             DASHBOARD_PUBLIC="$2"; shift 2 ;;
         --dashboard-readonly-user)
+            CONFIG_OVERRIDE_PROVIDED="1"
             DASHBOARD_READONLY_USER_VALUE="$2"; shift 2 ;;
         --dashboard-readonly-pass)
+            CONFIG_OVERRIDE_PROVIDED="1"
             DASHBOARD_READONLY_PASS_VALUE="$2"; shift 2 ;;
         --dashboard-trader-user)
+            CONFIG_OVERRIDE_PROVIDED="1"
             DASHBOARD_TRADER_USER_VALUE="$2"; shift 2 ;;
         --dashboard-trader-pass)
+            CONFIG_OVERRIDE_PROVIDED="1"
             DASHBOARD_TRADER_PASS_VALUE="$2"; shift 2 ;;
         --monitor-user)
+            CONFIG_OVERRIDE_PROVIDED="1"
             MONITOR_USER_VALUE="$2"; shift 2 ;;
         --monitor-pass)
+            CONFIG_OVERRIDE_PROVIDED="1"
             MONITOR_PASS_VALUE="$2"; shift 2 ;;
         --no-start)
             START_SERVICES="0"; shift ;;
@@ -187,6 +267,8 @@ while [[ $# -gt 0 ]]; do
             exit 1 ;;
     esac
 done
+
+load_existing_deploy_config
 
 escape_env_value() {
     local value="$1"
@@ -233,29 +315,40 @@ install_rendered_service() {
 validate_required_inputs() {
     prompt_value APP_DIR "部署目录" "$APP_DIR"
     VENV_DIR="$APP_DIR/.venv"
-    prompt_value PYTHON_BIN "Python 解释器" "$PYTHON_BIN"
-    prompt_value TRADER_CONFIG_PATH "策略配置文件路径" "$TRADER_CONFIG_PATH"
-    prompt_yes_no WITH_MONITOR "是否部署独立 Monitor 面板？" "N"
-    prompt_yes_no START_SERVICES "部署完成后是否自动启动服务？" "Y"
-    prompt_yes_no DASHBOARD_PUBLIC "是否公开暴露 Dashboard 到 0.0.0.0？" "N"
 
-    if [[ "$DASHBOARD_PUBLIC" == "1" ]]; then
+    if [[ "$EXISTING_DEPLOYMENT" == "1" && "$CONFIG_OVERRIDE_PROVIDED" != "1" ]]; then
+        echo "检测到已有部署配置，默认复用现有 env 参数并跳过配置输入。"
+    else
+        prompt_value PYTHON_BIN "Python 解释器" "$PYTHON_BIN"
+        prompt_value TRADER_CONFIG_PATH "策略配置文件路径" "$TRADER_CONFIG_PATH"
+        prompt_yes_no WITH_MONITOR "是否部署独立 Monitor 面板？" "N"
+        prompt_yes_no START_SERVICES "部署完成后是否自动启动服务？" "Y"
+        prompt_yes_no DASHBOARD_PUBLIC "是否公开暴露 Dashboard 到 0.0.0.0？" "N"
+
+        if [[ "$DASHBOARD_PUBLIC" == "1" ]]; then
+            DASHBOARD_PUBLIC="true"
+        else
+            DASHBOARD_PUBLIC="false"
+        fi
+
+        prompt_value BINANCE_API_KEY_VALUE "请输入 Binance API Key"
+        prompt_value BINANCE_API_SECRET_VALUE "请输入 Binance API Secret" "" 1
+        prompt_value DASHBOARD_READONLY_USER_VALUE "Dashboard 只读用户名" "$DASHBOARD_READONLY_USER_VALUE"
+        prompt_value DASHBOARD_READONLY_PASS_VALUE "Dashboard 只读密码" "" 1
+        prompt_value DASHBOARD_TRADER_USER_VALUE "Dashboard 交易用户名" "$DASHBOARD_TRADER_USER_VALUE"
+        prompt_value DASHBOARD_TRADER_PASS_VALUE "Dashboard 交易密码" "" 1
+        prompt_value CDD_API_TOKEN_VALUE "可选：CDD API Token（可留空）" "$CDD_API_TOKEN_VALUE" 1
+
+        if [[ "$WITH_MONITOR" == "1" ]]; then
+            prompt_value MONITOR_USER_VALUE "Monitor 用户名" "$MONITOR_USER_VALUE"
+            prompt_value MONITOR_PASS_VALUE "Monitor 密码" "" 1
+        fi
+    fi
+
+    if [[ "$DASHBOARD_PUBLIC" == "1" || "$DASHBOARD_PUBLIC" == "true" || "$DASHBOARD_PUBLIC" == "TRUE" ]]; then
         DASHBOARD_PUBLIC="true"
     else
         DASHBOARD_PUBLIC="false"
-    fi
-
-    prompt_value BINANCE_API_KEY_VALUE "请输入 Binance API Key"
-    prompt_value BINANCE_API_SECRET_VALUE "请输入 Binance API Secret" "" 1
-    prompt_value DASHBOARD_READONLY_USER_VALUE "Dashboard 只读用户名" "$DASHBOARD_READONLY_USER_VALUE"
-    prompt_value DASHBOARD_READONLY_PASS_VALUE "Dashboard 只读密码" "" 1
-    prompt_value DASHBOARD_TRADER_USER_VALUE "Dashboard 交易用户名" "$DASHBOARD_TRADER_USER_VALUE"
-    prompt_value DASHBOARD_TRADER_PASS_VALUE "Dashboard 交易密码" "" 1
-    prompt_value CDD_API_TOKEN_VALUE "可选：CDD API Token（可留空）" "$CDD_API_TOKEN_VALUE" 1
-
-    if [[ "$WITH_MONITOR" == "1" ]]; then
-        prompt_value MONITOR_USER_VALUE "Monitor 用户名" "$MONITOR_USER_VALUE"
-        prompt_value MONITOR_PASS_VALUE "Monitor 密码" "" 1
     fi
 
     local missing=()
