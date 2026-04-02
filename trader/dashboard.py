@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import inspect
 import hmac
 import json
 import os
@@ -22,7 +23,9 @@ import sys
 import threading
 import time as _time
 import uuid
+from collections.abc import MutableMapping
 from datetime import datetime, timezone, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +61,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 from loguru import logger
 
 from trader.config import load_config, TraderConfig
@@ -66,6 +70,106 @@ from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.binance_client import BinanceOptionsClient
 from trader.position_manager import PositionManager
 from trader.limit_chaser import ChaserConfig as DashboardChaserConfig
+
+
+def _supports_streamlit_param(func: Any, param_name: str) -> bool:
+    try:
+        return param_name in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _wrap_streamlit_width_compat(obj: Any, attr_name: str) -> None:
+    original = getattr(obj, attr_name, None)
+    if not callable(original):
+        return
+    if _supports_streamlit_param(original, "width") or not _supports_streamlit_param(original, "use_container_width"):
+        return
+
+    @wraps(original)
+    def _wrapped(*args, **kwargs):
+        width = kwargs.pop("width", None)
+        if width is not None and "use_container_width" not in kwargs:
+            kwargs["use_container_width"] = width == "stretch"
+        return original(*args, **kwargs)
+
+    setattr(obj, attr_name, _wrapped)
+
+
+class _QueryParamsCompat(MutableMapping[str, str]):
+    def _read(self) -> dict[str, str]:
+        getter = getattr(st, "experimental_get_query_params", None)
+        if getter is None:
+            return {}
+        raw_params = getter()
+        params: dict[str, str] = {}
+        for key, value in raw_params.items():
+            if isinstance(value, list):
+                params[key] = str(value[-1]) if value else ""
+            else:
+                params[key] = str(value)
+        return params
+
+    def _write(self, params: dict[str, str]) -> None:
+        setter = getattr(st, "experimental_set_query_params", None)
+        if setter is None:
+            return
+        setter(**params)
+
+    def __getitem__(self, key: str) -> str:
+        return self._read()[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        params = self._read()
+        params[key] = str(value)
+        self._write(params)
+
+    def __delitem__(self, key: str) -> None:
+        params = self._read()
+        del params[key]
+        self._write(params)
+
+    def __iter__(self):
+        return iter(self._read())
+
+    def __len__(self) -> int:
+        return len(self._read())
+
+    def __repr__(self) -> str:
+        return repr(self._read())
+
+
+if not hasattr(st, "query_params"):
+    st.query_params = _QueryParamsCompat()
+
+if not hasattr(st, "rerun") and hasattr(st, "experimental_rerun"):
+    def _rerun_compat(*args, **kwargs):
+        return st.experimental_rerun()
+
+    st.rerun = _rerun_compat
+
+if not hasattr(st, "fragment"):
+    def _fragment_compat(*args, **kwargs):
+        def _decorator(func):
+            return func
+        return _decorator
+
+    st.fragment = _fragment_compat
+
+if not hasattr(st, "html"):
+    def _html_compat(body: str, *args, **kwargs):
+        height = kwargs.pop("height", 900)
+        scrolling = kwargs.pop("scrolling", True)
+        return components.html(body, height=height, scrolling=scrolling)
+
+    st.html = _html_compat
+
+for _streamlit_obj, _attr_names in (
+    (st, ("button", "form_submit_button", "dataframe", "plotly_chart")),
+    (st.sidebar, ("button",)),
+):
+    for _attr_name in _attr_names:
+        _wrap_streamlit_width_compat(_streamlit_obj, _attr_name)
 
 # ---------------------------------------------------------------------------
 # Page config
