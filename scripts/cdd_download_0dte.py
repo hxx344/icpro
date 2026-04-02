@@ -22,11 +22,10 @@ import pandas as pd
 import requests
 from typing import Optional, Union
 
-from cdd_secrets import get_cdd_api_token
-
 # ── 配置 ──────────────────────────────────────────────────────────────
+API_TOKEN = "368ca0bd2ccf5620aa35c50f9a11a65943589b49"
 BASE_URL = "https://api.cryptodatadownload.com/v1"
-HEADERS = {"Authorization": f"Token {get_cdd_api_token()}"}
+HEADERS = {"Authorization": f"Token {API_TOKEN}"}
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_DIR / "data"

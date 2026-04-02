@@ -4,8 +4,6 @@
 
 ## 快速开始
 
-> 当前项目最低运行环境为 **Python 3.10+**。继续使用 Python 3.9 会遗留公开已知漏洞依赖，不能作为安全生产基线。
-
 ### 1. 安装
 
 ```bash
@@ -13,7 +11,7 @@
 git clone https://github.com/hxx344/icpro.git
 cd icpro
 
-# 创建虚拟环境（确保 python 指向 3.10+）
+# 创建虚拟环境
 python -m venv .venv
 
 # Windows
@@ -24,9 +22,6 @@ source .venv/bin/activate
 # 安装依赖
 pip install -U pip setuptools wheel
 pip install -e ".[dev,trader]"
-
-# 生产部署建议：优先使用锁定依赖（需 Python 3.10+）
-pip install -r requirements.lock.txt
 ```
 
 ### 2. 配置 API 密钥
@@ -49,32 +44,14 @@ cp .env.example .env
 # 编辑 .env 填写 BINANCE_API_KEY / BINANCE_API_SECRET
 ```
 
-生产部署建议：不要把真实密钥写进 YAML。优先使用：
-
-- [deploy/trader-engine.env](deploy/trader-engine.env) 存放交易引擎凭据
-- [deploy/trader-dashboard.env](deploy/trader-dashboard.env) 存放 Dashboard 凭据
-- [deploy/monitor-dashboard.env](deploy/monitor-dashboard.env) 存放 Monitor 凭据
-
 ### 3. 启动交易
 
 ```bash
 # 推荐：Dashboard + 引擎（Streamlit Web UI）
-streamlit run dashboard_app.py -- --config configs/trader/weekend_vol_btc.yaml
+streamlit run trader/dashboard.py -- --config configs/trader/weekend_vol_btc.yaml
 
 # 仅后端引擎（无 UI）
 python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
-```
-
-Dashboard 现在默认必须配置登录凭据，至少设置以下任意一组：
-
-```bash
-# 只读账号
-export DASHBOARD_READONLY_USER="readonly"
-export DASHBOARD_READONLY_PASS="strong_readonly_password"
-
-# 交易账号
-export DASHBOARD_TRADER_USER="trader"
-export DASHBOARD_TRADER_PASS="strong_trader_password"
 ```
 
 > **注意**：默认配置 `simulate_private: true`，引擎只模拟下单不实际成交，适合调试。正式交易前改为 `false`，并确认 `testnet: false`。
@@ -82,7 +59,7 @@ export DASHBOARD_TRADER_PASS="strong_trader_password"
 ### Ubuntu VPS 命令清单（从 0 到启动）
 
 ```bash
-# 1) 基础依赖（要求 Python 3.10+；Ubuntu 22.04+/Debian 12+ 更稳妥）
+# 1) 基础依赖
 sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
 
 # 2) 克隆项目
@@ -90,7 +67,6 @@ git clone https://github.com/hxx344/icpro.git
 cd icpro
 
 # 3) 创建并激活虚拟环境
-# 先确认 python3 --version >= 3.10
 python3 -m venv .venv
 source .venv/bin/activate
 
@@ -102,120 +78,12 @@ pip install -e ".[trader]"
 export BINANCE_API_KEY="your_key"
 export BINANCE_API_SECRET="your_secret"
 
-# 6) 配置 Dashboard 登录凭据
-cp deploy/trader-dashboard.env.example deploy/trader-dashboard.env
-nano deploy/trader-dashboard.env
+# 6) 启动 Dashboard + 引擎
+streamlit run trader/dashboard.py -- --config configs/trader/weekend_vol_btc.yaml
 
-# 7) 启动 Dashboard + 引擎
-streamlit run dashboard_app.py -- --config configs/trader/weekend_vol_btc.yaml
-
-# 8) 或使用 systemd 服务（参考 deploy/setup.sh）
+# 7) 或使用 systemd 服务（参考 deploy/setup.sh）
 sudo bash deploy/setup.sh
 ```
-
-如果希望在 VPS 上一条命令完成部署并自动写入 API / 登录凭据，可直接这样执行：
-
-```bash
-sudo env \
-  BINANCE_API_KEY="your_key" \
-  BINANCE_API_SECRET="your_secret" \
-  DASHBOARD_READONLY_USER="readonly" \
-  DASHBOARD_READONLY_PASS="strong_readonly_password" \
-  DASHBOARD_TRADER_USER="trader" \
-  DASHBOARD_TRADER_PASS="strong_trader_password" \
-  TRADER_CONFIG_PATH="configs/trader/weekend_vol_btc.yaml" \
-  bash deploy/setup.sh
-```
-
-也可以改用命令行参数形式：
-
-```bash
-sudo bash deploy/setup.sh \
-  --api-key "your_key" \
-  --api-secret "your_secret" \
-  --dashboard-readonly-user "readonly" \
-  --dashboard-readonly-pass "strong_readonly_password" \
-  --dashboard-trader-user "trader" \
-  --dashboard-trader-pass "strong_trader_password" \
-  --config configs/trader/weekend_vol_btc.yaml
-```
-
-脚本会自动：
-
-- 校验 Python 3.10+
-- 创建/重建虚拟环境
-- 安装锁定依赖
-- 写入 `deploy/*.env`
-- 安装并启用 Linux systemd 服务
-- 默认自动重启 `trader-engine`、`trader-dashboard`
-
-`monitor` 默认不部署；只有显式指定 `--with-monitor` 时，脚本才会要求 `MONITOR_PASS` / `--monitor-pass`，并安装/启动 `monitor-dashboard`。
-
-如果使用 systemd，`trader-dashboard.service` 会自动读取 [deploy/trader-dashboard.env](deploy/trader-dashboard.env) 中的凭据；该文件权限应保持为仅服务账户可读。
-
-`trader-engine.service` 现在同样会读取 [deploy/trader-engine.env](deploy/trader-engine.env)，用于注入 Binance API 密钥等敏感配置。
-
-`monitor-dashboard.service` 会读取 [deploy/monitor-dashboard.env](deploy/monitor-dashboard.env)，并默认监听 `8502` 端口，避免与交易面板冲突。
-
-### Monitor 面板
-
-监控面板现在默认要求登录凭据：
-
-```bash
-export MONITOR_USER="monitor"
-export MONITOR_PASS="strong_monitor_password"
-
-streamlit run monitor_app.py
-```
-
-如果在服务器上长期运行，建议把凭据写入 [deploy/monitor-dashboard.env](deploy/monitor-dashboard.env) 并设置为 `600` 权限。
-
-### Python 3.10+ 迁移与验证清单
-
-如果你是从旧的 Python 3.9 环境升级，建议按下面顺序执行：
-
-```powershell
-# 1) 安装 Python 3.10+（Windows 可用 3.11）
-winget install -e --id Python.Python.3.11
-
-# 2) 删除旧虚拟环境
-Remove-Item -Recurse -Force .venv
-
-# 3) 用新解释器重建环境
-py -3.11 -m venv .venv
-
-# 4) 安装锁定依赖
-.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
-.\.venv\Scripts\python.exe -m pip install -r requirements.lock.txt
-
-# 5) 安装项目本身（不重复解析依赖）
-.\.venv\Scripts\python.exe -m pip install -e ".[trader,dev]" --no-deps
-
-# 6) 安装审计工具并复扫
-.\.venv\Scripts\python.exe -m pip install pip-audit
-.\.venv\Scripts\python.exe -m pip_audit -r requirements.lock.txt
-.\.venv\Scripts\python.exe -m pip_audit
-```
-
-验证通过标准：
-
-- `python --version` 或 `py -3.11 --version` 显示 3.10+
-- `pip install -r requirements.lock.txt` 无版本冲突
-- `pip_audit -r requirements.lock.txt` 输出 `No known vulnerabilities found`
-- `pip_audit` 扫描本地环境时，`options-backtest` 可能显示 `Dependency not found on PyPI`，这是本地可编辑包的预期现象，不代表已知漏洞
-
-如需交给 systemd 托管，可执行：
-
-```bash
-sudo systemctl enable --now monitor-dashboard
-```
-
-## 依赖治理
-
-- 开发入口仍以 [pyproject.toml](pyproject.toml) 为准
-- 生产安装建议优先使用 [requirements.lock.txt](requirements.lock.txt) 做可复现部署
-- [deploy/setup.sh](deploy/setup.sh) 在检测到锁定文件时会优先按锁定版本安装，再安装当前项目本体
-- 升级依赖时，先在虚拟环境验证，再同步更新锁定文件，避免线上环境漂移
 
 ## 交易策略
 

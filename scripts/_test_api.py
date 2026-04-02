@@ -1,8 +1,6 @@
 import requests
-from cdd_secrets import get_cdd_api_token
-
 s = requests.Session()
-s.headers["Authorization"] = f"Token {get_cdd_api_token()}"
+s.headers["Authorization"] = "Token 368ca0bd2ccf5620aa35c50f9a11a65943589b49"
 r = s.get(
     "https://api.cryptodatadownload.com/v1/data/ohlc/deribit/options/",
     params={"currency": "BTC", "expiry": "1JAN24", "limit": 10},
