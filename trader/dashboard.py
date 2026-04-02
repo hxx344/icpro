@@ -24,7 +24,7 @@ import time as _time
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # OS-aware Streamlit server config (injected before Streamlit reads config)
@@ -58,7 +58,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 from loguru import logger
 
 from trader.config import load_config, TraderConfig
@@ -102,18 +101,6 @@ def _log_exception_with_id(message: str, exc: Exception, *, prefix: str = "dash"
     error_id = _new_error_id(prefix)
     logger.exception(f"{message} | error_id={error_id} | error={exc}")
     return error_id
-
-
-def _downsample_time_series(df: pd.DataFrame, *, max_points: int = 2000) -> tuple[pd.DataFrame, bool]:
-    """Reduce dense time-series payloads before Plotly rendering."""
-    if len(df) <= max_points:
-        return df, False
-
-    step = max((len(df) + max_points - 1) // max_points, 1)
-    sampled = cast(pd.DataFrame, df.iloc[::step, :].copy())
-    if sampled.index[-1] != df.index[-1]:
-        sampled = cast(pd.DataFrame, pd.concat([sampled, df.iloc[[-1], :].copy()]))
-    return sampled, True
 
 
 def _get_test_order_task(task_id: str | None) -> dict | None:
@@ -499,8 +486,6 @@ def _check_login() -> bool:
     if st.session_state.get("authenticated"):
         st.session_state["authenticated"] = False
         st.session_state.pop("auth_role", None)
-        st.session_state.pop("trading_mode", None)
-        st.session_state.pop("_mode_initialized", None)
 
     # --- Login form ---
     st.markdown("## 🦅 铁鹰交易面板")
@@ -526,8 +511,6 @@ def _check_login() -> bool:
             else:
                 st.session_state["authenticated"] = True
                 st.session_state["auth_role"] = matched["role"]
-                st.session_state["trading_mode"] = "🟢 交易模式" if matched["role"] == "trader" else "🔒 只读模式"
-                st.session_state["_mode_initialized"] = True
                 st.rerun()
 
     return False
@@ -546,9 +529,18 @@ st.sidebar.title("📊 期权交易面板")
 auth_role = str(st.session_state.get("auth_role", "readonly") or "readonly")
 can_trade = auth_role == "trader"
 _mode_options = ["🔒 只读模式"] + (["🟢 交易模式"] if can_trade else [])
-if not st.session_state.get("_mode_initialized"):
-    st.session_state.trading_mode = "🟢 交易模式" if can_trade else "🔒 只读模式"
-    st.session_state["_mode_initialized"] = True
+_mode_param_to_label = {
+    "readonly": "🔒 只读模式",
+    "trade": "🟢 交易模式",
+}
+_mode_label_to_param = {v: k for k, v in _mode_param_to_label.items()}
+_mode_from_query = _mode_param_to_label.get(str(st.query_params.get("mode", "")).strip().lower())
+if not can_trade:
+    _mode_from_query = "🔒 只读模式"
+if "trading_mode" not in st.session_state:
+    st.session_state.trading_mode = _mode_from_query or "🔒 只读模式"
+elif _mode_from_query and st.session_state.trading_mode != _mode_from_query:
+    st.session_state.trading_mode = _mode_from_query
 
 if st.session_state.trading_mode not in _mode_options:
     st.session_state.trading_mode = "🔒 只读模式"
@@ -561,6 +553,7 @@ trading_mode = st.sidebar.radio(
     help="只读模式: 查看行情/持仓/统计，不可启动引擎或下单\n交易模式: 解锁全部功能",
 )
 st.session_state.trading_mode = trading_mode
+st.query_params["mode"] = _mode_label_to_param.get(trading_mode, "readonly")
 is_trade_mode = "交易" in trading_mode
 st.sidebar.caption("当前权限: 交易管理员" if can_trade else "当前权限: 只读用户")
 st.sidebar.markdown(f"**策略:** {cfg.name}")
@@ -658,9 +651,17 @@ _current_nav_page = st.session_state.get("nav_page", "📊 总览")
 _pause_auto_refresh = _current_nav_page == "🔧 策略配置"
 
 if auto_refresh and not _pause_auto_refresh:
-    # Use a lightweight timer component instead of fragment reruns.
-    # This avoids browser-side blank-page issues observed during full page refreshes.
-    st_autorefresh(interval=refresh_sec * 1000, key="dashboard_auto_refresh")
+    # Fragment-based auto-refresh: triggers full app rerun without hard browser reload,
+    # preserving session_state (selected page, mode, etc.)
+    st.session_state["_app_run_ts"] = _time.time()
+
+    @st.fragment(run_every=timedelta(seconds=refresh_sec))
+    def _auto_refresh():
+        # Only trigger full rerun on timer-based fragment reruns, not the initial script run
+        if _time.time() - st.session_state.get("_app_run_ts", 0) > 2:
+            st.rerun(scope="app")
+
+    _auto_refresh()
     st.sidebar.caption(f"每 {refresh_sec} 秒自动刷新")
 elif auto_refresh and _pause_auto_refresh:
     st.sidebar.caption("策略配置页已暂停整页自动刷新，避免表单/下单预览卡顿")
@@ -921,10 +922,9 @@ if page == "📊 总览":
         st.subheader("📈 资产走势")
         df_eq = pd.DataFrame(equity_curve)
         df_eq["timestamp"] = pd.to_datetime(df_eq["timestamp"])
-        df_eq_chart, _eq_downsampled = _downsample_time_series(df_eq, max_points=1200)
         fig_mini = go.Figure()
         fig_mini.add_trace(go.Scatter(
-            x=df_eq_chart["timestamp"], y=df_eq_chart["total_equity"],
+            x=df_eq["timestamp"], y=df_eq["total_equity"],
             fill="tozeroy", line=dict(color="#00e396", width=1.8),
             fillcolor="rgba(0,227,150,0.08)",
             hovertemplate="%{y:,.2f}<extra></extra>",
@@ -939,8 +939,6 @@ if page == "📊 总览":
         )
         fig_mini.update_xaxes(gridcolor="rgba(255,255,255,0.06)", tickfont=dict(color="#b0b0b0"))
         fig_mini.update_yaxes(gridcolor="rgba(255,255,255,0.06)", tickfont=dict(color="#b0b0b0"))
-        if _eq_downsampled:
-            st.caption(f"图表已压缩显示：{len(df_eq_chart):,} / {len(df_eq):,} 个点")
         st.plotly_chart(fig_mini, width='stretch')
 
 
@@ -989,16 +987,7 @@ elif page == "📈 资产曲线":
         st.info("暂无资产数据。交易程序运行后将自动记录。")
     else:
         df = pd.DataFrame(equity_curve)
-        for _col, _default in {
-            "available_balance": 0.0,
-            "unrealized_pnl": 0.0,
-            "position_count": 0,
-            "underlying_price": 0.0,
-        }.items():
-            if _col not in df.columns:
-                df[_col] = _default
         df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df_chart, _chart_downsampled = _downsample_time_series(df, max_points=1800)
 
         # --- Dark theme constants ---
         _BG = "rgba(0,0,0,0)"
@@ -1047,9 +1036,6 @@ elif page == "📈 资产曲线":
         with k4:
             st.metric("数据点数", f"{len(df):,}")
 
-        if _chart_downsampled:
-            st.caption(f"为避免浏览器卡死，图表已压缩显示为 {len(df_chart):,} / {len(df):,} 个点")
-
         st.divider()
 
         # ======== Main equity chart ========
@@ -1063,7 +1049,7 @@ elif page == "📈 资产曲线":
         # -- Row 1: Equity area + available balance --
         fig.add_trace(
             go.Scatter(
-                x=df_chart["timestamp"], y=df_chart["total_equity"],
+                x=df["timestamp"], y=df["total_equity"],
                 name="权益",
                 line=dict(color=_EQUITY_COLOR, width=2),
                 fill="tozeroy",
@@ -1074,7 +1060,7 @@ elif page == "📈 资产曲线":
         )
         fig.add_trace(
             go.Scatter(
-                x=df_chart["timestamp"], y=df_chart["available_balance"],
+                x=df["timestamp"], y=df["available_balance"],
                 name="可用余额",
                 line=dict(color=_BALANCE_COLOR, width=1.2, dash="dot"),
                 hovertemplate="%{y:,.2f}",
@@ -1083,10 +1069,10 @@ elif page == "📈 资产曲线":
         )
 
         # -- Row 2: Unrealized PnL bars --
-        upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in df_chart["unrealized_pnl"]]
+        upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in df["unrealized_pnl"]]
         fig.add_trace(
             go.Bar(
-            x=df_chart["timestamp"], y=df_chart["unrealized_pnl"],
+            x=df["timestamp"], y=df["unrealized_pnl"],
                 name="未实现 PnL",
                 marker_color=upnl_colors,
                 marker_line_width=0,
@@ -1099,7 +1085,7 @@ elif page == "📈 资产曲线":
         # -- Row 3: Drawdown area (inverted) --
         fig.add_trace(
             go.Scatter(
-                x=df_chart["timestamp"], y=dd_series.loc[df_chart.index],
+                x=df["timestamp"], y=dd_series,
                 name="回撤 %",
                 line=dict(color=_DD_COLOR, width=1.2),
                 fill="tozeroy",
@@ -1161,7 +1147,7 @@ elif page == "📈 资产曲线":
             )
             fig2.add_trace(
                 go.Scatter(
-                    x=df_chart["timestamp"], y=df_chart["underlying_price"],
+                    x=df["timestamp"], y=df["underlying_price"],
                     name="标的价格 (USD)",
                     line=dict(color="#00b4d8", width=1.5),
                     hovertemplate="$%{y:,.2f}",
@@ -1170,7 +1156,7 @@ elif page == "📈 资产曲线":
             )
             fig2.add_trace(
                 go.Scatter(
-                    x=df_chart["timestamp"], y=df_chart["position_count"],
+                    x=df["timestamp"], y=df["position_count"],
                     name="持仓数", mode="lines+markers",
                     line=dict(color=_POS_COLOR, width=1.5),
                     marker=dict(size=4, color=_POS_COLOR),
@@ -1218,7 +1204,7 @@ elif page == "📈 资产曲线":
             # Position count only
             fig_pos = go.Figure()
             fig_pos.add_trace(go.Scatter(
-                x=df_chart["timestamp"], y=df_chart["position_count"],
+                x=df["timestamp"], y=df["position_count"],
                 name="持仓数", mode="lines+markers",
                 line=dict(color=_POS_COLOR, width=2),
                 marker=dict(size=4),
@@ -1261,14 +1247,6 @@ elif page == "💰 损益记录":
         st.info("暂无每日损益数据。")
     else:
         df = pd.DataFrame(daily_pnl)
-        for _col, _default in {
-            "realized_pnl": 0.0,
-            "unrealized_pnl": 0.0,
-            "total_fees": 0.0,
-            "trade_count": 0,
-        }.items():
-            if _col not in df.columns:
-                df[_col] = _default
         df["date"] = pd.to_datetime(df["date"])
         df["daily_return"] = (df["ending_equity"] - df["starting_equity"])
         df["daily_return_pct"] = df.apply(
