@@ -10,7 +10,7 @@ Group=trader
 WorkingDirectory=/opt/project_Options
 Environment=TRADER_CONFIG_PATH=configs/trader/weekend_vol_btc.yaml
 EnvironmentFile=/opt/project_Options/deploy/trader-dashboard.env
-ExecStart=/opt/project_Options/.venv/bin/python -m streamlit run dashboard_app.py -- --config ${TRADER_CONFIG_PATH}
+ExecStart=/opt/project_Options/.venv/bin/python -m streamlit run dashboard_app.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

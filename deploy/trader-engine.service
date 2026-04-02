@@ -10,7 +10,7 @@ Group=trader
 WorkingDirectory=/opt/project_Options
 Environment=TRADER_CONFIG_PATH=configs/trader/weekend_vol_btc.yaml
 EnvironmentFile=/opt/project_Options/deploy/trader-engine.env
-ExecStart=/opt/project_Options/.venv/bin/python -m trader.main run --config ${TRADER_CONFIG_PATH}
+ExecStart=/opt/project_Options/.venv/bin/python -m trader.main run
 Restart=always
 RestartSec=10
 StandardOutput=journal

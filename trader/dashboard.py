@@ -430,7 +430,7 @@ def get_config_path() -> str:
     for i, a in enumerate(args):
         if a == "--config" and i + 1 < len(args):
             return args[i + 1]
-    return "configs/trader/short_strangle_7dte.yaml"
+    return os.environ.get("TRADER_CONFIG_PATH", "configs/trader/short_strangle_7dte.yaml")
 
 
 config_path = get_config_path()

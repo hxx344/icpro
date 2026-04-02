@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -28,6 +29,12 @@ from trader.equity import EquityTracker
 from trader.position_manager import PositionManager
 from trader.storage import Storage
 from trader.strategy import IronCondor0DTEStrategy, WeekendVolStrategy
+
+
+DEFAULT_CONFIG_PATH = os.environ.get(
+    "TRADER_CONFIG_PATH",
+    "configs/trader/weekend_vol_btc.yaml",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +434,8 @@ Examples:
 
     parser.add_argument(
         "--config", "-c",
-        default="configs/trader/weekend_vol_btc.yaml",
-        help="配置文件路径 (默认: configs/trader/weekend_vol_btc.yaml)",
+        default=DEFAULT_CONFIG_PATH,
+        help=f"配置文件路径 (默认: {DEFAULT_CONFIG_PATH})",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
