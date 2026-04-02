@@ -238,10 +238,23 @@ class TraderApp:
             balance = -1
             upnl = 0
 
+        rv_str = "-"
+        basket_str = "-"
+        try:
+            strategy_status = self.strategy.status()
+            rv_val = strategy_status.get("entry_realized_vol_current")
+            basket_val = strategy_status.get("basket_pnl_pct")
+            if isinstance(rv_val, (int, float)):
+                rv_str = f"{rv_val:.2%}"
+            if isinstance(basket_val, (int, float)):
+                basket_str = f"{basket_val:.1f}%"
+        except Exception:
+            pass
+
         logger.info(
             f"[Heartbeat] {now.strftime('%H:%M:%S')} UTC | "
             f"balance={balance:.4f} | upnl={upnl:.4f} | "
-            f"positions={pos_count}"
+            f"positions={pos_count} | rv24={rv_str} | basket={basket_str}"
         )
 
     def _shutdown(self) -> None:

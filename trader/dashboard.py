@@ -8,11 +8,12 @@ Streamlit 前端，用于:
 - 手动操作 (平仓、暂停)
 
 Usage:
-    streamlit run trader/dashboard.py -- --config configs/trader_iron_condor_0dte.yaml
+    streamlit run dashboard_app.py -- --config configs/trader_iron_condor_0dte.yaml
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import platform
@@ -20,10 +21,10 @@ import requests
 import sys
 import threading
 import time as _time
-import traceback
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # OS-aware Streamlit server config (injected before Streamlit reads config)
@@ -34,7 +35,6 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 _is_linux = platform.system() == "Linux"
 _dashboard_public = os.environ.get("DASHBOARD_PUBLIC", "false").strip().lower() in {"1", "true", "yes", "on"}
-_allow_no_auth = os.environ.get("DASHBOARD_ALLOW_NO_AUTH", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 def _set_default(env_key: str, value: str) -> None:
     """Set env var only if not already set (allow manual override)."""
@@ -58,9 +58,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-
-# Ensure project root is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from loguru import logger
 
 from trader.config import load_config, TraderConfig
 from trader.storage import Storage
@@ -93,6 +91,16 @@ def init_storage(db_path: str) -> Storage:
 
 _TEST_ORDER_TASKS: dict[str, dict] = {}
 _TEST_ORDER_TASKS_LOCK = threading.Lock()
+
+
+def _new_error_id(prefix: str = "dash") -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:10]}"
+
+
+def _log_exception_with_id(message: str, exc: Exception, *, prefix: str = "dash") -> str:
+    error_id = _new_error_id(prefix)
+    logger.exception(f"{message} | error_id={error_id} | error={exc}")
+    return error_id
 
 
 def _get_test_order_task(task_id: str | None) -> dict | None:
@@ -290,7 +298,40 @@ def _start_test_order_task(
     engine_ref: TradingEngine,
 ) -> None:
     def _runner() -> None:
+        last_progress: dict[str, object] = {}
+
+        def _infer_underlying_from_order() -> str:
+            for _key in ("sell_call_symbol", "sell_put_symbol", "buy_call_symbol", "buy_put_symbol"):
+                _symbol = str(order_params.get(_key) or "").strip().upper()
+                if _symbol and "-" in _symbol:
+                    return _symbol.split("-", 1)[0]
+            return ""
+
+        def _capture_exchange_positions_on_failure() -> dict[str, object]:
+            _underlying = _infer_underlying_from_order()
+            if not _underlying:
+                return {
+                    "exchange_positions_checked": False,
+                    "exchange_positions_error": "无法从测试订单参数推断标的，未执行持仓复核",
+                }
+            try:
+                _positions = task_client.get_positions(_underlying)
+                return {
+                    "exchange_positions_checked": True,
+                    "exchange_positions_underlying": _underlying,
+                    "exchange_positions": _positions,
+                    "exchange_positions_count": len(_positions),
+                }
+            except Exception as _snapshot_exc:
+                return {
+                    "exchange_positions_checked": True,
+                    "exchange_positions_underlying": _underlying,
+                    "exchange_positions_error": str(_snapshot_exc),
+                }
+
         def _on_progress(progress: dict) -> None:
+            last_progress.clear()
+            last_progress.update(progress)
             legs = progress.get("legs") or []
             fill_ratio = float(progress.get("fill_ratio") or 0.0)
             _update_test_order_task(
@@ -324,38 +365,57 @@ def _start_test_order_task(
                 ),
             )
 
-            condor = task_pos_mgr.open_iron_condor(
-                execution_mode="market",
-                status_callback=_on_progress,
-                **order_params,
-            )
+            _is_strangle = not order_params.get("buy_call_symbol") and not order_params.get("buy_put_symbol")
+            if _is_strangle:
+                condor = task_pos_mgr.open_short_strangle(
+                    execution_mode="market",
+                    status_callback=_on_progress,
+                    sell_call_symbol=order_params["sell_call_symbol"],
+                    sell_put_symbol=order_params["sell_put_symbol"],
+                    sell_call_strike=order_params["sell_call_strike"],
+                    sell_put_strike=order_params["sell_put_strike"],
+                    quantity=order_params["quantity"],
+                    underlying_price=order_params["underlying_price"],
+                )
+            else:
+                condor = task_pos_mgr.open_iron_condor(
+                    execution_mode="market",
+                    status_callback=_on_progress,
+                    **order_params,
+                )
 
             if condor is not None:
+                _group_id = str(getattr(condor, "group_id", ""))
                 if engine_ref.pos_mgr is not None:
-                    engine_ref.pos_mgr.open_condors[condor.group_id] = condor
+                    engine_ref.pos_mgr.open_condors[_group_id] = condor
                 _update_test_order_task(
                     task_id,
                     state="success",
                     status="success",
-                    message=f"测试下单成功：{condor.group_id}",
+                    message=f"测试下单成功：{_group_id}",
                     percent=100,
-                    result_group_id=condor.group_id,
+                    result_group_id=_group_id,
                 )
             else:
+                _snapshot = _capture_exchange_positions_on_failure()
                 _update_test_order_task(
                     task_id,
                     state="failed",
                     status="failed",
-                    message="测试下单失败：至少有一条腿未成交或被回滚",
+                    message=str(last_progress.get("message") or "测试下单失败：至少有一条腿未成交或被回滚"),
+                    **_snapshot,
                 )
         except Exception as exc:
+            _snapshot = _capture_exchange_positions_on_failure()
+            error_id = _log_exception_with_id("Test order task failed", exc, prefix="test")
             _update_test_order_task(
                 task_id,
                 state="error",
                 status="error",
-                message=f"测试下单异常: {exc}",
+                message=f"测试下单异常，请查看服务端日志。错误编号: {error_id}",
                 error=str(exc),
-                traceback=traceback.format_exc(),
+                error_id=error_id,
+                **_snapshot,
             )
 
     thread = threading.Thread(target=_runner, name=f"test-order-{task_id[:8]}", daemon=True)
@@ -378,34 +438,49 @@ cfg = load_config(config_path)          # ← This also loads .env into os.envir
 storage = init_storage(cfg.storage.db_path)
 
 # ---------------------------------------------------------------------------
-# Login authentication (credentials from env: DASHBOARD_USER / DASHBOARD_PASS)
+# Login authentication (env: DASHBOARD_READONLY_* / DASHBOARD_TRADER_* / legacy DASHBOARD_*)
 # ---------------------------------------------------------------------------
+
+def _get_dashboard_credentials() -> list[dict[str, str]]:
+    credentials: list[dict[str, str]] = []
+
+    def _append_role(role: str, user_key: str, pass_key: str) -> None:
+        user = os.environ.get(user_key, "").strip()
+        password = os.environ.get(pass_key, "").strip()
+        if bool(user) != bool(password):
+            raise RuntimeError(f"{user_key} 和 {pass_key} 必须同时配置")
+        if user and password:
+            credentials.append({"role": role, "user": user, "password": password})
+
+    _append_role("readonly", "DASHBOARD_READONLY_USER", "DASHBOARD_READONLY_PASS")
+    _append_role("trader", "DASHBOARD_TRADER_USER", "DASHBOARD_TRADER_PASS")
+    return credentials
 
 def _check_login() -> bool:
     """Show login form and validate credentials. Returns True if authenticated."""
-    # Load expected credentials from environment
-    expected_user = os.environ.get("DASHBOARD_USER", "").strip()
-    expected_pass = os.environ.get("DASHBOARD_PASS", "").strip()
+    try:
+        credentials = _get_dashboard_credentials()
+    except RuntimeError as exc:
+        error_id = _log_exception_with_id("Dashboard credential validation failed", exc, prefix="auth")
+        st.error(f"Dashboard 当前不可用，请联系管理员。错误编号: {error_id}")
+        st.stop()
 
-    # If no credentials configured, skip auth
-    if not expected_user or not expected_pass:
-        if _dashboard_public and not _allow_no_auth:
-            st.error("公网访问已启用，但未配置 DASHBOARD_USER / DASHBOARD_PASS。已拒绝访问。")
-            st.stop()
-        if not _allow_no_auth:
-            st.warning("当前未配置 Dashboard 登录凭据，仅建议在本机或受保护网络使用。")
-        return True
+    if not credentials:
+        error_id = _new_error_id("auth")
+        logger.error(f"Dashboard credentials missing | error_id={error_id}")
+        st.error(f"Dashboard 当前不可用，请联系管理员。错误编号: {error_id}")
+        st.stop()
 
     # Already authenticated this session
-    if st.session_state.get("authenticated"):
+    if st.session_state.get("authenticated") and st.session_state.get("auth_role") in {"readonly", "trader"}:
         return True
+    if st.session_state.get("authenticated"):
+        st.session_state["authenticated"] = False
+        st.session_state.pop("auth_role", None)
 
     # --- Login form ---
-    st.markdown(
-        "<h2 style='text-align:center; margin-top:80px;'>🦅 铁鹰交易面板</h2>"
-        "<p style='text-align:center; color:#888;'>请输入用户名和密码登录</p>",
-        unsafe_allow_html=True,
-    )
+    st.markdown("## 🦅 铁鹰交易面板")
+    st.caption("请输入用户名和密码登录")
     _col_l, col_form, _col_r = st.columns([1, 1.5, 1])
     with col_form:
         with st.form("login_form"):
@@ -414,11 +489,20 @@ def _check_login() -> bool:
             submitted = st.form_submit_button("登录", width='stretch', type="primary")
 
         if submitted:
-            if username == expected_user and password == expected_pass:
-                st.session_state["authenticated"] = True
-                st.rerun()
-            else:
+            matched = next(
+                (
+                    item for item in credentials
+                    if hmac.compare_digest(username, item["user"])
+                    and hmac.compare_digest(password, item["password"])
+                ),
+                None,
+            )
+            if matched is None:
                 st.error("用户名或密码错误")
+            else:
+                st.session_state["authenticated"] = True
+                st.session_state["auth_role"] = matched["role"]
+                st.rerun()
 
     return False
 
@@ -433,17 +517,24 @@ if not _check_login():
 st.sidebar.title("📊 期权交易面板")
 
 # --- Mode selector ---
-_mode_options = ["🔒 只读模式", "🟢 交易模式"]
+auth_role = str(st.session_state.get("auth_role", "readonly") or "readonly")
+can_trade = auth_role == "trader"
+_mode_options = ["🔒 只读模式"] + (["🟢 交易模式"] if can_trade else [])
 _mode_param_to_label = {
     "readonly": "🔒 只读模式",
     "trade": "🟢 交易模式",
 }
 _mode_label_to_param = {v: k for k, v in _mode_param_to_label.items()}
 _mode_from_query = _mode_param_to_label.get(str(st.query_params.get("mode", "")).strip().lower())
+if not can_trade:
+    _mode_from_query = "🔒 只读模式"
 if "trading_mode" not in st.session_state:
     st.session_state.trading_mode = _mode_from_query or "🔒 只读模式"
 elif _mode_from_query and st.session_state.trading_mode != _mode_from_query:
     st.session_state.trading_mode = _mode_from_query
+
+if st.session_state.trading_mode not in _mode_options:
+    st.session_state.trading_mode = "🔒 只读模式"
 
 trading_mode = st.sidebar.radio(
     "运行模式",
@@ -455,6 +546,7 @@ trading_mode = st.sidebar.radio(
 st.session_state.trading_mode = trading_mode
 st.query_params["mode"] = _mode_label_to_param.get(trading_mode, "readonly")
 is_trade_mode = "交易" in trading_mode
+st.sidebar.caption("当前权限: 交易管理员" if can_trade else "当前权限: 只读用户")
 st.sidebar.markdown(f"**策略:** {cfg.name}")
 st.sidebar.markdown(f"**标的:** {cfg.strategy.underlying}")
 _sidebar_mode = getattr(cfg.strategy, 'mode', 'iron_condor')
@@ -899,12 +991,12 @@ elif page == "📈 资产曲线":
         _DN_COLOR = "#ff4560"
         _DD_COLOR = "#ff4560"
 
-        _dark_axis = dict(
+        _dark_axis: dict[str, object] = dict(
             gridcolor=_GRID, zerolinecolor=_GRID,
             tickfont=dict(color=_TEXT, size=11),
             title_font=dict(color=_TEXT, size=12),
         )
-        _dark_layout = dict(
+        _dark_layout: dict[str, object] = dict(
             paper_bgcolor=_BG, plot_bgcolor=_BG,
             font=dict(color=_TEXT, size=12),
             hovermode="x unified",
@@ -1003,13 +1095,32 @@ elif page == "📈 资产曲线":
                 bgcolor="rgba(0,0,0,0)", font=dict(color=_TEXT, size=11),
             ),
             margin=dict(l=60, r=16, t=24, b=16),
-            **_dark_layout,
+            paper_bgcolor=_BG,
+            plot_bgcolor=_BG,
+            font=dict(color=_TEXT, size=12),
+            hovermode="x unified",
+            hoverlabel=dict(bgcolor="#1e1e2f", font_size=12),
         )
 
         # Axes styling
         for row_i in range(1, 4):
-            fig.update_xaxes(row=row_i, col=1, **_dark_axis, showticklabels=(row_i == 3))
-            fig.update_yaxes(row=row_i, col=1, **_dark_axis)
+            fig.update_xaxes(
+                row=row_i,
+                col=1,
+                gridcolor=_GRID,
+                zerolinecolor=_GRID,
+                tickfont=dict(color=_TEXT, size=11),
+                title_font=dict(color=_TEXT, size=12),
+                showticklabels=(row_i == 3),
+            )
+            fig.update_yaxes(
+                row=row_i,
+                col=1,
+                gridcolor=_GRID,
+                zerolinecolor=_GRID,
+                tickfont=dict(color=_TEXT, size=11),
+                title_font=dict(color=_TEXT, size=12),
+            )
 
         fig.update_yaxes(title_text="账户权益", row=1, col=1)
         fig.update_yaxes(title_text="未实现PnL", row=2, col=1)
@@ -1051,11 +1162,34 @@ elif page == "📈 资产曲线":
                     orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5,
                     bgcolor="rgba(0,0,0,0)", font=dict(color=_TEXT, size=11),
                 ),
-                **_dark_layout,
+                paper_bgcolor=_BG,
+                plot_bgcolor=_BG,
+                font=dict(color=_TEXT, size=12),
+                hovermode="x unified",
+                hoverlabel=dict(bgcolor="#1e1e2f", font_size=12),
             )
-            fig2.update_xaxes(**_dark_axis)
-            fig2.update_yaxes(title_text="标的价格 (USD)", secondary_y=False, **_dark_axis)
-            fig2.update_yaxes(title_text="持仓数", secondary_y=True, **_dark_axis)
+            fig2.update_xaxes(
+                gridcolor=_GRID,
+                zerolinecolor=_GRID,
+                tickfont=dict(color=_TEXT, size=11),
+                title_font=dict(color=_TEXT, size=12),
+            )
+            fig2.update_yaxes(
+                title_text="标的价格 (USD)",
+                secondary_y=False,
+                gridcolor=_GRID,
+                zerolinecolor=_GRID,
+                tickfont=dict(color=_TEXT, size=11),
+                title_font=dict(color=_TEXT, size=12),
+            )
+            fig2.update_yaxes(
+                title_text="持仓数",
+                secondary_y=True,
+                gridcolor=_GRID,
+                zerolinecolor=_GRID,
+                tickfont=dict(color=_TEXT, size=11),
+                title_font=dict(color=_TEXT, size=12),
+            )
             st.plotly_chart(fig2, width='stretch')
         else:
             # Position count only
@@ -1069,10 +1203,25 @@ elif page == "📈 资产曲线":
             ))
             fig_pos.update_layout(
                 height=200, margin=dict(l=60, r=16, t=8, b=16),
-                yaxis_title="持仓数", **_dark_layout,
+                yaxis_title="持仓数",
+                paper_bgcolor=_BG,
+                plot_bgcolor=_BG,
+                font=dict(color=_TEXT, size=12),
+                hovermode="x unified",
+                hoverlabel=dict(bgcolor="#1e1e2f", font_size=12),
             )
-            fig_pos.update_xaxes(**_dark_axis)
-            fig_pos.update_yaxes(**_dark_axis)
+            fig_pos.update_xaxes(
+                gridcolor=_GRID,
+                zerolinecolor=_GRID,
+                tickfont=dict(color=_TEXT, size=11),
+                title_font=dict(color=_TEXT, size=12),
+            )
+            fig_pos.update_yaxes(
+                gridcolor=_GRID,
+                zerolinecolor=_GRID,
+                tickfont=dict(color=_TEXT, size=11),
+                title_font=dict(color=_TEXT, size=12),
+            )
             st.plotly_chart(fig_pos, width='stretch')
 
 
@@ -1394,6 +1543,21 @@ elif page == "🔧 策略配置":
                 value=float(_strategy.get("leverage", 1.0)),
                 step=0.5, format="%.1f", help="仓位大小的杠杆倍数 (weekend_vol)",
             )
+            ed_rv_hours = st.number_input(
+                "RV 回看小时数", min_value=0, max_value=168,
+                value=int(_strategy.get("entry_realized_vol_lookback_hours", 24)),
+                step=1, help="入场 RV 过滤的历史小时数；0 表示关闭过滤",
+            )
+            ed_rv_max = st.number_input(
+                "RV 上限", min_value=0.0, max_value=5.0,
+                value=float(_strategy.get("entry_realized_vol_max", 1.20)),
+                step=0.05, format="%.2f", help="仅当年化 RV 不超过该值时允许开仓",
+            )
+            ed_stop_loss_pct = st.number_input(
+                "组合止损 %", min_value=0.0, max_value=1000.0,
+                value=float(_strategy.get("stop_loss_pct", 200.0)),
+                step=10.0, format="%.1f", help="组合 PnL% 低于 -该值时触发止损；0 表示关闭",
+            )
             _day_options = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
             _cur_day = _strategy.get("entry_day", "friday").lower()
             _day_index = _day_options.index(_cur_day) if _cur_day in _day_options else 4
@@ -1514,6 +1678,9 @@ elif page == "🔧 策略配置":
                 "target_delta": round(ed_target_delta, 4),
                 "wing_delta": round(ed_wing_delta, 4),
                 "leverage": round(ed_leverage, 2),
+                "entry_realized_vol_lookback_hours": int(ed_rv_hours),
+                "entry_realized_vol_max": round(ed_rv_max, 4),
+                "stop_loss_pct": round(ed_stop_loss_pct, 4),
                 "entry_day": ed_entry_day,
                 "default_iv": round(ed_default_iv, 4),
                 "entry_time_utc": ed_entry_time.strftime("%H:%M"),
@@ -1565,12 +1732,15 @@ elif page == "🔧 策略配置":
     # 📋  下单预览 — 根据实时行情模拟下一次开仓
     # ------------------------------------------------------------------
     _pv_mode = getattr(cfg.strategy, "mode", "iron_condor")
-    _pv_mode_labels = {
-        "strangle": "Short Strangle",
-        "iron_condor": "Iron Condor",
-        "weekend_vol": "Weekend Vol Iron Condor",
-    }
-    _pv_mode_label = _pv_mode_labels.get(_pv_mode, _pv_mode)
+    _pv_weekend_is_ic = getattr(cfg.strategy, "wing_delta", 0) > 0
+    if _pv_mode == "weekend_vol":
+        _pv_mode_label = "Weekend Vol Iron Condor" if _pv_weekend_is_ic else "Weekend Vol Short Strangle"
+    else:
+        _pv_mode_labels = {
+            "strangle": "Short Strangle",
+            "iron_condor": "Iron Condor",
+        }
+        _pv_mode_label = _pv_mode_labels.get(_pv_mode, _pv_mode)
     st.subheader(f"📋 下单预览 ({_pv_mode_label})（实时行情）")
 
     @st.cache_resource
@@ -1584,6 +1754,8 @@ elif page == "🔧 策略配置":
         _pv_ul = cfg.strategy.underlying.upper()
         _pv_spot = _pv_client.get_spot_price(_pv_ul)
         _pv_tickers = _pv_client.get_tickers(_pv_ul)
+        _now_utc = datetime.now(timezone.utc)
+        _sunday_exp = _now_utc
 
         if _pv_spot <= 0:
             _prices = [t.underlying_price for t in _pv_tickers if t.underlying_price > 0]
@@ -1734,6 +1906,16 @@ elif page == "🔧 策略配置":
             )
 
             if _has_all_legs:
+                if _sell_call is None or _sell_put is None:
+                    raise RuntimeError("Preview leg selection returned incomplete short legs")
+                if _is_ic and (_buy_call is None or _buy_put is None):
+                    raise RuntimeError("Preview leg selection returned incomplete wing legs")
+
+                _sell_call_t: Any = _sell_call
+                _sell_put_t: Any = _sell_put
+                _buy_call_t: Any = _buy_call
+                _buy_put_t: Any = _buy_put
+
                 # Compute quantity
                 import math as _math
                 _base_qty = cfg.strategy.quantity
@@ -1767,10 +1949,11 @@ elif page == "🔧 策略配置":
 
                 # Prices in USD (Binance option native quote unit)
                 _preview_fallback_iv = getattr(cfg.strategy, "default_iv", 0.60)
-                _sc_bid = _sell_call.bid_price
-                _sc_ask = _sell_call.ask_price
-                _sp_bid = _sell_put.bid_price
-                _sp_ask = _sell_put.ask_price
+                _total_max_loss = 0.0
+                _sc_bid = _sell_call_t.bid_price
+                _sc_ask = _sell_call_t.ask_price
+                _sp_bid = _sell_put_t.bid_price
+                _sp_ask = _sell_put_t.ask_price
 
                 if not _is_ic:
                     # ---- Strangle / weekend_vol without wings P&L ----
@@ -1780,24 +1963,24 @@ elif page == "🔧 策略配置":
                         _margin_used = _pv_spot * _pv_qty  # notional
                     else:
                         _margin_used = _otm * _pv_spot * 2 * _pv_qty
-                    _be_upper = _sell_call.strike + _premium_per
-                    _be_lower = _sell_put.strike - _premium_per
+                    _be_upper = _sell_call_t.strike + _premium_per
+                    _be_lower = _sell_put_t.strike - _premium_per
                 else:
                     # ---- Iron Condor P&L ----
-                    _lc_bid = _buy_call.bid_price
-                    _lc_ask = _buy_call.ask_price
-                    _lp_bid = _buy_put.bid_price
-                    _lp_ask = _buy_put.ask_price
+                    _lc_bid = _buy_call_t.bid_price
+                    _lc_ask = _buy_call_t.ask_price
+                    _lp_bid = _buy_put_t.bid_price
+                    _lp_ask = _buy_put_t.ask_price
                     _premium_per = (_sc_bid + _sp_bid) - (_lc_ask + _lp_ask)
-                    _call_width = _buy_call.strike - _sell_call.strike
-                    _put_width = _sell_put.strike - _buy_put.strike
+                    _call_width = _buy_call_t.strike - _sell_call_t.strike
+                    _put_width = _sell_put_t.strike - _buy_put_t.strike
                     _max_wing = max(_call_width, _put_width)
                     _max_loss_per = _max_wing - _premium_per
                     _total_premium = _premium_per * _pv_qty
                     _total_max_loss = _max_loss_per * _pv_qty
                     _margin_used = _max_wing * 2 * _pv_qty
-                    _be_upper = _sell_call.strike + _premium_per
-                    _be_lower = _sell_put.strike - _premium_per
+                    _be_upper = _sell_call_t.strike + _premium_per
+                    _be_lower = _sell_put_t.strike - _premium_per
 
                 _pv_ok = True
 
@@ -1827,25 +2010,25 @@ elif page == "🔧 策略配置":
                     _legs_data = [
                         {
                             "腿": "① Short Put (卖出收权利金)",
-                            "合约": _sell_put.symbol,
-                            "行权价": f"${_sell_put.strike:,.0f}",
-                            "距Spot": f"{(_sell_put.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_put, _pv_spot, _preview_fallback_iv),
+                            "合约": _sell_put_t.symbol,
+                            "行权价": f"${_sell_put_t.strike:,.0f}",
+                            "距Spot": f"{(_sell_put_t.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_put_t, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sp_bid:.2f}",
                             "Ask (USDT)": f"${_sp_ask:.2f}",
-                            "DTE": f"{_sell_put.dte_hours:.0f}h ({_sell_put.dte_hours/24:.1f}d)",
+                            "DTE": f"{_sell_put_t.dte_hours:.0f}h ({_sell_put_t.dte_hours/24:.1f}d)",
                         },
                         {
                             "腿": "② Short Call (卖出收权利金)",
-                            "合约": _sell_call.symbol,
-                            "行权价": f"${_sell_call.strike:,.0f}",
-                            "距Spot": f"{(_sell_call.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_call, _pv_spot, _preview_fallback_iv),
+                            "合约": _sell_call_t.symbol,
+                            "行权价": f"${_sell_call_t.strike:,.0f}",
+                            "距Spot": f"{(_sell_call_t.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_call_t, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sc_bid:.2f}",
                             "Ask (USDT)": f"${_sc_ask:.2f}",
-                            "DTE": f"{_sell_call.dte_hours:.0f}h ({_sell_call.dte_hours/24:.1f}d)",
+                            "DTE": f"{_sell_call_t.dte_hours:.0f}h ({_sell_call_t.dte_hours/24:.1f}d)",
                         },
                     ]
                 else:
@@ -1853,47 +2036,47 @@ elif page == "🔧 策略配置":
                     _legs_data = [
                         {
                             "腿": "① Long Put (买入保护)",
-                            "合约": _buy_put.symbol,
-                            "行权价": f"${_buy_put.strike:,.0f}",
-                            "距Spot": f"{(_buy_put.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_buy_put, _pv_spot, _preview_fallback_iv),
+                            "合约": _buy_put_t.symbol,
+                            "行权价": f"${_buy_put_t.strike:,.0f}",
+                            "距Spot": f"{(_buy_put_t.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_buy_put_t, _pv_spot, _preview_fallback_iv),
                             "方向": "🟢 买入",
                             "Bid (USDT)": f"${_lp_bid:.2f}",
                             "Ask (USDT)": f"${_lp_ask:.2f}",
-                            "DTE": f"{_buy_put.dte_hours:.0f}h ({_buy_put.dte_hours/24:.1f}d)",
+                            "DTE": f"{_buy_put_t.dte_hours:.0f}h ({_buy_put_t.dte_hours/24:.1f}d)",
                         },
                         {
                             "腿": "② Short Put (卖出收权利金)",
-                            "合约": _sell_put.symbol,
-                            "行权价": f"${_sell_put.strike:,.0f}",
-                            "距Spot": f"{(_sell_put.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_put, _pv_spot, _preview_fallback_iv),
+                            "合约": _sell_put_t.symbol,
+                            "行权价": f"${_sell_put_t.strike:,.0f}",
+                            "距Spot": f"{(_sell_put_t.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_put_t, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sp_bid:.2f}",
                             "Ask (USDT)": f"${_sp_ask:.2f}",
-                            "DTE": f"{_sell_put.dte_hours:.0f}h ({_sell_put.dte_hours/24:.1f}d)",
+                            "DTE": f"{_sell_put_t.dte_hours:.0f}h ({_sell_put_t.dte_hours/24:.1f}d)",
                         },
                         {
                             "腿": "③ Short Call (卖出收权利金)",
-                            "合约": _sell_call.symbol,
-                            "行权价": f"${_sell_call.strike:,.0f}",
-                            "距Spot": f"{(_sell_call.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_call, _pv_spot, _preview_fallback_iv),
+                            "合约": _sell_call_t.symbol,
+                            "行权价": f"${_sell_call_t.strike:,.0f}",
+                            "距Spot": f"{(_sell_call_t.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_sell_call_t, _pv_spot, _preview_fallback_iv),
                             "方向": "🔴 卖出",
                             "Bid (USDT)": f"${_sc_bid:.2f}",
                             "Ask (USDT)": f"${_sc_ask:.2f}",
-                            "DTE": f"{_sell_call.dte_hours:.0f}h ({_sell_call.dte_hours/24:.1f}d)",
+                            "DTE": f"{_sell_call_t.dte_hours:.0f}h ({_sell_call_t.dte_hours/24:.1f}d)",
                         },
                         {
                             "腿": "④ Long Call (买入保护)",
-                            "合约": _buy_call.symbol,
-                            "行权价": f"${_buy_call.strike:,.0f}",
-                            "距Spot": f"{(_buy_call.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_buy_call, _pv_spot, _preview_fallback_iv),
+                            "合约": _buy_call_t.symbol,
+                            "行权价": f"${_buy_call_t.strike:,.0f}",
+                            "距Spot": f"{(_buy_call_t.strike/_pv_spot - 1)*100:+.1f}%",
+                            "Delta": _format_preview_delta(_buy_call_t, _pv_spot, _preview_fallback_iv),
                             "方向": "🟢 买入",
                             "Bid (USDT)": f"${_lc_bid:.2f}",
                             "Ask (USDT)": f"${_lc_ask:.2f}",
-                            "DTE": f"{_buy_call.dte_hours:.0f}h ({_buy_call.dte_hours/24:.1f}d)",
+                            "DTE": f"{_buy_call_t.dte_hours:.0f}h ({_buy_call_t.dte_hours/24:.1f}d)",
                         },
                     ]
                 st.dataframe(pd.DataFrame(_legs_data), width="stretch", hide_index=True)
@@ -1905,22 +2088,22 @@ elif page == "🔧 策略配置":
                 _active_test_task = _get_test_order_task(_active_test_task_id)
                 _test_task_running = bool(_active_test_task and _active_test_task.get("state") in {"queued", "running"})
                 _test_disabled_reason = None
-                if not _is_ic:
-                    _test_disabled_reason = "当前预览不是四条腿组合，测试按钮仅支持四腿下单。"
-                elif not is_trade_mode:
+                if not is_trade_mode:
                     _test_disabled_reason = "当前为只读模式，切换到交易模式后才可发送测试单。"
                 elif _test_task_running:
                     _test_disabled_reason = "已有测试下单任务在执行，请等待完成。"
 
+                _test_leg_count = 4 if _is_ic else 2
+                _test_button_label = f"🧪 测试{_test_leg_count}腿市价单 0.01"
                 st.caption(
-                    "按当前预览目标固定发送 4 条腿市价单，每条腿数量 0.01，用于验证真实下单链路。"
+                    f"按当前预览目标固定发送 {_test_leg_count} 条腿市价单，每条腿数量 0.01，用于验证真实下单链路。"
                 )
                 _tc1, _tc2 = st.columns([1, 2])
                 with _tc1:
                     _preview_test_clicked = st.button(
-                        "🧪 测试四腿市价单 0.01",
+                        _test_button_label,
                         key=(
-                            f"preview_test_iron_condor_{_pv_mode}_"
+                            f"preview_test_combo_{_pv_mode}_"
                             f"{_sell_put.symbol}_{_sell_call.symbol}_"
                             f"{_buy_put.symbol if _buy_put else 'none'}_"
                             f"{_buy_call.symbol if _buy_call else 'none'}"
@@ -1930,13 +2113,20 @@ elif page == "🔧 策略配置":
                         disabled=_test_disabled_reason is not None,
                     )
                 with _tc2:
-                    st.write(
-                        f"固定数量: {_test_qty:.2f} | "
-                        f"Long Put `{_buy_put.symbol if _buy_put else '-'}` / "
-                        f"Short Put `{_sell_put.symbol}` / "
-                        f"Short Call `{_sell_call.symbol}` / "
-                        f"Long Call `{_buy_call.symbol if _buy_call else '-'}`"
-                    )
+                    if _is_ic:
+                        st.write(
+                            f"固定数量: {_test_qty:.2f} | "
+                            f"Long Put `{_buy_put.symbol if _buy_put else '-'}` / "
+                            f"Short Put `{_sell_put.symbol}` / "
+                            f"Short Call `{_sell_call.symbol}` / "
+                            f"Long Call `{_buy_call.symbol if _buy_call else '-'}`"
+                        )
+                    else:
+                        st.write(
+                            f"固定数量: {_test_qty:.2f} | "
+                            f"Short Put `{_sell_put.symbol}` / "
+                            f"Short Call `{_sell_call.symbol}`"
+                        )
 
                 if _test_disabled_reason:
                     st.info(_test_disabled_reason)
@@ -1953,9 +2143,9 @@ elif page == "🔧 策略配置":
                         created_at=datetime.now(timezone.utc).isoformat(),
                         order_summary={
                             "sell_call": _sell_call.symbol,
-                            "buy_call": _buy_call.symbol,
+                            "buy_call": _buy_call.symbol if _buy_call else None,
                             "sell_put": _sell_put.symbol,
-                            "buy_put": _buy_put.symbol,
+                            "buy_put": _buy_put.symbol if _buy_put else None,
                             "quantity": _test_qty,
                             "execution_mode": "market",
                         },
@@ -1967,13 +2157,13 @@ elif page == "🔧 策略配置":
                         cfg.chaser,
                         {
                             "sell_call_symbol": _sell_call.symbol,
-                            "buy_call_symbol": _buy_call.symbol,
+                            "buy_call_symbol": _buy_call.symbol if _buy_call else None,
                             "sell_put_symbol": _sell_put.symbol,
-                            "buy_put_symbol": _buy_put.symbol,
+                            "buy_put_symbol": _buy_put.symbol if _buy_put else None,
                             "sell_call_strike": _sell_call.strike,
-                            "buy_call_strike": _buy_call.strike,
+                            "buy_call_strike": _buy_call.strike if _buy_call else None,
                             "sell_put_strike": _sell_put.strike,
-                            "buy_put_strike": _buy_put.strike,
+                            "buy_put_strike": _buy_put.strike if _buy_put else None,
                             "quantity": _test_qty,
                             "underlying_price": _pv_spot,
                         },
@@ -2034,9 +2224,38 @@ elif page == "🔧 策略配置":
                             ])
                             st.dataframe(_legs_df, width="stretch", hide_index=True)
 
-                        if _task.get("traceback"):
-                            with st.expander("查看异常堆栈"):
-                                st.code(_task["traceback"])
+                        if _task.get("error_id"):
+                            st.caption(f"错误编号: {_task['error_id']}（详细堆栈仅写入服务端日志）")
+
+                        if _state in {"failed", "error"}:
+                            _snapshot_checked = bool(_task.get("exchange_positions_checked"))
+                            _snapshot_underlying = str(_task.get("exchange_positions_underlying") or "")
+                            _snapshot_error = _task.get("exchange_positions_error")
+                            _snapshot_positions = _task.get("exchange_positions") or []
+
+                            st.markdown("##### 🔎 失败后交易所持仓复核")
+                            if _snapshot_checked:
+                                if _snapshot_error:
+                                    st.warning(f"持仓复核失败（{_snapshot_underlying or '-'}）：{_snapshot_error}")
+                                elif _snapshot_positions:
+                                    _snapshot_rows = [
+                                        {
+                                            "合约": p.get("symbol", ""),
+                                            "方向": p.get("side", ""),
+                                            "数量": float(p.get("quantity") or 0.0),
+                                            "开仓价": f"${float(p.get('entryPrice') or 0.0):.4f}",
+                                            "未实现PnL": f"${float(p.get('unrealizedPnl') or 0.0):.4f}",
+                                        }
+                                        for p in _snapshot_positions
+                                    ]
+                                    st.error(
+                                        f"复核发现 {_snapshot_underlying} 仍有 {len(_snapshot_positions)} 条真实持仓，请立即核对是否存在残留仓位。"
+                                    )
+                                    st.dataframe(pd.DataFrame(_snapshot_rows), width="stretch", hide_index=True)
+                                else:
+                                    st.success(f"复核完成：{_snapshot_underlying} 当前无真实持仓残留。")
+                            else:
+                                st.caption("本次失败未完成交易所持仓复核。")
 
                         if _state in {"success", "failed", "error"}:
                             if st.button("清除测试进度", key=f"clear_test_task_{task_id}"):
@@ -2045,7 +2264,8 @@ elif page == "🔧 策略配置":
                                 st.session_state.pop("preview_test_order_task_id", None)
                                 st.rerun()
 
-                    _render_test_order_progress(_active_test_task_id)
+                    if _active_test_task_id is not None:
+                        _render_test_order_progress(str(_active_test_task_id))
 
                 # P&L summary
                 st.markdown("##### 💰 盈亏概要")
@@ -2095,43 +2315,43 @@ elif page == "🔧 策略配置":
                 st.markdown("##### 📈 到期盈亏曲线")
                 import numpy as _np
 
+                _max_loss_line: float | None = None
+
                 if not _is_ic:
-                    _price_lo = _sell_put.strike * 0.85
-                    _price_hi = _sell_call.strike * 1.15
+                    _price_lo = _sell_put_t.strike * 0.85
+                    _price_hi = _sell_call_t.strike * 1.15
                     _prices = _np.linspace(_price_lo, _price_hi, 500)
 
                     def _payoff(S):
-                        sc = -_np.maximum(S - _sell_call.strike, 0)
-                        sp = -_np.maximum(_sell_put.strike - S, 0)
+                        sc = -_np.maximum(S - _sell_call_t.strike, 0)
+                        sp = -_np.maximum(_sell_put_t.strike - S, 0)
                         return (sc + sp + _premium_per) * _pv_qty
 
                     _pnl = _payoff(_prices)
                     _chart_title = f"{_pv_mode_label} 到期盈亏  |  {_pv_ul} Spot=${_pv_spot:,.0f}  |  Qty={_pv_qty:.0f}"
                     _strike_lines = [
-                        (_sell_put.strike,  f"Short Put ${_sell_put.strike:,.0f}",  "red"),
-                        (_sell_call.strike, f"Short Call ${_sell_call.strike:,.0f}", "red"),
+                        (_sell_put_t.strike,  f"Short Put ${_sell_put_t.strike:,.0f}",  "red"),
+                        (_sell_call_t.strike, f"Short Call ${_sell_call_t.strike:,.0f}", "red"),
                     ]
-                    # No max loss line for strangle (unlimited)
-                    _max_loss_line = None
                 else:
-                    _price_lo = _buy_put.strike * 0.92
-                    _price_hi = _buy_call.strike * 1.08
+                    _price_lo = _buy_put_t.strike * 0.92
+                    _price_hi = _buy_call_t.strike * 1.08
                     _prices = _np.linspace(_price_lo, _price_hi, 500)
 
                     def _payoff(S):
-                        sc = -_np.maximum(S - _sell_call.strike, 0)
-                        lc = _np.maximum(S - _buy_call.strike, 0)
-                        sp = -_np.maximum(_sell_put.strike - S, 0)
-                        lp = _np.maximum(_buy_put.strike - S, 0)
+                        sc = -_np.maximum(S - _sell_call_t.strike, 0)
+                        lc = _np.maximum(S - _buy_call_t.strike, 0)
+                        sp = -_np.maximum(_sell_put_t.strike - S, 0)
+                        lp = _np.maximum(_buy_put_t.strike - S, 0)
                         return (sc + lc + sp + lp + _premium_per) * _pv_qty
 
                     _pnl = _payoff(_prices)
                     _chart_title = f"{_pv_mode_label} 到期盈亏  |  {_pv_ul} Spot=${_pv_spot:,.0f}  |  Qty={_pv_qty:.0f}"
                     _strike_lines = [
-                        (_buy_put.strike,   f"Long Put ${_buy_put.strike:,.0f}",   "green"),
-                        (_sell_put.strike,  f"Short Put ${_sell_put.strike:,.0f}",  "red"),
-                        (_sell_call.strike, f"Short Call ${_sell_call.strike:,.0f}", "red"),
-                        (_buy_call.strike,  f"Long Call ${_buy_call.strike:,.0f}",  "green"),
+                        (_buy_put_t.strike,   f"Long Put ${_buy_put_t.strike:,.0f}",   "green"),
+                        (_sell_put_t.strike,  f"Short Put ${_sell_put_t.strike:,.0f}",  "red"),
+                        (_sell_call_t.strike, f"Short Call ${_sell_call_t.strike:,.0f}", "red"),
+                        (_buy_call_t.strike,  f"Long Call ${_buy_call_t.strike:,.0f}",  "green"),
                     ]
                     _max_loss_line = -_total_max_loss
 
@@ -2201,8 +2421,8 @@ elif page == "🔧 策略配置":
                             f"标的: {_pv_ul}  现货: ${_pv_spot:,.2f}\n"
                             f"{_mode_detail}\n"
                             f"───────────────────────────────\n"
-                            f"Short Put:  {_sell_put.symbol}  K=${_sell_put.strike:,.0f}\n"
-                            f"Short Call: {_sell_call.symbol}  K=${_sell_call.strike:,.0f}\n"
+                            f"Short Put:  {_sell_put_t.symbol}  K=${_sell_put_t.strike:,.0f}\n"
+                            f"Short Call: {_sell_call_t.symbol}  K=${_sell_call_t.strike:,.0f}\n"
                             f"───────────────────────────────\n"
                             f"数量: {_pv_qty:.2f} 张  (base={_base_qty}, compound={cfg.strategy.compound})\n"
                             f"权益: ${_pv_equity:,.2f}  max_capital: {cfg.strategy.max_capital_pct*100:.0f}%\n"
@@ -2226,10 +2446,10 @@ elif page == "🔧 策略配置":
                             f"标的: {_pv_ul}  现货: ${_pv_spot:,.2f}\n"
                             f"{_mode_detail}\n"
                             f"───────────────────────────────\n"
-                            f"Long Put:   {_buy_put.symbol}  K=${_buy_put.strike:,.0f}\n"
-                            f"Short Put:  {_sell_put.symbol}  K=${_sell_put.strike:,.0f}\n"
-                            f"Short Call: {_sell_call.symbol}  K=${_sell_call.strike:,.0f}\n"
-                            f"Long Call:  {_buy_call.symbol}  K=${_buy_call.strike:,.0f}\n"
+                            f"Long Put:   {_buy_put_t.symbol}  K=${_buy_put_t.strike:,.0f}\n"
+                            f"Short Put:  {_sell_put_t.symbol}  K=${_sell_put_t.strike:,.0f}\n"
+                            f"Short Call: {_sell_call_t.symbol}  K=${_sell_call_t.strike:,.0f}\n"
+                            f"Long Call:  {_buy_call_t.symbol}  K=${_buy_call_t.strike:,.0f}\n"
                             f"───────────────────────────────\n"
                             f"Put侧翼宽:  ${_put_width:,.0f}\n"
                             f"Call侧翼宽: ${_call_width:,.0f}\n"
@@ -2254,9 +2474,8 @@ elif page == "🔧 策略配置":
             else:
                 st.warning(f"⚠️ 目标合约不可用 ({_dte_label_str})")
     except Exception as _pv_ex:
-        st.error(f"下单预览失败: {_pv_ex}")
-        import traceback
-        st.code(traceback.format_exc())
+        _error_id = _log_exception_with_id("Order preview failed", _pv_ex, prefix="preview")
+        st.error(f"下单预览失败，请稍后重试。错误编号: {_error_id}")
 
     if not _pv_ok:
         st.info(f"💡 下单预览需要实时行情数据，请确保网络连通且有可匹配合约")
@@ -2378,6 +2597,83 @@ elif page == "🖥 引擎状态":
         env = "🧪 Testnet" if cfg.exchange.testnet else "🔴 Production"
         st.metric("API 环境", env)
 
+    strategy_status = es.get("strategy_status") or {}
+    if getattr(cfg.strategy, "mode", "") == "weekend_vol":
+        col9, col10, col11, col12 = st.columns(4)
+        with col9:
+            rv_now = strategy_status.get("entry_realized_vol_current")
+            st.metric(
+                "当前 RV24",
+                f"{rv_now:.2%}" if isinstance(rv_now, (int, float)) else "-",
+            )
+        with col10:
+            rv_cap = strategy_status.get("entry_realized_vol_max")
+            st.metric(
+                "RV 上限",
+                f"{rv_cap:.2f}" if isinstance(rv_cap, (int, float)) and rv_cap > 0 else "关闭",
+            )
+        with col11:
+            basket_pnl = strategy_status.get("basket_pnl_pct")
+            st.metric(
+                "篮子 PnL%",
+                f"{basket_pnl:.1f}%" if isinstance(basket_pnl, (int, float)) else "-",
+            )
+        with col12:
+            sl_pct = strategy_status.get("stop_loss_pct")
+            st.metric(
+                "止损线",
+                f"-{sl_pct:.0f}%" if isinstance(sl_pct, (int, float)) and sl_pct > 0 else "关闭",
+            )
+
+        _last_order_status = str(strategy_status.get("last_order_status") or "")
+        _last_order_message = str(strategy_status.get("last_order_message") or "")
+        _last_order_attempt_at = str(strategy_status.get("last_order_attempt_at") or "")
+        _last_order_group_id = str(strategy_status.get("last_order_group_id") or "")
+
+        if _last_order_status and _last_order_status != "idle":
+            st.subheader("🧾 最近一次实盘开仓结果")
+            _lc1, _lc2, _lc3, _lc4 = st.columns(4)
+            with _lc1:
+                st.metric("状态", _last_order_status)
+            with _lc2:
+                st.metric("尝试时间", _last_order_attempt_at or "-")
+            with _lc3:
+                st.metric("组合ID", _last_order_group_id or "-")
+            with _lc4:
+                st.metric("持仓复核", "已执行" if strategy_status.get("last_order_exchange_positions_checked") else "未执行")
+
+            if _last_order_status == "success":
+                st.success(_last_order_message or "最近一次实盘开仓成功")
+            elif _last_order_status in {"failed", "error"}:
+                st.error(_last_order_message or "最近一次实盘开仓失败")
+            else:
+                st.info(_last_order_message or "最近一次实盘开仓处理中")
+
+            if _last_order_status in {"failed", "error"}:
+                st.markdown("##### 🔎 实盘失败后交易所持仓复核")
+                _snapshot_underlying = str(strategy_status.get("last_order_exchange_positions_underlying") or "")
+                _snapshot_error = strategy_status.get("last_order_exchange_positions_error")
+                _snapshot_positions = strategy_status.get("last_order_exchange_positions") or []
+                if _snapshot_error:
+                    st.warning(f"持仓复核失败（{_snapshot_underlying or '-'}）：{_snapshot_error}")
+                elif _snapshot_positions:
+                    _snapshot_rows = [
+                        {
+                            "合约": p.get("symbol", ""),
+                            "方向": p.get("side", ""),
+                            "数量": float(p.get("quantity") or 0.0),
+                            "开仓价": f"${float(p.get('entryPrice') or 0.0):.4f}",
+                            "未实现PnL": f"${float(p.get('unrealizedPnl') or 0.0):.4f}",
+                        }
+                        for p in _snapshot_positions
+                    ]
+                    st.error(
+                        f"复核发现 {_snapshot_underlying} 仍有 {len(_snapshot_positions)} 条真实持仓，请立即核对是否存在残留仓位。"
+                    )
+                    st.dataframe(pd.DataFrame(_snapshot_rows), width="stretch", hide_index=True)
+                elif strategy_status.get("last_order_exchange_positions_checked"):
+                    st.success(f"复核完成：{_snapshot_underlying or cfg.strategy.underlying} 当前无真实持仓残留。")
+
     st.divider()
 
     # --- Error log ---
@@ -2430,7 +2726,7 @@ elif page == "🖥 引擎状态":
         run_info = {
             "配置项": [
                 "策略名", "模式", "标的", "短腿 |Δ|", "翼 |Δ|",
-                "杠杆", "开仓日/时间", "基础数量", "复利", "API环境",
+                "杠杆", "开仓日/时间", "RV过滤", "止损", "基础数量", "复利", "API环境",
             ],
             "值": [
                 cfg.name,
@@ -2440,6 +2736,18 @@ elif page == "🖥 引擎状态":
                 f"{getattr(cfg.strategy, 'wing_delta', 0.05):.0%}",
                 f"{getattr(cfg.strategy, 'leverage', 1.0):.1f}x",
                 f"{getattr(cfg.strategy, 'entry_day', 'friday')} {cfg.strategy.entry_time_utc} UTC",
+                (
+                    f"RV{getattr(cfg.strategy, 'entry_realized_vol_lookback_hours', 0)} <= "
+                    f"{getattr(cfg.strategy, 'entry_realized_vol_max', 0.0):.2f}"
+                    if getattr(cfg.strategy, 'entry_realized_vol_lookback_hours', 0) > 1
+                    and getattr(cfg.strategy, 'entry_realized_vol_max', 0.0) > 0
+                    else "关闭"
+                ),
+                (
+                    f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}%"
+                    if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0
+                    else "关闭"
+                ),
                 str(cfg.strategy.quantity),
                 "✅" if cfg.strategy.compound else "❌",
                 "测试网" if cfg.exchange.testnet else "正式环境",

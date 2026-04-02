@@ -3,7 +3,9 @@
 import requests
 import time
 
-TOKEN = "368ca0bd2ccf5620aa35c50f9a11a65943589b49"
+from cdd_secrets import get_cdd_api_token
+
+TOKEN = get_cdd_api_token()
 BASE = "https://api.cryptodatadownload.com/v1"
 s = requests.Session()
 s.headers["Authorization"] = f"Token {TOKEN}"

@@ -8,11 +8,19 @@ Type=simple
 User=trader
 Group=trader
 WorkingDirectory=/opt/project_Options
-ExecStart=/opt/project_Options/.venv/bin/python -m streamlit run trader/dashboard.py -- --config configs/trader/iron_condor_0dte.yaml
+Environment=TRADER_CONFIG_PATH=configs/trader/weekend_vol_btc.yaml
+EnvironmentFile=/opt/project_Options/deploy/trader-dashboard.env
+ExecStart=/opt/project_Options/.venv/bin/python -m streamlit run dashboard_app.py -- --config ${TRADER_CONFIG_PATH}
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/project_Options/data /opt/project_Options/logs /opt/project_Options/deploy
+UMask=0077
 
 Environment=PYTHONUNBUFFERED=1
 

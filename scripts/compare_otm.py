@@ -1,6 +1,5 @@
 """Compare OTM levels with full metrics."""
 import sys, time
-sys.path.insert(0, "src")
 
 # Suppress loguru DEBUG logs (major perf drain)
 from loguru import logger

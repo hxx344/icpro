@@ -1,6 +1,5 @@
 """Quick profiling: where is time spent in a single backtest run?"""
 import sys, time, cProfile, pstats, io
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

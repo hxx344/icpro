@@ -1,6 +1,6 @@
 """Position manager – 仓位管理.
 
-Tracks open iron condor positions, maps exchange positions to
+Tracks open multi-leg option positions, maps exchange positions to
 local trade records, and provides aggregated risk views.
 """
 
@@ -22,12 +22,12 @@ from trader.storage import Storage
 
 
 # ---------------------------------------------------------------------------
-# Iron Condor position model
+# Position model
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CondorLeg:
-    """Single leg of an iron condor."""
+    """Single option leg inside a grouped position."""
     symbol: str
     side: str              # "SELL" or "BUY"
     option_type: str       # "call" / "put"
@@ -40,13 +40,15 @@ class CondorLeg:
 
 @dataclass
 class IronCondorPosition:
-    """Complete iron condor position (4 legs).
+    """Multi-leg option position.
 
     Legs:
-      - sell_put:  short OTM put  (collect premium)
-      - buy_put:   long further OTM put  (protection)
-      - sell_call: short OTM call (collect premium)
-      - buy_call:  long further OTM call (protection)
+        - sell_put: short OTM put (collect premium)
+        - buy_put: long further OTM put (protection)
+        - sell_call: short OTM call (collect premium)
+        - buy_call: long further OTM call (protection)
+
+    For short strangle positions, `buy_put` and `buy_call` remain `None`.
     """
     group_id: str               # unique group identifier
     entry_time: datetime
@@ -187,16 +189,21 @@ class PositionManager:
         sell_put_strike: float,
         quantity: float,
         underlying_price: float,
+        execution_mode: str = "chaser",
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> IronCondorPosition | None:
-        """Open a naked short strangle via limit-order chaser (2 legs).
+        """Open a naked short strangle (2 legs).
 
         Returns the IronCondorPosition (with buy legs = None) if all legs
         fill, or None on failure.
         """
         group_id = f"SS_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+        execution_mode_norm = str(execution_mode or "chaser").strip().lower()
+        if execution_mode_norm not in {"chaser", "market"}:
+            raise ValueError(f"Unsupported execution_mode: {execution_mode}")
 
         logger.info(
-            f"Opening Short Strangle {group_id} (limit chaser): "
+            f"Opening Short Strangle {group_id} ({execution_mode_norm}): "
             f"sell_put={sell_put_strike} "
             f"sell_call={sell_call_strike} "
             f"qty={quantity} spot={underlying_price}"
@@ -216,11 +223,38 @@ class PositionManager:
         ]
         underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
 
-        try:
-            results = self.chaser.execute_legs(leg_orders, underlying=underlying)
-        except Exception as e:
-            logger.error(f"Short Strangle {group_id}: execute_legs exception: {e}")
-            return None
+        if status_callback is not None:
+            status_callback({
+                "event": "position_open_start",
+                "message": f"开始提交 Short Strangle {group_id}（{execution_mode_norm}）",
+                "group_id": group_id,
+                "execution_mode": execution_mode_norm,
+                "legs": [
+                    {"leg_role": leg.leg_role, "symbol": leg.symbol, "side": leg.side, "quantity": leg.quantity, "status": leg.status}
+                    for leg in leg_orders
+                ],
+                "total_legs": len(leg_orders),
+            })
+
+        if execution_mode_norm == "market":
+            results = self._execute_market_legs(
+                group_id=group_id,
+                leg_orders=leg_orders,
+                quantity=quantity,
+                status_callback=status_callback,
+            )
+            if results is None:
+                return None
+        else:
+            try:
+                results = self.chaser.execute_legs(
+                    leg_orders,
+                    underlying=underlying,
+                    status_callback=status_callback,
+                )
+            except Exception as e:
+                logger.error(f"Short Strangle {group_id}: execute_legs exception: {e}")
+                return None
 
         failed = [r for r in results if r.status != "FILLED"]
         if failed:
@@ -237,56 +271,138 @@ class PositionManager:
                 ))
                 for r in results if r.status == "FILLED"
             ]
-            self._rollback_legs(filled_results)
+            rollback_failures = self._rollback_legs(filled_results)
+            if status_callback is not None:
+                _rollback_msg = (
+                    "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
+                    + ", ".join(rollback_failures)
+                    if rollback_failures
+                    else "至少有一条腿未成交，已完成回滚"
+                )
+                status_callback({
+                    "event": "position_open_failed",
+                    "message": _rollback_msg,
+                    "group_id": group_id,
+                    "execution_mode": execution_mode_norm,
+                    "failed_legs": [r.leg_role for r in failed],
+                    "rollback_failed_legs": rollback_failures,
+                    "legs": [
+                        {
+                            "leg_role": r.leg_role,
+                            "symbol": r.symbol,
+                            "side": r.side,
+                            "quantity": r.quantity,
+                            "filled_qty": r.filled_qty,
+                            "status": r.status,
+                            "avg_price": r.avg_price,
+                        }
+                        for r in results
+                    ],
+                })
             return None
 
-        condor = IronCondorPosition(
-            group_id=group_id,
-            entry_time=datetime.now(timezone.utc),
-            underlying_price=underlying_price,
-        )
-
-        total_premium = 0.0
-        for leg_order in results:
-            leg_qty = leg_order.filled_qty or quantity
-            meta = {
-                "leg_role": leg_order.leg_role,
-                "option_type": leg_order.option_type,
-                "strike": leg_order.strike,
-                "underlying_price": underlying_price,
-                "group_id": group_id,
-            }
-            trade_id = self.storage.record_trade(
-                trade_group=group_id,
-                symbol=leg_order.symbol,
-                side=leg_order.side,
-                quantity=leg_qty,
-                price=leg_order.avg_price,
-                fee=leg_order.fee,
-                order_id=leg_order.order_id,
-                meta=meta,
+        try:
+            condor = IronCondorPosition(
+                group_id=group_id,
+                entry_time=datetime.now(timezone.utc),
+                underlying_price=underlying_price,
             )
 
-            leg = CondorLeg(
-                symbol=leg_order.symbol,
-                side=leg_order.side,
-                option_type=leg_order.option_type,
-                strike=leg_order.strike,
-                quantity=leg_qty,
-                entry_price=leg_order.avg_price,
-                trade_id=trade_id,
-                order_id=leg_order.order_id,
-            )
-            setattr(condor, leg_order.leg_role, leg)
-            total_premium += leg_order.avg_price * leg_qty
+            total_premium = 0.0
+            for leg_order in results:
+                leg_qty = leg_order.filled_qty or quantity
+                meta = {
+                    "leg_role": leg_order.leg_role,
+                    "option_type": leg_order.option_type,
+                    "strike": leg_order.strike,
+                    "underlying_price": underlying_price,
+                    "group_id": group_id,
+                }
+                trade_id = self.storage.record_trade(
+                    trade_group=group_id,
+                    symbol=leg_order.symbol,
+                    side=leg_order.side,
+                    quantity=leg_qty,
+                    price=leg_order.avg_price,
+                    fee=leg_order.fee,
+                    order_id=leg_order.order_id,
+                    meta=meta,
+                )
 
-        condor.total_premium = total_premium
-        self.open_condors[group_id] = condor
+                leg = CondorLeg(
+                    symbol=leg_order.symbol,
+                    side=leg_order.side,
+                    option_type=leg_order.option_type,
+                    strike=leg_order.strike,
+                    quantity=leg_qty,
+                    entry_price=leg_order.avg_price,
+                    trade_id=trade_id,
+                    order_id=leg_order.order_id,
+                )
+                setattr(condor, leg_order.leg_role, leg)
+                total_premium += leg_order.avg_price * leg_qty
+
+            condor.total_premium = total_premium
+            self.open_condors[group_id] = condor
+        except Exception as e:
+            logger.error(f"Short Strangle {group_id}: persistence failed after fills: {e}")
+            rollback_failures = self._rollback_legs([
+                (
+                    r.leg_role,
+                    OrderResult(
+                        order_id=r.order_id,
+                        symbol=r.symbol,
+                        side=r.side,
+                        quantity=r.filled_qty or quantity,
+                        price=r.avg_price,
+                        avg_price=r.avg_price,
+                        status="FILLED",
+                        fee=r.fee,
+                        raw={},
+                    ),
+                )
+                for r in results if (r.filled_qty or 0) > 0
+            ])
+            if status_callback is not None:
+                _msg = (
+                    f"成交后本地记账失败，且回滚失败，可能有残留仓位：{', '.join(rollback_failures)}"
+                    if rollback_failures
+                    else f"成交后本地记账失败，已尝试全部回滚：{e}"
+                )
+                status_callback({
+                    "event": "position_open_error",
+                    "message": _msg,
+                    "group_id": group_id,
+                    "execution_mode": execution_mode_norm,
+                    "rollback_failed_legs": rollback_failures,
+                })
+            return None
 
         logger.info(
-            f"Short Strangle {group_id} opened via limit chaser. "
+            f"Short Strangle {group_id} opened via {execution_mode_norm}. "
             f"Net premium: {total_premium:.4f} USD"
         )
+
+        if status_callback is not None:
+            status_callback({
+                "event": "position_open_success",
+                "message": f"Short Strangle {group_id} 已全部成交",
+                "group_id": group_id,
+                "execution_mode": execution_mode_norm,
+                "net_premium": total_premium,
+                "legs": [
+                    {
+                        "leg_role": r.leg_role,
+                        "symbol": r.symbol,
+                        "side": r.side,
+                        "quantity": r.quantity,
+                        "filled_qty": r.filled_qty,
+                        "status": r.status,
+                        "avg_price": r.avg_price,
+                    }
+                    for r in results
+                ],
+            })
 
         return condor
 
@@ -410,14 +526,20 @@ class PositionManager:
                 ))
                 for r in results if r.status == "FILLED"
             ]
-            self._rollback_legs(filled_results)
+            rollback_failures = self._rollback_legs(filled_results)
             if status_callback is not None:
                 status_callback({
                     "event": "position_open_failed",
-                    "message": "至少有一条腿未成交，已触发回滚",
+                    "message": (
+                        "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
+                        + ", ".join(rollback_failures)
+                        if rollback_failures
+                        else "至少有一条腿未成交，已完成回滚"
+                    ),
                     "group_id": group_id,
                     "execution_mode": execution_mode_norm,
                     "failed_legs": [r.leg_role for r in failed],
+                    "rollback_failed_legs": rollback_failures,
                     "legs": [
                         {
                             "leg_role": r.leg_role,
@@ -433,54 +555,88 @@ class PositionManager:
                 })
             return None
 
-        # All filled – build condor position
-        condor = IronCondorPosition(
-            group_id=group_id,
-            entry_time=datetime.now(timezone.utc),
-            underlying_price=underlying_price,
-        )
-
-        total_premium = 0.0
-
-        for leg_order in results:
-            leg_qty = leg_order.filled_qty or quantity
-            meta = {
-                "leg_role": leg_order.leg_role,
-                "option_type": leg_order.option_type,
-                "strike": leg_order.strike,
-                "underlying_price": underlying_price,
-                "group_id": group_id,
-            }
-            trade_id = self.storage.record_trade(
-                trade_group=group_id,
-                symbol=leg_order.symbol,
-                side=leg_order.side,
-                quantity=leg_qty,
-                price=leg_order.avg_price,
-                fee=leg_order.fee,
-                order_id=leg_order.order_id,
-                meta=meta,
+        try:
+            # All filled – build condor position
+            condor = IronCondorPosition(
+                group_id=group_id,
+                entry_time=datetime.now(timezone.utc),
+                underlying_price=underlying_price,
             )
 
-            leg = CondorLeg(
-                symbol=leg_order.symbol,
-                side=leg_order.side,
-                option_type=leg_order.option_type,
-                strike=leg_order.strike,
-                quantity=leg_qty,
-                entry_price=leg_order.avg_price,
-                trade_id=trade_id,
-                order_id=leg_order.order_id,
-            )
-            setattr(condor, leg_order.leg_role, leg)
+            total_premium = 0.0
 
-            if leg_order.side == "SELL":
-                total_premium += leg_order.avg_price * leg_qty
-            else:
-                total_premium -= leg_order.avg_price * leg_qty
+            for leg_order in results:
+                leg_qty = leg_order.filled_qty or quantity
+                meta = {
+                    "leg_role": leg_order.leg_role,
+                    "option_type": leg_order.option_type,
+                    "strike": leg_order.strike,
+                    "underlying_price": underlying_price,
+                    "group_id": group_id,
+                }
+                trade_id = self.storage.record_trade(
+                    trade_group=group_id,
+                    symbol=leg_order.symbol,
+                    side=leg_order.side,
+                    quantity=leg_qty,
+                    price=leg_order.avg_price,
+                    fee=leg_order.fee,
+                    order_id=leg_order.order_id,
+                    meta=meta,
+                )
 
-        condor.total_premium = total_premium
-        self.open_condors[group_id] = condor
+                leg = CondorLeg(
+                    symbol=leg_order.symbol,
+                    side=leg_order.side,
+                    option_type=leg_order.option_type,
+                    strike=leg_order.strike,
+                    quantity=leg_qty,
+                    entry_price=leg_order.avg_price,
+                    trade_id=trade_id,
+                    order_id=leg_order.order_id,
+                )
+                setattr(condor, leg_order.leg_role, leg)
+
+                if leg_order.side == "SELL":
+                    total_premium += leg_order.avg_price * leg_qty
+                else:
+                    total_premium -= leg_order.avg_price * leg_qty
+
+            condor.total_premium = total_premium
+            self.open_condors[group_id] = condor
+        except Exception as e:
+            logger.error(f"Iron Condor {group_id}: persistence failed after fills: {e}")
+            rollback_failures = self._rollback_legs([
+                (
+                    r.leg_role,
+                    OrderResult(
+                        order_id=r.order_id,
+                        symbol=r.symbol,
+                        side=r.side,
+                        quantity=r.filled_qty or quantity,
+                        price=r.avg_price,
+                        avg_price=r.avg_price,
+                        status="FILLED",
+                        fee=r.fee,
+                        raw={},
+                    ),
+                )
+                for r in results if (r.filled_qty or 0) > 0
+            ])
+            if status_callback is not None:
+                _msg = (
+                    f"成交后本地记账失败，且回滚失败，可能有残留仓位：{', '.join(rollback_failures)}"
+                    if rollback_failures
+                    else f"成交后本地记账失败，已尝试全部回滚：{e}"
+                )
+                status_callback({
+                    "event": "position_open_error",
+                    "message": _msg,
+                    "group_id": group_id,
+                    "execution_mode": execution_mode_norm,
+                    "rollback_failed_legs": rollback_failures,
+                })
+            return None
 
         logger.info(
             f"Iron Condor {group_id} opened via {execution_mode_norm}. "
@@ -510,14 +666,14 @@ class PositionManager:
 
         return condor
 
-    def _execute_market_iron_condor(
+    def _execute_market_legs(
         self,
         group_id: str,
         leg_orders: list[LegOrder],
         quantity: float,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[LegOrder] | None:
-        """Submit iron condor legs sequentially as market orders."""
+        """Submit option legs sequentially as market orders."""
         results: list[LegOrder] = []
         total_legs = len(leg_orders)
 
@@ -555,7 +711,7 @@ class PositionManager:
                     client_order_id=f"{leg_order.client_order_prefix}:mkt",
                 )
             except Exception as e:
-                logger.error(f"Iron Condor {group_id}: market order failed for {leg_order.leg_role}: {e}")
+                logger.error(f"Position {group_id}: market order failed for {leg_order.leg_role}: {e}")
                 rollback_fills = [
                     (leg.leg_role, OrderResult(
                         order_id=leg.order_id,
@@ -571,14 +727,21 @@ class PositionManager:
                     for leg in results if leg.filled_qty > 0
                 ]
                 if rollback_fills:
-                    self._rollback_legs(rollback_fills)
+                    rollback_failures = self._rollback_legs(rollback_fills)
+                else:
+                    rollback_failures = []
                 if status_callback is not None:
                     status_callback({
                         "event": "position_open_error",
-                        "message": f"市价单提交失败: {leg_order.leg_role} | {e}",
+                        "message": (
+                            f"市价单提交失败: {leg_order.leg_role} | {e}；且回滚失败：{', '.join(rollback_failures)}"
+                            if rollback_failures
+                            else f"市价单提交失败: {leg_order.leg_role} | {e}"
+                        ),
                         "group_id": group_id,
                         "execution_mode": "market",
                         "failed_leg": leg_order.leg_role,
+                        "rollback_failed_legs": rollback_failures,
                         "filled_legs": sum(1 for leg in results if leg.status == "FILLED"),
                         "total_legs": total_legs,
                         "fill_ratio": sum(1 for leg in results if leg.status == "FILLED") / total_legs,
@@ -633,12 +796,26 @@ class PositionManager:
 
         return results
 
+    def _execute_market_iron_condor(
+        self,
+        group_id: str,
+        leg_orders: list[LegOrder],
+        quantity: float,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[LegOrder] | None:
+        """Backward-compatible wrapper for iron condor market execution."""
+        return self._execute_market_legs(group_id, leg_orders, quantity, status_callback)
+
     def _rollback_legs(
         self,
         filled_legs: list[tuple[str, OrderResult]],
-    ) -> None:
-        """Attempt to close already-filled legs on partial failure."""
+    ) -> list[str]:
+        """Attempt to close already-filled legs on partial failure.
+
+        Returns the leg roles that failed to rollback.
+        """
         logger.warning(f"Rolling back {len(filled_legs)} filled leg(s)")
+        failed_rollbacks: list[str] = []
         for leg_role, result in filled_legs:
             try:
                 close_side = "SELL" if result.side == "BUY" else "BUY"
@@ -652,13 +829,15 @@ class PositionManager:
                 logger.info(f"Rolled back {leg_role}")
             except Exception as e:
                 logger.error(f"Failed to rollback {leg_role}: {e}")
+                failed_rollbacks.append(leg_role)
+        return failed_rollbacks
 
     # ------------------------------------------------------------------
     # Close an iron condor
     # ------------------------------------------------------------------
 
-    def close_iron_condor(self, group_id: str, reason: str = "") -> float:
-        """Close all legs of an iron condor via limit chaser.
+    def close_iron_condor(self, group_id: str, reason: str = "", execution_mode: str = "chaser") -> float:
+        """Close all legs of an iron condor.
 
         Returns total realized PnL.
         """
@@ -667,7 +846,13 @@ class PositionManager:
             logger.warning(f"Condor {group_id} not found or already closed")
             return 0.0
 
-        logger.info(f"Closing Iron Condor {group_id}, reason: {reason}")
+        execution_mode_norm = str(execution_mode or "chaser").strip().lower()
+        if execution_mode_norm not in {"chaser", "market"}:
+            raise ValueError(f"Unsupported close execution_mode: {execution_mode}")
+
+        logger.info(
+            f"Closing Iron Condor {group_id}, reason: {reason}, mode: {execution_mode_norm}"
+        )
 
         # Build close legs
         close_legs: list[LegOrder] = []
@@ -682,9 +867,33 @@ class PositionManager:
                 option_type=leg.option_type,
             ))
 
-        # Execute close via limit chaser
+        # Execute close via limit chaser or market orders
         underlying = self._infer_underlying(condor.legs[0].symbol) if condor.legs else "ETH"
-        results = self.chaser.execute_legs(close_legs, underlying=underlying)
+        if execution_mode_norm == "market":
+            results = []
+            for close_leg in close_legs:
+                try:
+                    order_result = self.client.place_order(
+                        symbol=close_leg.symbol,
+                        side=close_leg.side,
+                        quantity=close_leg.quantity,
+                        order_type="MARKET",
+                        reduce_only=True,
+                        client_order_id=f"{group_id}:{close_leg.leg_role}:mkt_close",
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to market-close {close_leg.symbol}: {e}")
+                    close_leg.status = "ERROR"
+                    close_leg.avg_price = 0.0
+                    close_leg.filled_qty = 0.0
+                else:
+                    close_leg.status = order_result.status or "FILLED"
+                    close_leg.avg_price = order_result.avg_price
+                    close_leg.filled_qty = order_result.quantity
+                    close_leg.fee = order_result.fee
+                results.append(close_leg)
+        else:
+            results = self.chaser.execute_legs(close_legs, underlying=underlying)
 
         total_pnl = 0.0
         for leg, close_result in zip(condor.legs, results):
@@ -726,11 +935,11 @@ class PositionManager:
 
         return total_pnl
 
-    def close_all(self, reason: str = "close_all") -> float:
+    def close_all(self, reason: str = "close_all", execution_mode: str = "chaser") -> float:
         """Close all open iron condors."""
         total = 0.0
         for gid in list(self.open_condors.keys()):
-            total += self.close_iron_condor(gid, reason=reason)
+            total += self.close_iron_condor(gid, reason=reason, execution_mode=execution_mode)
         return total
 
     # ------------------------------------------------------------------

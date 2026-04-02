@@ -1,6 +1,5 @@
 """Diagnostic: DTE=7 OTM=10% daily roll — analyze per-trade P&L and data sources."""
 import sys
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

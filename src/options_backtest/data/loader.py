@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from options_backtest.data.hourly_store import HourlyOptionStore, load_hourly_option_store
 from options_backtest.utils import to_utc_timestamp
 
 
@@ -256,6 +257,109 @@ class DataLoader:
         self._save_disk_cache(cache_key, result)
 
         return result
+
+    def load_hourly_option_store(
+        self,
+        underlying: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> HourlyOptionStore:
+        """Load the native monthly `options_hourly` dataset for one underlying."""
+        if not start_date or not end_date:
+            raise ValueError("start_date and end_date are required for options_hourly loading")
+        store = load_hourly_option_store(self.data_dir, underlying, start_date, end_date)
+        logger.info(
+            f"Loaded options_hourly store for {underlying}: {len(store.frame):,} rows, "
+            f"{len(store.available_timestamps('close')):,} close snapshots"
+        )
+        return store
+
+    @staticmethod
+    def align_underlying_to_hourly_store(
+        underlying_df: pd.DataFrame,
+        store: HourlyOptionStore,
+        pick: str = "close",
+    ) -> pd.DataFrame:
+        """Restrict underlying bars to hours that have option-chain snapshots."""
+        if underlying_df.empty:
+            return underlying_df
+        available_ts = store.available_timestamps(pick)
+        if len(available_ts) == 0:
+            return underlying_df.iloc[0:0].copy()
+        ts_ns = underlying_df["timestamp"].to_numpy(dtype="datetime64[ns]").astype("int64")
+        mask = pd.Series(np.isin(ts_ns, available_ts), index=underlying_df.index)
+        return underlying_df.loc[mask].reset_index(drop=True)
+
+    def build_option_chain_from_hourly(
+        self,
+        store: HourlyOptionStore,
+        timestamp: datetime,
+        underlying_price: float,
+        default_iv: float = 0.60,
+        max_dte: float = 90.0,
+        source_counter: dict | None = None,
+        pick: str = "close",
+    ) -> "ArrayChain":
+        """Build an option-chain snapshot directly from the native hourly dataset."""
+        _ = default_iv  # preserved for interface parity with build_option_chain()
+        snap = store.get_snapshot(timestamp, pick=pick)
+        if snap.empty:
+            return ArrayChain({}, 0)
+
+        ts = to_utc_timestamp(timestamp)
+        ts_ns = int(ts.value)
+        exp_ns = snap["expiration_date"].to_numpy(dtype="datetime64[ns]").astype("int64")
+        strikes = snap["strike_price"].astype(float).to_numpy()
+        dte_ns = exp_ns - ts_ns
+        dte_days = dte_ns / 86_400_000_000_000.0
+
+        ref_underlying = float(underlying_price) if underlying_price > 0 else float(
+            snap["underlying_price"].dropna().median() if snap["underlying_price"].notna().any() else 0.0
+        )
+
+        mask = (
+            (dte_ns > 0)
+            & (dte_days <= max_dte)
+            & (strikes >= ref_underlying * 0.3)
+            & (strikes <= ref_underlying * 3.0)
+        ) if ref_underlying > 0 else ((dte_ns > 0) & (dte_days <= max_dte))
+
+        if not np.any(mask):
+            return ArrayChain({}, 0)
+
+        chain_df = snap.loc[mask, :]
+        n = len(chain_df)
+        if source_counter is not None:
+            source_counter["market"] = source_counter.get("market", 0) + n
+            source_counter["synth"] = source_counter.get("synth", 0)
+
+        mark_arr = chain_df["mark_price"].astype(float).to_numpy()
+        bid_arr = chain_df["bid_price"].astype(float).to_numpy()
+        ask_arr = chain_df["ask_price"].astype(float).to_numpy()
+        underlying_arr = chain_df["underlying_price"].astype(float).to_numpy()
+        if ref_underlying > 0:
+            underlying_arr = np.where(np.isfinite(underlying_arr) & (underlying_arr > 0), underlying_arr, ref_underlying)
+
+        return ArrayChain({
+            "instrument_name": chain_df["instrument_name"].astype(str).to_numpy(),
+            "underlying_price": underlying_arr,
+            "strike_price": chain_df["strike_price"].astype(float).to_numpy(),
+            "option_type": chain_df["option_type"].astype(str).to_numpy(),
+            "expiration_date": chain_df["expiration_date"].to_numpy(),
+            "days_to_expiry": dte_days[mask].astype(float),
+            "mark_price": mark_arr,
+            "bid_price": bid_arr,
+            "ask_price": ask_arr,
+            "volume": chain_df["open_interest"].fillna(0.0).astype(float).to_numpy(),
+            "open_interest": chain_df["open_interest"].fillna(0.0).astype(float).to_numpy(),
+            "mark_iv": chain_df["mark_iv"].astype(float).to_numpy(),
+            "bid_iv": chain_df["bid_iv"].astype(float).to_numpy(),
+            "ask_iv": chain_df["ask_iv"].astype(float).to_numpy(),
+            "delta": chain_df["delta"].astype(float).to_numpy(),
+            "gamma": chain_df["gamma"].astype(float).to_numpy(),
+            "vega": chain_df["vega"].astype(float).to_numpy(),
+            "theta": chain_df["theta"].astype(float).to_numpy(),
+        }, n)
 
     # ------------------------------------------------------------------
     # Cache helpers

@@ -1,0 +1,46 @@
+# BTC Weekday 0DTE Long Strangle (双买策略) — Mon-Fri only
+# 每天 08:00 UTC 买入近ATM的 Call + Put, 利用日内大波动获利
+# 与卖方策略相反: 亏损有限(权利金), 盈利无上限
+backtest:
+  name: "BTC Weekday 0DTE Long Strangle (Mon-Fri)"
+  start_date: "2023-03-01"
+  end_date: "2026-01-31"
+  time_step: "1h"
+  underlying: "BTC"
+  margin_mode: "USD"
+  use_bs_only: false
+  option_data_source: "options_hourly"
+  option_snapshot_pick: "close"
+  iv_mode: "fixed"
+  fixed_iv: 0.60
+
+account:
+  initial_balance: 1.0
+
+execution:
+  slippage: 0.0001
+  taker_fee: 0.00024
+  maker_fee: 0.00024
+  min_fee: 0.00024
+  max_fee_pct: 0.10
+  delivery_fee: 0.00015
+  delivery_fee_max_pct: 0.10
+
+strategy:
+  name: "LongStrangle"
+  params:
+    quantity: 1.0
+    min_days_to_expiry: 0.0      # 0DTE: 当天/次日到期
+    max_days_to_expiry: 1.5      # 捕捉次日 08:00 到期的合约
+    roll_days_before_expiry: 0
+    otm_pct: 0.02                # 2% OTM (近ATM, 最大gamma)
+    entry_hour: 8                # 每日 08:00 UTC 开仓
+    roll_daily: true
+    compound: true
+    take_profit_pct: 100         # 组合价值翻倍时止盈 (锁定gamma利润)
+    stop_loss_pct: 0             # 不止损 (亏损已由权利金上限)
+    max_positions: 1
+    skip_weekends: true
+
+report:
+  output_dir: "./reports/weekday_0dte_long_btc"

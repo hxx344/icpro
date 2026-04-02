@@ -65,15 +65,25 @@ class Matcher:
     ) -> float:
         """Compute trading fee.
 
-        Coin margin (Deribit): fixed fee per contract (0.03% of underlying), capped.
-        USD margin (Binance): percentage of premium (taker_fee × premium × qty).
+        Deribit model (both margin modes):
+          fee_per_contract = taker_fee × underlying_price  (coin: taker_fee alone)
+          Capped at max_fee_pct × option_price.
+
+        Coin margin: prices in BTC → fee in BTC.
+        USD margin:  prices in USD → fee in USD.
         """
         if self._margin_usd:
-            # Binance: fee = taker_rate × premium × quantity
-            fee = self.cfg.taker_fee * price_btc * quantity
-            return max(fee, 0.0)
+            # Deribit-style fee expressed in USD:
+            #   base = taker_fee (BTC per contract) × underlying_price (USD/BTC)
+            fee_per_contract = self.cfg.taker_fee * underlying_price
+            fee_per_contract = max(fee_per_contract, self.cfg.min_fee * underlying_price)
+            # Cap: max_fee_pct of option premium (in USD)
+            cap = price_btc * self.cfg.max_fee_pct
+            if cap > 0:
+                fee_per_contract = min(fee_per_contract, cap)
+            return fee_per_contract * quantity
 
-        # Deribit: 0.03 % of underlying value (in BTC, underlying = 1 BTC per contract)
+        # Deribit coin margin: 0.03 % of underlying value (in BTC, underlying = 1 BTC per contract)
         fee_per_contract = self.cfg.taker_fee  # 0.0003 BTC
 
         # Floor

@@ -12,7 +12,6 @@ Dimensions:
   - TakeProfit%: None, 30%, 50%, 70%, 90%
 """
 import sys, os, time, itertools, json
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

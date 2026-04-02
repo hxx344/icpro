@@ -16,6 +16,10 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
     if not equity_history:
         return ""
 
+    margin_mode = str(results.get("margin_mode", "coin") or "coin").upper()
+    underlying = str(results.get("underlying", "BTC") or "BTC")
+    is_usd_margin = margin_mode == "USD"
+
     # Support both 4-column (legacy) and 5-column (with underlying_price) history
     sample = equity_history[0]
     if len(sample) >= 5:
@@ -29,11 +33,16 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
     running_max = np.maximum.accumulate(df["equity"].values)
     drawdown = (df["equity"].values - running_max) / np.where(running_max > 0, running_max, 1)
 
-    # Check if we have USD data
-    has_usd = df["underlying_price"].iloc[0] > 0
-    n_rows = 3 if has_usd else 2
-    row_heights = [0.45, 0.25, 0.30] if has_usd else [0.7, 0.3]
-    subtitles = ("Equity Curve (BTC)", "Equity Curve (USD)", "Drawdown (BTC)") if has_usd else ("Equity Curve (BTC)", "Drawdown")
+    # For coin margin, show both coin equity and USD translations.
+    # For USD margin, the primary equity series is already USD and should not
+    # be labelled as BTC or duplicated in a second USD panel.
+    has_usd_panel = (not is_usd_margin) and (df["underlying_price"].iloc[0] > 0)
+    n_rows = 3 if has_usd_panel else 2
+    row_heights = [0.45, 0.25, 0.30] if has_usd_panel else [0.7, 0.3]
+    if is_usd_margin:
+        subtitles = ("Equity Curve (USD)", "Drawdown")
+    else:
+        subtitles = ("Equity Curve ({})".format(underlying), "Equity Curve (USD)", "Drawdown ({})".format(underlying)) if has_usd_panel else ("Equity Curve ({})".format(underlying), "Drawdown")
 
     fig = make_subplots(
         rows=n_rows, cols=1, shared_xaxes=True,
@@ -59,7 +68,7 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
     )
 
     # USD equity curve
-    if has_usd:
+    if has_usd_panel:
         usd_equity = df["equity"].values * df["underlying_price"].values
         eq_vals = df["equity"].values.astype(float)
         price_vals = df["underlying_price"].values.astype(float)
@@ -105,11 +114,11 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
         fig.update_yaxes(title_text="USD", row=2, col=1)
 
     # Drawdown
-    dd_row = 3 if has_usd else 2
+    dd_row = 3 if has_usd_panel else 2
     fig.add_trace(
         go.Scatter(
             x=df["timestamp"], y=drawdown,
-            name="Drawdown (BTC)", fill="tozeroy",
+            name=f"Drawdown ({'USD' if is_usd_margin else underlying})", fill="tozeroy",
             line=dict(color="#F44336", width=1),
             fillcolor="rgba(244, 67, 54, 0.3)",
         ),
@@ -118,11 +127,11 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
 
     fig.update_layout(
         title="Backtest: Equity & Drawdown",
-        height=750 if has_usd else 600,
+        height=750 if has_usd_panel else 600,
         template="plotly_white",
         legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
     )
-    fig.update_yaxes(title_text="BTC", row=1, col=1)
+    fig.update_yaxes(title_text=("USD" if is_usd_margin else underlying), row=1, col=1)
     fig.update_yaxes(title_text="DD %", tickformat=".1%", row=dd_row, col=1)
 
     out_dir = Path(output_dir)
@@ -138,6 +147,10 @@ def plot_trade_pnl(results: dict, output_dir: str = "reports") -> str:
     if not trades:
         return ""
 
+    margin_mode = str(results.get("margin_mode", "coin") or "coin").upper()
+    underlying = str(results.get("underlying", "BTC") or "BTC")
+    pnl_unit = "USD" if margin_mode == "USD" else underlying
+
     df = pd.DataFrame(trades)
     colors = ["#4CAF50" if p > 0 else "#F44336" for p in df["pnl"]]
 
@@ -150,9 +163,9 @@ def plot_trade_pnl(results: dict, output_dir: str = "reports") -> str:
     ))
 
     fig.update_layout(
-        title="Per‑Trade PnL (BTC)",
+        title=f"Per‑Trade PnL ({pnl_unit})",
         xaxis_title="Trade #",
-        yaxis_title="PnL (BTC)",
+        yaxis_title=f"PnL ({pnl_unit})",
         template="plotly_white",
         height=400,
     )

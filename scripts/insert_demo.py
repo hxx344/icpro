@@ -1,8 +1,6 @@
 """Insert demo data for dashboard testing."""
 import sys, random, json
 from datetime import datetime, timezone, timedelta
-
-sys.path.insert(0, ".")
 from trader.config import load_config
 from trader.storage import Storage
 

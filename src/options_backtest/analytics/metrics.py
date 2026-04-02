@@ -211,27 +211,60 @@ def compute_metrics(results: dict) -> dict:
 
 def print_metrics(metrics: dict) -> None:
     """Pretty‑print metrics to the console."""
-    coin = metrics.get("underlying", "BTC")
+    unit = metrics.get("currency", metrics.get("underlying", "BTC"))
+    is_usd = unit == "USD"
+
+    def _fmt_amount(value: float) -> str:
+        if is_usd:
+            return f"${value:,.2f}"
+        return f"{value:.6f} {unit}"
+
     print("\n" + "=" * 50)
     print("  BACKTEST RESULTS")
     print("=" * 50)
     fmt = [
-        ("Initial Balance",  f"{metrics.get('initial_balance', 0):.4f} {coin}"),
-        ("Final Equity",     f"{metrics.get('final_equity', 0):.4f} {coin}"),
+        ("Initial Balance",  _fmt_amount(metrics.get('initial_balance', 0))),
+        ("Final Equity",     _fmt_amount(metrics.get('final_equity', 0))),
         ("Total Return",     f"{metrics.get('total_return', 0):.2%}"),
         ("Annualised Return", f"{metrics.get('annualized_return', 0):.2%}"),
         ("Max Drawdown",     f"{metrics.get('max_drawdown', 0):.2%}"),
         ("Sharpe Ratio",     f"{metrics.get('sharpe_ratio', 0):.2f}"),
         ("Total Trades",     f"{metrics.get('total_trades', 0)}"),
         ("Win Rate",         f"{metrics.get('win_rate', 0):.2%}"),
-        ("Avg Win",          f"{metrics.get('avg_win', 0):.6f} {coin}"),
-        ("Avg Loss",         f"{metrics.get('avg_loss', 0):.6f} {coin}"),
+        ("Avg Win",          _fmt_amount(metrics.get('avg_win', 0))),
+        ("Avg Loss",         _fmt_amount(metrics.get('avg_loss', 0))),
         ("Profit Factor",    f"{metrics.get('profit_factor', 0):.2f}"),
-        ("Total Fees",       f"{metrics.get('total_fees', 0):.6f} {coin}"),
+        ("Total Fees",       _fmt_amount(metrics.get('total_fees', 0))),
         ("Backtest Days",    f"{metrics.get('backtest_days', 0):.0f}"),
     ]
     for label, value in fmt:
         print(f"  {label:<22s} {value}")
+
+    if is_usd:
+        ds = metrics.get("data_source", {})
+        if ds:
+            print("-" * 50)
+            print("  DATA SOURCE")
+            print("-" * 50)
+
+            mark_total = ds.get("mark_total", 0)
+            mark_mkt = ds.get("mark_market", 0)
+            mark_syn = ds.get("mark_synth", 0)
+            quote_total = ds.get("quote_total", 0)
+            quote_mkt = ds.get("quote_market", 0)
+            quote_syn = ds.get("quote_synth", 0)
+            chain_total = ds.get("chain_total", 0)
+            chain_mkt = ds.get("chain_market", 0)
+            chain_syn = ds.get("chain_synth", 0)
+
+            def _pct(n, total):
+                return f"{n/total:.1%}" if total > 0 else "N/A"
+
+            print(f"  {'Mark Pricing':<22s} Market: {mark_mkt}  B-S: {mark_syn}  ({_pct(mark_mkt, mark_total)} real)")
+            print(f"  {'Order Quotes':<22s} Market: {quote_mkt}  B-S: {quote_syn}  ({_pct(quote_mkt, quote_total)} real)")
+            print(f"  {'Chain Entries':<22s} Market: {chain_mkt}  B-S: {chain_syn}  ({_pct(chain_mkt, chain_total)} real)")
+        print("=" * 50)
+        return
 
     # USD metrics (spot tracking)
     initial_usd = metrics.get("initial_usd", 0)

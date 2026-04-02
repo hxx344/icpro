@@ -1,6 +1,5 @@
 """0DTE Naked Short Call — OTM% grid comparison."""
 import sys, time
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

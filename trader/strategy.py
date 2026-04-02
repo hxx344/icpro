@@ -446,7 +446,7 @@ IronCondor0DTEStrategy = OptionSellingStrategy
 # ======================================================================
 
 class WeekendVolStrategy:
-    """Weekend volatility selling iron condor on Binance.
+    """Weekend volatility selling strategy on Binance.
 
     Strategy logic (mirrors backtest_weekend_vol.py):
     ─────────────────────────────────────────────────
@@ -455,22 +455,24 @@ class WeekendVolStrategy:
        b. Compute Black-76 delta for each strike using mark_iv or default_iv
        c. Select short call: closest strike to |delta| = target_delta
        d. Select short put:  closest strike to |delta| = target_delta
-       e. Select wing call:  closest strike to |delta| = wing_delta (protection)
-       f. Select wing put:   closest strike to |delta| = wing_delta (protection)
+         e. Select wing call: closest strike to |delta| = wing_delta (optional protection)
+         f. Select wing put: closest strike to |delta| = wing_delta (optional protection)
        g. Compute quantity:  (balance × leverage) / spot, compounding
-       h. Execute 4-leg iron condor via PositionManager
+         h. Execute short strangle / iron condor via PositionManager
 
-    2. **Hold to settlement** – no early close.
-       Options auto-settle at expiry; the strategy records
-       settlement PnL once the position expires.
+     2. During holding period:
+         a. Monitor basket PnL using option mark prices
+         b. If basket PnL% <= -stop_loss_pct, close all legs early
+         c. Otherwise hold to settlement
 
     Parameters (from StrategyConfig):
     ──────────────────────────────────
     - target_delta : 0.40 (|δ| for short legs)
     - wing_delta   : 0.05 (|δ| for protection legs, 0 → strangle)
-    - leverage     : 3.0
+    - max_delta_diff : 0.20 (actual |δ| vs target |δ| max deviation)
+    - leverage     : 4.0
     - entry_day    : "friday"
-    - entry_time_utc : "16:00"
+    - entry_time_utc : "18:00"
     - underlying   : "BTC"
     - compound     : True
     """
@@ -496,6 +498,14 @@ class WeekendVolStrategy:
         self._last_trade_week: str = self.storage.load_state(
             "wv_last_trade_week", ""
         )
+        self._last_order_attempt_at: str = ""
+        self._last_order_status: str = "idle"
+        self._last_order_message: str = ""
+        self._last_order_group_id: str = ""
+        self._last_order_exchange_positions_checked: bool = False
+        self._last_order_exchange_positions_underlying: str = ""
+        self._last_order_exchange_positions: list[dict[str, Any]] = []
+        self._last_order_exchange_positions_error: str = ""
 
     # ------------------------------------------------------------------
     # Main entry: called periodically by engine / main loop
@@ -508,7 +518,10 @@ class WeekendVolStrategy:
         # 1. Check settlement of open positions
         self._check_settlement(now)
 
-        # 2. Check if it's time to open a new position
+        # 2. Check live stop management
+        self._manage_open_positions(now)
+
+        # 3. Check if it's time to open a new position
         if self._should_enter(now):
             self._try_open_iron_condor(now)
 
@@ -562,13 +575,18 @@ class WeekendVolStrategy:
         return True
 
     # ------------------------------------------------------------------
-    # Core: open iron condor via delta-based strike selection
+    # Core: open weekend volatility position via delta-based strike selection
     # ------------------------------------------------------------------
 
     def _try_open_iron_condor(self, now: datetime) -> None:
-        """Fetch option chain, select strikes by delta, execute IC."""
+        """Fetch option chain, select strikes by delta, execute combo position."""
         ul = self.cfg.underlying.upper()
-        logger.info(f"[WeekendVol] Scanning {ul} weekend options for iron condor...")
+        self._mark_order_attempt("opening", f"开始扫描 {ul} 周末合约")
+        logger.info(f"[WeekendVol] Scanning {ul} weekend options for target combo...")
+
+        rv24 = self._get_entry_realized_vol(ul)
+        if not self._passes_entry_rv_filter(rv24):
+            return
 
         # --- Get tickers ---
         try:
@@ -681,18 +699,26 @@ class WeekendVolStrategy:
                 f"  Qty: {quantity:.3f}  Leverage: {self.cfg.leverage}x  "
                 f"T={T_years*365.25:.1f}d"
             )
-            condor = self.pos_mgr.open_iron_condor(
-                sell_call_symbol=sell_call.symbol,
-                buy_call_symbol=buy_call.symbol,
-                sell_put_symbol=sell_put.symbol,
-                buy_put_symbol=buy_put.symbol,
-                sell_call_strike=sell_call.strike,
-                buy_call_strike=buy_call.strike,
-                sell_put_strike=sell_put.strike,
-                buy_put_strike=buy_put.strike,
-                quantity=quantity,
-                underlying_price=spot,
-            )
+            try:
+                condor = self.pos_mgr.open_iron_condor(
+                    sell_call_symbol=sell_call.symbol,
+                    buy_call_symbol=buy_call.symbol,
+                    sell_put_symbol=sell_put.symbol,
+                    buy_put_symbol=buy_put.symbol,
+                    sell_call_strike=sell_call.strike,
+                    buy_call_strike=buy_call.strike,
+                    sell_put_strike=sell_put.strike,
+                    buy_put_strike=buy_put.strike,
+                    quantity=quantity,
+                    underlying_price=spot,
+                )
+            except Exception as e:
+                self._record_live_order_failure(
+                    underlying=ul,
+                    message=f"实盘开仓异常: {e}",
+                    status="error",
+                )
+                raise
         else:
             # No wings → short strangle
             logger.info(
@@ -702,24 +728,168 @@ class WeekendVolStrategy:
                 f"  Qty: {quantity:.3f}  Leverage: {self.cfg.leverage}x  "
                 f"T={T_years*365.25:.1f}d"
             )
-            condor = self.pos_mgr.open_short_strangle(
-                sell_call_symbol=sell_call.symbol,
-                sell_put_symbol=sell_put.symbol,
-                sell_call_strike=sell_call.strike,
-                sell_put_strike=sell_put.strike,
-                quantity=quantity,
-                underlying_price=spot,
-            )
+            try:
+                condor = self.pos_mgr.open_short_strangle(
+                    sell_call_symbol=sell_call.symbol,
+                    sell_put_symbol=sell_put.symbol,
+                    sell_call_strike=sell_call.strike,
+                    sell_put_strike=sell_put.strike,
+                    quantity=quantity,
+                    underlying_price=spot,
+                )
+            except Exception as e:
+                self._record_live_order_failure(
+                    underlying=ul,
+                    message=f"实盘开仓异常: {e}",
+                    status="error",
+                )
+                raise
 
         if condor:
             self._last_trade_week = week_id
             self.storage.save_state("wv_last_trade_week", week_id)
+            self._mark_order_success(
+                group_id=condor.group_id,
+                message=f"实盘开仓成功: {condor.group_id}",
+            )
             logger.info(
                 f"[WeekendVol] Position opened: {condor.group_id} "
                 f"premium={condor.total_premium:.6f}"
             )
         else:
+            self._record_live_order_failure(
+                underlying=ul,
+                message="实盘开仓失败：至少有一条腿未成交，或成交后本地记账失败",
+                status="failed",
+            )
             logger.error("[WeekendVol] Failed to open position")
+
+    def _mark_order_attempt(self, status: str, message: str, group_id: str = "") -> None:
+        self._last_order_attempt_at = datetime.now(timezone.utc).isoformat()
+        self._last_order_status = status
+        self._last_order_message = message
+        self._last_order_group_id = group_id
+        self._last_order_exchange_positions_checked = False
+        self._last_order_exchange_positions_underlying = ""
+        self._last_order_exchange_positions = []
+        self._last_order_exchange_positions_error = ""
+
+    def _mark_order_success(self, group_id: str, message: str) -> None:
+        self._last_order_attempt_at = datetime.now(timezone.utc).isoformat()
+        self._last_order_status = "success"
+        self._last_order_message = message
+        self._last_order_group_id = group_id
+        self._last_order_exchange_positions_checked = False
+        self._last_order_exchange_positions_underlying = ""
+        self._last_order_exchange_positions = []
+        self._last_order_exchange_positions_error = ""
+
+    def _record_live_order_failure(self, underlying: str, message: str, status: str) -> None:
+        self._last_order_attempt_at = datetime.now(timezone.utc).isoformat()
+        self._last_order_status = status
+        self._last_order_message = message
+        self._last_order_group_id = ""
+        self._last_order_exchange_positions_checked = True
+        self._last_order_exchange_positions_underlying = underlying.upper()
+        try:
+            positions = self.client.get_positions(underlying.upper())
+            self._last_order_exchange_positions = positions
+            self._last_order_exchange_positions_error = ""
+            if positions:
+                logger.error(
+                    f"[WeekendVol] Post-failure exchange position check found {len(positions)} live position(s): "
+                    f"{[p.get('symbol') for p in positions]}"
+                )
+            else:
+                logger.info(f"[WeekendVol] Post-failure exchange position check: no live {underlying.upper()} positions")
+        except Exception as e:
+            self._last_order_exchange_positions = []
+            self._last_order_exchange_positions_error = str(e)
+            logger.error(f"[WeekendVol] Post-failure exchange position check failed: {e}")
+
+    def _manage_open_positions(self, now: datetime) -> None:
+        if self.pos_mgr.open_position_count <= 0 or self.cfg.stop_loss_pct <= 0:
+            return
+
+        try:
+            mark_prices = self.client.get_mark_prices(self.cfg.underlying.upper())
+            basket_pnl_pct = self._basket_pnl_pct(mark_prices)
+        except Exception as e:
+            logger.warning(f"[WeekendVol] Failed to evaluate live stop: {e}")
+            return
+
+        if basket_pnl_pct is None:
+            return
+
+        if basket_pnl_pct <= -float(self.cfg.stop_loss_pct):
+            logger.warning(
+                f"[WeekendVol] Stop loss triggered: basket pnl {basket_pnl_pct:.1f}% "
+                f"<= -{self.cfg.stop_loss_pct:.1f}%"
+            )
+            self.pos_mgr.close_all(
+                reason=f"weekend_vol_stop_loss_{self.cfg.stop_loss_pct:.0f}",
+                execution_mode="market",
+            )
+
+    def _get_entry_realized_vol(self, underlying: str) -> float | None:
+        if self.cfg.entry_realized_vol_lookback_hours <= 1 or self.cfg.entry_realized_vol_max <= 0:
+            return None
+        return self._compute_realized_vol(underlying, log_result=True)
+
+    def _compute_realized_vol(self, underlying: str, log_result: bool = False) -> float | None:
+        try:
+            rv = self.client.get_realized_vol(underlying, self.cfg.entry_realized_vol_lookback_hours)
+        except Exception as e:
+            logger.warning(f"[WeekendVol] Failed to compute RV filter input: {e}")
+            return None
+        if rv is not None and log_result:
+            logger.info(
+                f"[WeekendVol] RV{self.cfg.entry_realized_vol_lookback_hours} = {rv:.2%}"
+            )
+        return rv
+
+    def _passes_entry_rv_filter(self, realized_vol: float | None) -> bool:
+        if self.cfg.entry_realized_vol_lookback_hours <= 1 or self.cfg.entry_realized_vol_max <= 0:
+            return True
+        if realized_vol is None:
+            logger.warning("[WeekendVol] RV filter enabled but realized vol unavailable – skipping entry")
+            return False
+        if realized_vol > self.cfg.entry_realized_vol_max:
+            logger.info(
+                f"[WeekendVol] Skip entry: RV{self.cfg.entry_realized_vol_lookback_hours} "
+                f"{realized_vol:.2%} > {self.cfg.entry_realized_vol_max:.2%}"
+            )
+            return False
+        return True
+
+    def _basket_pnl_pct(self, mark_prices: dict[str, float]) -> float | None:
+        entry_credit = 0.0
+        close_cost = 0.0
+
+        for condor in self.pos_mgr.open_condors.values():
+            if not condor.is_open:
+                continue
+            for leg in condor.legs:
+                sign = 1.0 if leg.side == "SELL" else -1.0
+                mark = float(mark_prices.get(leg.symbol, leg.entry_price) or leg.entry_price)
+                entry_credit += float(leg.entry_price) * float(leg.quantity) * sign
+                close_cost += mark * float(leg.quantity) * sign
+
+        if entry_credit <= 0:
+            return None
+
+        pnl = entry_credit - close_cost
+        return pnl / entry_credit * 100.0
+
+    def _current_basket_pnl_pct(self) -> float | None:
+        if self.pos_mgr.open_position_count <= 0:
+            return None
+        try:
+            mark_prices = self.client.get_mark_prices(self.cfg.underlying.upper())
+        except Exception as e:
+            logger.warning(f"[WeekendVol] Failed to fetch mark prices for status: {e}")
+            return None
+        return self._basket_pnl_pct(mark_prices)
 
     # ------------------------------------------------------------------
     # Delta-based strike selection
@@ -769,10 +939,23 @@ class WeekendVolStrategy:
 
         if best:
             source = "exchange" if used_exchange else "Black-76"
+            if best_diff > self.cfg.max_delta_diff:
+                if used_exchange:
+                    logger.warning(
+                        f"[WeekendVol] Reject {option_type} strike {best.symbol}: "
+                        f"|δ|={best_delta:.4f} target={target_abs_delta:.4f} "
+                        f"diff={best_diff:.4f} > max_delta_diff={self.cfg.max_delta_diff:.4f}"
+                    )
+                    return None
+                logger.warning(
+                    f"[WeekendVol] Accepting closest {option_type} strike via Black-76 fallback: "
+                    f"{best.symbol} |δ|={best_delta:.4f} target={target_abs_delta:.4f} "
+                    f"diff={best_diff:.4f} > max_delta_diff={self.cfg.max_delta_diff:.4f}"
+                )
             logger.info(
                 f"[WeekendVol] {option_type} strike selection: "
                 f"K={best.strike} |δ|={best_delta:.4f} "
-                f"(target={target_abs_delta}) source={source} "
+                f"(target={target_abs_delta}, diff={best_diff:.4f}) source={source} "
                 f"IV={best.mark_iv:.1%} {best.symbol}"
             )
 
@@ -893,15 +1076,31 @@ class WeekendVolStrategy:
 
     def status(self) -> dict:
         """Return current strategy status."""
+        rv24 = self._compute_realized_vol(self.cfg.underlying.upper(), log_result=False)
+        basket_pnl_pct = self._current_basket_pnl_pct()
         return {
             "strategy": "WeekendVol",
             "mode": "weekend_vol",
             "underlying": self.cfg.underlying,
             "target_delta": self.cfg.target_delta,
             "wing_delta": self.cfg.wing_delta,
+            "max_delta_diff": self.cfg.max_delta_diff,
             "leverage": self.cfg.leverage,
             "entry_day": self.cfg.entry_day,
             "entry_time_utc": self.cfg.entry_time_utc,
+            "entry_realized_vol_lookback_hours": self.cfg.entry_realized_vol_lookback_hours,
+            "entry_realized_vol_max": self.cfg.entry_realized_vol_max,
+            "entry_realized_vol_current": rv24,
+            "stop_loss_pct": self.cfg.stop_loss_pct,
+            "basket_pnl_pct": basket_pnl_pct,
+            "last_order_attempt_at": self._last_order_attempt_at,
+            "last_order_status": self._last_order_status,
+            "last_order_message": self._last_order_message,
+            "last_order_group_id": self._last_order_group_id,
+            "last_order_exchange_positions_checked": self._last_order_exchange_positions_checked,
+            "last_order_exchange_positions_underlying": self._last_order_exchange_positions_underlying,
+            "last_order_exchange_positions": self._last_order_exchange_positions,
+            "last_order_exchange_positions_error": self._last_order_exchange_positions_error,
             "last_trade_week": self._last_trade_week,
             "open_positions": self.pos_mgr.open_position_count,
             "max_positions": self.cfg.max_positions,

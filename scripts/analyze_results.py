@@ -1,8 +1,5 @@
 """Quick script to re-run the backtest and output detailed analysis."""
 
-import sys
-sys.path.insert(0, "src")
-
 from pathlib import Path
 from options_backtest.config import Config
 from options_backtest.engine.backtest import BacktestEngine

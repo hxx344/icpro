@@ -26,7 +26,6 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
-sys.path.insert(0, "src")
 from options_backtest.data.fetcher import parse_instrument_name
 
 # ── Config ─────────────────────────────────────────────────────────────

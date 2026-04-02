@@ -30,8 +30,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# Add src to path so we can import the pricing module
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from options_backtest.pricing.black76 import call_price, put_price, delta as bs_delta
 
 

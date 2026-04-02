@@ -1,7 +1,5 @@
 """Analyze optimal K2 strike for Call Spread CC."""
-import sys
-sys.path.insert(0, "monitor")
-from exchanges import fetch_deribit
+from monitor.exchanges import fetch_deribit
 
 q = fetch_deribit("ETH")
 spot = [x for x in q if x.bid_usd > 0][0].underlying_price

@@ -64,15 +64,20 @@ def _load_env_file(env_path: Path) -> bool:
 
 
 def _auto_load_dotenv(config_path: Path | None) -> None:
-    """Try loading .env from common project locations."""
+    """Load .env from a single controlled location.
+
+    Precedence:
+    1. `PROJECT_OPTIONS_ENV_FILE` if explicitly provided
+    2. project-root `.env`
+    """
+    explicit_env = os.environ.get("PROJECT_OPTIONS_ENV_FILE", "").strip()
     candidates: list[Path] = []
 
-    if config_path is not None:
-        candidates.append(config_path.parent / ".env")
-        candidates.append(config_path.parent.parent / ".env")
-
-    candidates.append(Path.cwd() / ".env")
-    candidates.append(Path(__file__).resolve().parent.parent / ".env")
+    if explicit_env:
+        candidates.append(Path(explicit_env))
+    else:
+        project_root = Path(__file__).resolve().parent.parent
+        candidates.append(project_root / ".env")
 
     seen: set[str] = set()
     for p in candidates:
@@ -127,10 +132,14 @@ class StrategyConfig:
 
     # --- Delta-based strike selection (weekend_vol) ---
     target_delta: float = 0.40           # |delta| for short legs
-    wing_delta: float = 0.05            # |delta| for protection legs (0 = no wings)
+    wing_delta: float = 0.05             # |delta| for protection legs (0 = no wings)
+    max_delta_diff: float = 0.20         # max allowed |actual_delta-target_delta|
     leverage: float = 1.0                # notional leverage multiplier
     entry_day: str = "friday"            # day of week to enter (lowercase)
     default_iv: float = 0.60             # fallback IV if mark_iv unavailable
+    entry_realized_vol_lookback_hours: int = 0  # realized vol lookback in hours (0=off)
+    entry_realized_vol_max: float = 0.0   # max allowed annualized RV for entry (0=off)
+    stop_loss_pct: float = 0.0            # close all when basket pnl% <= -stop_loss_pct
 
     # --- Common ---
     entry_time_utc: str = "08:00"         # entry at HH:MM UTC
@@ -161,11 +170,12 @@ class MonitorConfig:
 
 @dataclass
 class ChaserConfig:
-    """Limit-order chaser settings."""
+    """Spread-gated market execution settings."""
     window_seconds: int = 1800          # 30 minutes total window
     poll_interval_sec: int = 60         # check / amend every 60 seconds
     tick_size_usdt: float = 5.0         # min price increment in USD
     market_fallback_sec: int = 60       # switch to market order last N seconds
+    market_trigger_spread_ticks: int = 1  # trigger market when all legs spread <= N ticks
     max_amend_attempts: int = 180       # safety cap on re-pricing loops
 
 
@@ -212,6 +222,8 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("strategy.target_delta must be within (0, 0.95]")
     if not (0 <= cfg.strategy.wing_delta <= 0.95):
         raise ValueError("strategy.wing_delta must be within [0, 0.95]")
+    if not (0 <= cfg.strategy.max_delta_diff <= 0.95):
+        raise ValueError("strategy.max_delta_diff must be within [0, 0.95]")
     if cfg.strategy.leverage <= 0:
         raise ValueError("strategy.leverage must be > 0")
     if cfg.strategy.quantity <= 0:
@@ -222,6 +234,14 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("strategy.max_capital_pct must be within (0, 1]")
     if cfg.strategy.default_iv <= 0:
         raise ValueError("strategy.default_iv must be > 0")
+    if cfg.strategy.entry_realized_vol_lookback_hours < 0:
+        raise ValueError("strategy.entry_realized_vol_lookback_hours must be >= 0")
+    if cfg.strategy.entry_realized_vol_lookback_hours == 1:
+        raise ValueError("strategy.entry_realized_vol_lookback_hours must be 0 or >= 2")
+    if cfg.strategy.entry_realized_vol_max < 0:
+        raise ValueError("strategy.entry_realized_vol_max must be >= 0")
+    if cfg.strategy.stop_loss_pct < 0:
+        raise ValueError("strategy.stop_loss_pct must be >= 0")
     if cfg.strategy.target_dte_days < 0:
         raise ValueError("strategy.target_dte_days must be >= 0")
     if cfg.strategy.dte_window_hours <= 0:
@@ -246,6 +266,8 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("chaser.market_fallback_sec must be >= 0")
     if cfg.chaser.market_fallback_sec >= cfg.chaser.window_seconds:
         raise ValueError("chaser.market_fallback_sec must be smaller than window_seconds")
+    if cfg.chaser.market_trigger_spread_ticks < 1:
+        raise ValueError("chaser.market_trigger_spread_ticks must be >= 1")
     if cfg.chaser.max_amend_attempts < 1:
         raise ValueError("chaser.max_amend_attempts must be >= 1")
 

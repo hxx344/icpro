@@ -1,6 +1,5 @@
 ﻿"""BTC ATM DTE 0-2 Grid."""
 import sys, time
-sys.path.insert(0, "src")
 from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="WARNING")

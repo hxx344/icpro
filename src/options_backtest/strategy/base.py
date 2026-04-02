@@ -51,4 +51,4 @@ class BaseStrategy:
     # ------------------------------------------------------------------
 
     def log(self, msg: str) -> None:
-        logger.info(f"[{self.name}] {msg}")
+        logger.debug(f"[{self.name}] {msg}")

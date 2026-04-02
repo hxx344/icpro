@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -145,7 +146,7 @@ class BinanceOptionsClient:
 
     @staticmethod
     def _has_api_error(data: Any) -> bool:
-        return isinstance(data, dict) and data.get("code") and int(data["code"]) < 0
+        return bool(isinstance(data, dict) and data.get("code") and int(data["code"]) < 0)
 
     def _is_retryable_get_error(self, exc: Exception) -> bool:
         if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
@@ -292,9 +293,91 @@ class BinanceOptionsClient:
     def get_spot_price(self, underlying: str = "ETH") -> float:
         try:
             data = self._public_get("/eapi/v1/index", {"underlying": f"{underlying.upper()}USDT"})
+            if not isinstance(data, dict):
+                return 0.0
             return float(data.get("indexPrice", 0.0))
         except Exception:
             return 0.0
+
+    def _get_external_json(self, url: str, params: dict[str, Any]) -> Any:
+        resp = self.session.get(url, params=params, timeout=self.cfg.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        if self._has_api_error(data):
+            raise RuntimeError(f"Binance error {data['code']}: {data.get('msg', '')}")
+        return data
+
+    def get_hourly_index_prices(self, underlying: str = "ETH", limit: int = 25) -> list[tuple[datetime, float]]:
+        limit = max(int(limit), 3)
+        ul = underlying.upper()
+        candidates = [
+            (
+                "https://fapi.binance.com/fapi/v1/indexPriceKlines",
+                {"pair": f"{ul}USDT", "interval": "1h", "limit": limit},
+            ),
+            (
+                "https://dapi.binance.com/dapi/v1/indexPriceKlines",
+                {"pair": f"{ul}USD", "interval": "1h", "limit": limit},
+            ),
+            (
+                "https://api.binance.com/api/v3/klines",
+                {"symbol": f"{ul}USDT", "interval": "1h", "limit": limit},
+            ),
+        ]
+
+        for url, params in candidates:
+            try:
+                result = self._get_external_json(url, params)
+            except Exception as e:
+                logger.warning(f"Failed to fetch hourly prices from {url}: {self._format_http_error(e)}")
+                continue
+
+            if not isinstance(result, list):
+                continue
+
+            prices: list[tuple[datetime, float]] = []
+            for row in result:
+                if not isinstance(row, list) or len(row) < 5:
+                    continue
+                try:
+                    ts = datetime.fromtimestamp(float(row[0]) / 1000.0, tz=timezone.utc)
+                    close = float(row[4])
+                except Exception:
+                    continue
+                if close > 0 and math.isfinite(close):
+                    prices.append((ts, close))
+            if len(prices) >= 3:
+                return prices
+
+        return []
+
+    def get_realized_vol(self, underlying: str = "ETH", lookback_hours: int = 24) -> float | None:
+        if lookback_hours < 2:
+            return None
+        window = self.get_hourly_index_prices(underlying, limit=lookback_hours + 1)
+        if len(window) < 3:
+            return None
+
+        prices = [px for _, px in window if px > 0 and math.isfinite(px)]
+        if len(prices) < 3:
+            return None
+
+        log_returns: list[float] = []
+        for prev, curr in zip(prices[:-1], prices[1:]):
+            if prev <= 0 or curr <= 0:
+                continue
+            try:
+                log_returns.append(math.log(curr / prev))
+            except Exception:
+                continue
+        if len(log_returns) < 2:
+            return None
+
+        mean = sum(log_returns) / len(log_returns)
+        var = sum((x - mean) ** 2 for x in log_returns) / (len(log_returns) - 1)
+        if var < 0 or not math.isfinite(var):
+            return None
+        return math.sqrt(var) * math.sqrt(24.0 * 365.25)
 
     def get_tickers(self, underlying: str = "ETH") -> list[OptionTicker]:
         try:

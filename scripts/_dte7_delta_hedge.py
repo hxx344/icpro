@@ -11,7 +11,6 @@ with delta hedge overlay injected into the main loop.
 from __future__ import annotations
 
 import sys, math
-sys.path.insert(0, "src")
 
 import numpy as np
 import pandas as pd

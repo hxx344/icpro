@@ -4,7 +4,6 @@ Runs each OTM level twice: once naked (hedge_otm=0) and once with the
 best-performing wing (2%) from the grid search.
 """
 import sys, time
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

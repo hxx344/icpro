@@ -26,15 +26,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Ensure trader package is importable
-# ---------------------------------------------------------------------------
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-
 from trader.config import (
     ExchangeConfig,
     StrategyConfig,

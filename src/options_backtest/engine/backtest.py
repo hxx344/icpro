@@ -16,6 +16,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from options_backtest.config import Config
+from options_backtest.data.hourly_store import HourlyOptionStore
 from options_backtest.data.loader import DataLoader, ArrayChain
 from options_backtest.engine.account import Account
 from options_backtest.engine.matcher import Matcher
@@ -130,12 +131,34 @@ class StrategyContext:
         pos = self.positions.get(instrument_name)
         if pos is None:
             return
+        self.close_partial(instrument_name, quantity=pos.quantity)
+
+    def close_partial(self, instrument_name: str, quantity: float | None = None, fraction: float | None = None) -> None:
+        """Close part of an existing position by quantity or fraction."""
+        pos = self.positions.get(instrument_name)
+        if pos is None:
+            return
+
+        close_qty = 0.0
+        if quantity is not None:
+            close_qty = float(quantity)
+        elif fraction is not None:
+            close_qty = float(pos.quantity) * float(fraction)
+        else:
+            close_qty = float(pos.quantity)
+
+        if not np.isfinite(close_qty) or close_qty <= 0:
+            return
+        close_qty = min(float(pos.quantity), close_qty)
+        if close_qty <= 0:
+            return
+
         from options_backtest.data.models import Direction, OrderRequest
         close_dir = Direction.SHORT if pos.direction.value == "long" else Direction.LONG
         order = OrderRequest(
             instrument_name=instrument_name,
             direction=close_dir,
-            quantity=pos.quantity,
+            quantity=close_qty,
         )
         self._engine._pending_orders.append(order)
 
@@ -170,7 +193,9 @@ class BacktestEngine:
         self._instruments_df: pd.DataFrame = pd.DataFrame()
         self._underlying_df: pd.DataFrame = pd.DataFrame()
         self._option_data: dict[str, pd.DataFrame] = {}
+        self._options_hourly_store: HourlyOptionStore | None = None
         self._settlements_df: pd.DataFrame = pd.DataFrame()
+        self._option_data_source: str = "market_data"
 
         # Pre-indexed data for fast lookups (built in _load_data)
         self._ohlcv_index: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -249,7 +274,7 @@ class BacktestEngine:
         ts_pd_all = pd.DatetimeIndex(ts_values).tz_localize("UTC")
 
         # 4. Iterate
-        for i in tqdm(range(n_steps), desc="Backtesting"):
+        for i in tqdm(range(n_steps), desc="Backtesting", disable=not cfg.show_progress):
             ts_np = ts_values[i]               # numpy datetime64
             open_price = float(open_values[i])
             close_price = float(close_values[i])
@@ -315,16 +340,51 @@ class BacktestEngine:
         res_map = {"1m": "1", "5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "1D"}
         resolution = res_map.get(step, "1D")
         use_bs_only = self.config.backtest.use_bs_only
+        requested_source = str(getattr(self.config.backtest, "option_data_source", "auto") or "auto").lower()
+        snapshot_pick = str(getattr(self.config.backtest, "option_snapshot_pick", "close") or "close").lower()
+        if snapshot_pick not in {"open", "close"}:
+            snapshot_pick = "close"
 
         self._instruments_df = self.loader.load_instruments(underlying)
         self._underlying_df = self.loader.load_underlying(underlying, resolution, start, end)
+        self._options_hourly_store = None
         if use_bs_only:
             self._option_data = {}
+            self._option_data_source = "bs_only"
             logger.info("BS-only mode enabled: skip option OHLCV loading")
         else:
-            self._option_data = self.loader.load_all_option_data(
-                self._instruments_df, start, end, resolution=resolution,
-            )
+            use_hourly_store = False
+            if resolution == "60":
+                if requested_source == "options_hourly":
+                    use_hourly_store = True
+                elif requested_source == "auto":
+                    hourly_root = self.loader.data_dir / "options_hourly" / str(underlying).upper()
+                    use_hourly_store = hourly_root.exists()
+
+            if use_hourly_store:
+                start_bound = str(self._underlying_df["timestamp"].min()) if not self._underlying_df.empty else start
+                end_bound = str(self._underlying_df["timestamp"].max()) if not self._underlying_df.empty else end
+                self._options_hourly_store = self.loader.load_hourly_option_store(
+                    underlying,
+                    start_bound,
+                    end_bound,
+                )
+                self._underlying_df = self.loader.align_underlying_to_hourly_store(
+                    self._underlying_df,
+                    self._options_hourly_store,
+                    pick=snapshot_pick,
+                )
+                self._option_data = {}
+                self._option_data_source = "options_hourly"
+                logger.info(
+                    f"Option data source: options_hourly ({snapshot_pick} snapshots, "
+                    f"{len(self._underlying_df)} aligned bars)"
+                )
+            else:
+                self._option_data = self.loader.load_all_option_data(
+                    self._instruments_df, start, end, resolution=resolution,
+                )
+                self._option_data_source = "market_data"
         if self.config.backtest.iv_mode == "surface":
             if use_bs_only:
                 logger.warning("IV surface mode requested but BS-only is enabled; fallback to fixed IV")
@@ -369,41 +429,42 @@ class BacktestEngine:
         # --- Pre-build OHLCV index: numpy arrays for O(log n) searchsorted ---
         self._ohlcv_index = {}
         self._ohlcv_arith = {}       # O(1) arithmetic index for regular grids
-        _HOUR_NS = 3600 * 1_000_000_000
-        for name, df in self._option_data.items():
-            ts_arr = np.asarray(df["timestamp"].values)  # sorted datetime64
-            open_arr = (np.asarray(df["open"].values, dtype=np.float64)
-                        if "open" in df.columns else np.asarray(df["close"].values, dtype=np.float64))
-            close_arr = np.asarray(df["close"].values, dtype=np.float64)
-            low_arr = (np.asarray(df["low"].values, dtype=np.float64)
-                       if "low" in df.columns else close_arr.copy())
-            high_arr = (np.asarray(df["high"].values, dtype=np.float64)
-                        if "high" in df.columns else close_arr.copy())
-            vol_arr = (np.asarray(df["volume"].values, dtype=np.float64)
-                       if "volume" in df.columns else np.zeros(len(df), dtype=np.float64))
-            self._ohlcv_index[name] = (ts_arr, open_arr, close_arr, low_arr, high_arr, vol_arr)
+        if self._option_data_source != "options_hourly":
+            _HOUR_NS = 3600 * 1_000_000_000
+            for name, df in self._option_data.items():
+                ts_arr = np.asarray(df["timestamp"].values)  # sorted datetime64
+                open_arr = (np.asarray(df["open"].values, dtype=np.float64)
+                            if "open" in df.columns else np.asarray(df["close"].values, dtype=np.float64))
+                close_arr = np.asarray(df["close"].values, dtype=np.float64)
+                low_arr = (np.asarray(df["low"].values, dtype=np.float64)
+                           if "low" in df.columns else close_arr.copy())
+                high_arr = (np.asarray(df["high"].values, dtype=np.float64)
+                            if "high" in df.columns else close_arr.copy())
+                vol_arr = (np.asarray(df["volume"].values, dtype=np.float64)
+                           if "volume" in df.columns else np.zeros(len(df), dtype=np.float64))
+                self._ohlcv_index[name] = (ts_arr, open_arr, close_arr, low_arr, high_arr, vol_arr)
 
-            # Build O(1) arithmetic index for regularly-spaced (hourly) grids
-            n_rows = len(ts_arr)
-            if n_rows >= 2:
-                ts_ns = ts_arr.view("int64")  # zero-copy view
-                start_ns = int(ts_ns[0])
-                step_ns = int(ts_ns[1] - ts_ns[0])
-                if step_ns > 0:
-                    # Check regularity: all steps should equal step_ns
-                    expected_end_ns = start_ns + step_ns * (n_rows - 1)
-                    if int(ts_ns[-1]) == expected_end_ns:
-                        # Regular grid → O(1) index
-                        self._ohlcv_arith[name] = (
-                            start_ns, step_ns, n_rows,
-                            open_arr, close_arr, low_arr, high_arr, vol_arr,
-                        )
-            elif n_rows == 1:
-                ts_ns = ts_arr.view("int64")  # zero-copy view
-                self._ohlcv_arith[name] = (
-                    int(ts_ns[0]), _HOUR_NS, 1,
-                    open_arr, close_arr, low_arr, high_arr, vol_arr,
-                )
+                # Build O(1) arithmetic index for regularly-spaced (hourly) grids
+                n_rows = len(ts_arr)
+                if n_rows >= 2:
+                    ts_ns = ts_arr.view("int64")  # zero-copy view
+                    start_ns = int(ts_ns[0])
+                    step_ns = int(ts_ns[1] - ts_ns[0])
+                    if step_ns > 0:
+                        # Check regularity: all steps should equal step_ns
+                        expected_end_ns = start_ns + step_ns * (n_rows - 1)
+                        if int(ts_ns[-1]) == expected_end_ns:
+                            # Regular grid → O(1) index
+                            self._ohlcv_arith[name] = (
+                                start_ns, step_ns, n_rows,
+                                open_arr, close_arr, low_arr, high_arr, vol_arr,
+                            )
+                elif n_rows == 1:
+                    ts_ns = ts_arr.view("int64")  # zero-copy view
+                    self._ohlcv_arith[name] = (
+                        int(ts_ns[0]), _HOUR_NS, 1,
+                        open_arr, close_arr, low_arr, high_arr, vol_arr,
+                    )
 
         # --- Pre-build instrument dict for O(1) lookup (fast vectorised) ---
         records = self._instruments_df.to_dict(orient="records")
@@ -440,6 +501,17 @@ class BacktestEngine:
         # unless the strategy actually accesses context.option_chain
         def _lazy_chain():
             sc = {"market": 0, "synth": 0}
+            if self._option_data_source == "options_hourly" and self._options_hourly_store is not None:
+                result = self.loader.build_option_chain_from_hourly(
+                    self._options_hourly_store,
+                    timestamp,
+                    underlying_price,
+                    source_counter=sc,
+                    pick=str(getattr(self.config.backtest, "option_snapshot_pick", "close") or "close").lower(),
+                )
+                self._chain_source_market += sc["market"]
+                self._chain_source_synth += sc["synth"]
+                return result
             result = self.loader.build_option_chain(
                 self._instruments_df, self._option_data, timestamp, underlying_price,
                 ohlcv_index=self._ohlcv_index,
@@ -482,6 +554,14 @@ class BacktestEngine:
         _ts_ns_val = int(np.datetime64(ts_np, 'ns').view('int64')) if not isinstance(ts_np, (int, np.integer)) else int(ts_np)
 
         for name in self.position_mgr.positions:
+            if self._option_data_source == "options_hourly" and self._options_hourly_store is not None:
+                _, _, mark = self._options_hourly_store.get_quote(name, ts_np, pick="close")
+                if mark is not None and mark > 0:
+                    self._mark_source_market += 1
+                    self._update_iv_observation(name, ts_np, mark if not margin_usd else mark / max(underlying_price, 1e-12), underlying_price)
+                    marks[name] = mark * underlying_price if margin_usd else mark
+                    continue
+
             # Try O(1) arithmetic index first (regular hourly grids)
             if use_market_data:
                 arith = ohlcv_arith.get(name)
@@ -574,6 +654,17 @@ class BacktestEngine:
         Returns prices in coin or USD depending on margin_mode.
         """
         margin_usd = self._margin_usd
+        if self._option_data_source == "options_hourly" and self._options_hourly_store is not None:
+            pick = "open" if price_field == "open" else "close"
+            bid, ask, mark = self._options_hourly_store.get_quote(instrument_name, ts_np, pick=pick)
+            if mark is not None and mark > 0:
+                self._quote_source_market += 1
+                self._update_iv_observation(instrument_name, ts_np, mark, underlying_price)
+                if margin_usd:
+                    bid = bid * underlying_price if bid is not None else None
+                    ask = ask * underlying_price if ask is not None else None
+                    mark = mark * underlying_price
+                return bid, ask, mark
         if not self.config.backtest.use_bs_only:
             # O(1) arithmetic index for regular grids
             arith = self._ohlcv_arith.get(instrument_name)

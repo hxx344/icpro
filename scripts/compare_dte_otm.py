@@ -4,7 +4,6 @@ Runs a matrix of (dte, otm_pct) combinations for naked short strangle
 and prints a compact summary heatmap with key metrics.
 """
 import sys, time, itertools, json
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

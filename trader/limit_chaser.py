@@ -1,22 +1,11 @@
-"""Limit-order chaser – 限价追单引擎.
+"""Spread-gated market execution engine.
 
-Manages limit orders that gradually drift toward market price over a
-configurable time window to maximise fill probability while minimising
-slippage.
+Within a configurable time window, the engine only watches quotes.
+If at any poll all target legs have bid/ask spread within the configured
+tick threshold, it immediately sends market orders for all pending legs.
 
-Strategy:
-  - SELL legs: start at (ask - tick), drift toward bid over time
-  - BUY  legs: start at (bid + tick), drift toward ask over time
-  - At deadline: switch to market order to guarantee fill
-
-Time-based price interpolation:
-  elapsed_ratio = elapsed / window_seconds        (0.0 → 1.0)
-  aggression    = elapsed_ratio ^ 2               (slow start, fast finish)
-
-  SELL: price = ask - tick × (1 - aggression) × spread_ticks
-        i.e. starts near ask, ends at bid
-  BUY:  price = bid + tick × (1 - aggression) × spread_ticks
-        i.e. starts near bid, ends at ask
+If that condition never occurs before the deadline, it still submits
+market orders for all remaining legs at the end of the time window.
 """
 
 from __future__ import annotations
@@ -71,6 +60,7 @@ class ChaserConfig:
     poll_interval_sec: int = 60         # check / amend every 60 seconds
     tick_size_usdt: float = 5.0         # min price increment in USD
     market_fallback_sec: int = 60       # switch to market order last N seconds
+    market_trigger_spread_ticks: int = 1  # trigger market when all legs spread <= N ticks
     max_amend_attempts: int = 180       # safety cap on re-pricing loops
 
 
@@ -79,7 +69,7 @@ class ChaserConfig:
 # ---------------------------------------------------------------------------
 
 class LimitChaser:
-    """Execute multi-leg limit orders with time-based price drift.
+    """Execute multi-leg orders with spread-gated market submission.
 
     Usage:
         chaser = LimitChaser(client, config)
@@ -261,10 +251,14 @@ class LimitChaser:
         underlying: str = "ETH",
         status_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> list[LegOrder]:
-        """Execute all legs concurrently with adaptive limit orders.
+        """Execute all legs with initial passive orders + chase fallback.
 
-        Legs are processed in parallel: all limits placed simultaneously,
-        then a polling loop amends unfilled orders until all fill or timeout.
+        The engine first places an initial passive limit order for each leg.
+        Any legs that are not filled are then monitored until either:
+        - all pending legs have sufficiently tight spreads, then market-like
+          fallback orders are sent in one burst; or
+        - the deadline is reached, then all remaining legs are force-finished
+          via the market fallback path.
 
         Parameters
         ----------
@@ -287,22 +281,23 @@ class LimitChaser:
             status_callback,
             "started",
             legs,
-            message=f"开始追单，共 {len(legs)} 条腿",
+            message=f"开始监控盘口，共 {len(legs)} 条腿",
             elapsed_sec=0.0,
             remaining_sec=self.cfg.window_seconds,
         )
 
-        # Phase 1: Place initial limit orders for all legs
+        # Submit initial passive orders first. In simulated/test environments,
+        # these often fill immediately and should not wait for the full chase window.
         self._place_initial_orders(legs, underlying, status_callback=status_callback)
 
-        # Phase 2: Poll + amend loop
+        # Poll quotes until trigger condition or deadline.
         self._chase_loop(legs, underlying, t0, status_callback=status_callback)
 
         self._emit_progress(
             status_callback,
             "finished",
             legs,
-            message="追单结束",
+            message="下单监控结束",
             elapsed_sec=max(time.monotonic() - t0, 0.0),
             remaining_sec=0.0,
         )
@@ -364,110 +359,156 @@ class LimitChaser:
         t0: float,
         status_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> None:
-        """Poll unfilled orders and amend prices until all fill or timeout."""
+        """Poll quotes until all pending legs are market-ready or timeout."""
         deadline = t0 + self.cfg.window_seconds
-        market_time = t0 + self.cfg.window_seconds - self.cfg.market_fallback_sec
         iteration = 0
 
         while True:
             iteration += 1
-            # Check if all legs are done
             pending = [l for l in legs if l.status not in ("FILLED", "FAILED")]
             if not pending:
-                logger.info("[Chaser] All legs filled")
+                logger.info("[Chaser] All legs completed")
                 break
 
             now = time.monotonic()
             elapsed = now - t0
-
-            # Past deadline – should not happen but safety check
-            if now > deadline + 5:
-                logger.warning("[Chaser] Past deadline, forcing market fills")
-                for leg in pending:
-                    self._cancel_and_market(leg)
-                self._emit_progress(
-                    status_callback,
-                    "deadline_forced_market",
-                    legs,
-                    message="超过追单截止时间，强制进入兜底成交",
-                    elapsed_sec=elapsed,
-                    remaining_sec=max(deadline - now, 0.0),
-                    iteration=iteration,
-                )
-                break
-
-            # Check order statuses
-            for leg in pending:
-                self._check_fill(leg)
+            quotes = self._get_quotes(pending, underlying=underlying)
+            ready, not_ready = self._all_pending_spreads_ready(pending, quotes)
 
             self._emit_progress(
                 status_callback,
                 "poll",
                 legs,
-                message=f"第 {iteration} 轮检查：{sum(1 for leg in legs if leg.status == 'FILLED')}/{len(legs)} 条腿已成交",
+                message=(
+                    f"第 {iteration} 轮盘口检查："
+                    f"{'全部腿满足一档 spread' if ready else '等待全部腿 spread 收敛'}"
+                ),
                 elapsed_sec=elapsed,
                 remaining_sec=max(deadline - now, 0.0),
                 iteration=iteration,
+                ready_symbols=[] if ready else not_ready,
             )
 
-            # Re-check pending after status updates
-            pending = [l for l in legs if l.status not in ("FILLED", "FAILED")]
-            if not pending:
-                break
-
-            # Market fallback zone: last N seconds
-            if now >= market_time:
-                logger.info(
-                    f"[Chaser] Entering market fallback zone "
-                    f"({self.cfg.market_fallback_sec}s remaining)"
-                )
-                for leg in pending:
-                    self._cancel_and_market(leg)
+            if ready:
+                logger.info("[Chaser] All pending legs reached trigger spread, sending market orders")
                 self._emit_progress(
                     status_callback,
-                    "market_fallback_zone",
+                    "spread_triggered_market",
                     legs,
-                    message=f"进入最后 {self.cfg.market_fallback_sec} 秒兜底成交区间",
+                    message="全部目标腿盘口仅差一档，开始同时发送市价单",
                     elapsed_sec=elapsed,
                     remaining_sec=max(deadline - now, 0.0),
                     iteration=iteration,
                 )
+                self._execute_market_batch(pending, status_callback=status_callback)
                 break
 
-            # Amend prices based on elapsed time
-            elapsed_ratio = min(elapsed / (self.cfg.window_seconds - self.cfg.market_fallback_sec), 1.0)
-            quotes = self._get_quotes(pending)
+            if now >= deadline:
+                logger.warning("[Chaser] Spread trigger not met before deadline, forcing market orders")
+                self._emit_progress(
+                    status_callback,
+                    "deadline_market",
+                    legs,
+                    message="时间窗口结束，开始市价下所有目标腿",
+                    elapsed_sec=elapsed,
+                    remaining_sec=0.0,
+                    iteration=iteration,
+                    ready_symbols=not_ready,
+                )
+                self._execute_market_batch(pending, status_callback=status_callback)
+                break
 
-            for leg in pending:
-                if leg.status == "FILLED":
-                    continue
-                if leg.attempts >= self.cfg.max_amend_attempts:
-                    logger.warning(f"[Chaser] Max attempts for {leg.symbol}, market fill")
-                    self._cancel_and_market(leg)
-                    continue
+            time.sleep(self.cfg.poll_interval_sec)
 
-                q = quotes.get(leg.symbol)
-                if not q or q.bid_price <= 0 or q.ask_price <= 0:
-                    continue
+    def _all_pending_spreads_ready(
+        self,
+        legs: list[LegOrder],
+        quotes: dict[str, OptionTicker],
+    ) -> tuple[bool, list[str]]:
+        """Return whether all pending legs have sufficiently tight spreads."""
+        max_spread = self.cfg.tick_size_usdt * self.cfg.market_trigger_spread_ticks
+        not_ready: list[str] = []
 
-                new_price = self._compute_limit_price(leg, q, elapsed_ratio)
+        for leg in legs:
+            quote = quotes.get(leg.symbol)
+            if quote is None or quote.bid_price <= 0 or quote.ask_price <= 0:
+                not_ready.append(leg.symbol)
+                continue
+            if (quote.ask_price - quote.bid_price) > (max_spread + 1e-9):
+                not_ready.append(leg.symbol)
 
-                # Only amend if price changed meaningfully
-                if abs(new_price - leg.current_price) >= self.cfg.tick_size_usdt * 0.5:
-                    self._cancel_and_replace(leg, new_price)
+        return len(not_ready) == 0, not_ready
+
+    def _execute_market_batch(
+        self,
+        legs: list[LegOrder],
+        status_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> None:
+        """Submit market orders for all pending legs in a tight loop."""
+        total_legs = len(legs)
+
+        for idx, leg in enumerate(legs, start=1):
+            remaining_qty = self._remaining_qty(leg)
+            if remaining_qty <= 1e-9:
+                self._mark_filled_if_done(leg)
+                continue
+
+            client_order_id = self._make_client_order_id(leg, "MKT")
+            leg.attempts += 1
+            self._emit_progress(
+                status_callback,
+                "market_submit",
+                legs,
+                message=f"正在发送 {leg.leg_role} 市价单",
+                leg_role=leg.leg_role,
+                symbol=leg.symbol,
+                submitted_index=idx,
+                total_market_orders=total_legs,
+            )
+
+            try:
+                self._start_new_child_order(leg)
+                result = self.client.place_order(
+                    symbol=leg.symbol,
+                    side=leg.side,
+                    quantity=remaining_qty,
+                    order_type="MARKET",
+                    client_order_id=client_order_id,
+                )
+                leg.order_id = result.order_id
+                leg.client_order_id = client_order_id
+
+                if result.status in ("FILLED", "PARTIALLY_FILLED"):
+                    self._record_fill_progress(leg, result)
+                elif result.order_id:
+                    time.sleep(0.2)
+                    self._check_fill(leg)
+
+                if self._mark_filled_if_done(leg) or result.status == "FILLED":
+                    leg.status = "FILLED"
+                    logger.info(
+                        f"[Chaser] {leg.leg_role} {leg.symbol} market filled at {leg.avg_price:.4f}"
+                    )
+                else:
+                    leg.status = result.status or "FAILED"
+                    logger.warning(
+                        f"[Chaser] {leg.leg_role} {leg.symbol} market result={leg.status} "
+                        f"filled={leg.filled_qty:.4f}/{leg.quantity:.4f}"
+                    )
+            except Exception as e:
+                logger.error(f"[Chaser] Market order failed for {leg.leg_role}: {e}")
+                leg.status = "FAILED"
 
             self._emit_progress(
                 status_callback,
-                "amend_cycle",
+                "market_result",
                 legs,
-                message=f"第 {iteration} 轮改价完成，等待下一次轮询",
-                elapsed_sec=elapsed,
-                remaining_sec=max(deadline - now, 0.0),
-                iteration=iteration,
+                message=f"{leg.leg_role} 市价单结果: {leg.status}",
+                leg_role=leg.leg_role,
+                symbol=leg.symbol,
+                filled_qty=leg.filled_qty,
+                avg_price=leg.avg_price,
             )
-
-            # Sleep before next poll
-            time.sleep(self.cfg.poll_interval_sec)
 
     # ------------------------------------------------------------------
     # Price computation
@@ -619,6 +660,7 @@ class LimitChaser:
         """Cancel current order and place a new one at new_price."""
         if leg.order_id:
             try:
+                old_order_id = leg.order_id
                 cancelled = self.client.cancel_order(
                     leg.symbol,
                     order_id=leg.order_id or None,
@@ -631,6 +673,10 @@ class LimitChaser:
                     logger.debug(
                         f"[Chaser] Cancelled {leg.leg_role} order {leg.order_id}"
                     )
+                    if leg.order_id == old_order_id:
+                        leg.status = "PENDING"
+                        leg.order_id = ""
+                        leg.client_order_id = ""
                 else:
                     logger.debug(
                         f"[Chaser] {leg.leg_role} cancel not confirmed; order already missing or terminal"

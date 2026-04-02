@@ -108,6 +108,9 @@ def check_and_settle(
 
         delivery_fee = matcher.cfg.delivery_fee
         delivery_fee_max_pct = matcher.cfg.delivery_fee_max_pct
+        # USD margin: convert delivery fee from coin to USD
+        if margin_usd:
+            delivery_fee = delivery_fee * settlement_price
 
         pnl = position_mgr.settle_expired(
             instrument_name=name,
@@ -124,7 +127,7 @@ def check_and_settle(
         settled.append(name)
 
     if settled:
-        logger.info(f"Settled {len(settled)} position(s) at {timestamp}")
+        logger.debug(f"Settled {len(settled)} position(s) at {timestamp}")
 
     return settled
 

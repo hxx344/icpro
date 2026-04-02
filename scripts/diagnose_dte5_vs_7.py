@@ -1,6 +1,5 @@
 """Diagnostic: DTE=5 vs DTE=7 hold-to-settlement — why such a huge gap?"""
 import sys
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

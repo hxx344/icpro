@@ -1,6 +1,5 @@
 ﻿"""ETH 0DTE ATM: TP80/SL100 with and without wings."""
 import sys
-sys.path.insert(0, "src")
 from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="WARNING")

@@ -1,6 +1,5 @@
 ﻿"""Diagnose ETH 0DTE ATM + 3% wings drawdown."""
 import sys
-sys.path.insert(0, "src")
 from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="WARNING")

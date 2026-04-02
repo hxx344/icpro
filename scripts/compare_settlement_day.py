@@ -12,10 +12,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from backtest_weekend_vol import run_backtest, EXPIRE_DAY_MAP
+from scripts.backtest_weekend_vol import run_backtest, EXPIRE_DAY_MAP
 
 
 # ──────────── Parameters (matching optimized config) ────────────

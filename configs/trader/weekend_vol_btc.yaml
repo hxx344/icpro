@@ -1,10 +1,12 @@
 # ============================================================
-# Weekend Volatility Selling — BTC Iron Condor (Binance USD)
+# Weekend Volatility Selling — BTC Short Strangle (Binance USD)
 # ============================================================
-# 策略: 每周五 16:00 UTC 卖出周末到期铁鹰
-#   - Short delta ≈ 0.40 (call + put)
-#   - Wing  delta ≈ 0.05 (保护翼)
-#   - 3x USD 杠杆, 复利
+# 策略: 每周五 18:00 UTC 卖出周末到期双卖
+#   - Short delta ≈ 0.45 (call + put)
+#   - No wings (裸双卖)
+#   - RV24 <= 1.2 才允许入场
+#   - 4x USD 杠杆, 复利
+#   - 篮子止损: -200%
 #   - 持有至周日 08:00 UTC 自动结算
 #
 # 回测绩效 (2022-01 ~ 2024-12, $16,821 起始):
@@ -12,7 +14,7 @@
 #   Sharpe 3.69 |  Win Rate 81.4%
 # ============================================================
 
-name: Weekend Vol BTC Iron Condor (Binance 3x USD)
+name: Weekend Vol BTC Short Strangle (Binance 4x USD)
 
 exchange:
   api_key: ''                  # 或设置环境变量 BINANCE_API_KEY
@@ -28,16 +30,20 @@ strategy:
   underlying: BTC
 
   # Delta-based strike selection
-  target_delta: 0.40           # |δ| for short legs (sell call / sell put)
-  wing_delta: 0.05             # |δ| for protection legs (buy call / buy put)
+  target_delta: 0.45           # |δ| for short legs (sell call / sell put)
+  wing_delta: 0.0              # 0 = no wings, short strangle
+  max_delta_diff: 0.15         # 容许实际 |δ| 偏离目标的最大值
   default_iv: 0.60             # fallback IV if mark_iv unavailable
+  entry_realized_vol_lookback_hours: 24
+  entry_realized_vol_max: 1.2  # annualized RV threshold
+  stop_loss_pct: 200.0         # basket pnl% stop
 
   # Entry timing
   entry_day: friday
-  entry_time_utc: '16:00'      # Friday 16:00 UTC (weekend vol window)
+  entry_time_utc: '18:00'      # Friday 18:00 UTC (optimized entry)
 
   # Position sizing
-  leverage: 3.0                # 3x notional leverage
+  leverage: 4.0                # 4x notional leverage
   quantity: 0.1                # minimum qty (BTC)
   max_positions: 1
   max_capital_pct: 1.0         # leverage already accounted in qty calc
@@ -64,7 +70,8 @@ monitor:
 
 chaser:
   window_seconds: 600          # 10 分钟追单窗口 (周末期权流动性一般)
-  poll_interval_sec: 30        # 每 30 秒检查
+  poll_interval_sec: 30        # 每 30 秒检查盘口
   tick_size_usdt: 5.0          # Binance 期权价格最小跳动 (USD)
-  market_fallback_sec: 60      # 最后 60 秒切市价
+  market_fallback_sec: 60      # 兼容保留字段（当前策略主要按 window_seconds 截止）
+  market_trigger_spread_ticks: 1  # 所有腿 spread <= 1 tick(5刀) 时同时发市价单
   max_amend_attempts: 30

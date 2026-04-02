@@ -1,5 +1,5 @@
 """Analyze the 10% OTM short strangle equity curve anomaly."""
-import sys; sys.path.insert(0, 'src')
+import sys
 from loguru import logger; logger.remove(); logger.add(sys.stderr, level='ERROR')
 from options_backtest.config import Config
 from options_backtest.engine.backtest import BacktestEngine

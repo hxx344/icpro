@@ -4,7 +4,6 @@ Runs a matrix of (otm_pct, wing_pct) combinations and prints a
 compact summary table with key metrics for each cell.
 """
 import sys, time, itertools
-sys.path.insert(0, "src")
 
 from loguru import logger
 logger.remove()

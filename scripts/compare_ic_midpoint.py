@@ -6,8 +6,6 @@ import sys
 from pathlib import Path
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
 from options_backtest.config import Config
 from options_backtest.engine.backtest import BacktestEngine
 from options_backtest.analytics.metrics import compute_metrics, print_metrics
@@ -49,18 +47,18 @@ def main():
     headers = ["Metric", "Direct (08:00)", "Midpoint (wait 2h)"]
     key_metrics = [
         ("total_return", "总收益率", True),
-        ("annualized_return", "年化收益�?, True),
-        ("max_drawdown", "最大回�?, True),
+        ("annualized_return", "年化收益�?, True),
+        ("max_drawdown", "最大回�?, True),
         ("sharpe_ratio", "Sharpe Ratio", False),
         ("win_rate", "胜率", True),
-        ("total_trades", "总交易次�?, False),
+        ("total_trades", "总交易次�?, False),
         ("profit_factor", "Profit Factor", False),
         ("avg_win", "平均盈利 (ETH)", False),
         ("avg_loss", "平均亏损 (ETH)", False),
         ("total_fees", "总手续费 (ETH)", False),
-        ("total_return_hedged", "对冲USD收益�?, True),
+        ("total_return_hedged", "对冲USD收益�?, True),
         ("sharpe_ratio_hedged", "对冲USD Sharpe", False),
-        ("max_drawdown_hedged", "对冲USD最大回�?, True),
+        ("max_drawdown_hedged", "对冲USD最大回�?, True),
     ]
 
     print(f"\n{'指标':<25} {'Direct (08:00)':>18} {'Midpoint (wait)':>18}")

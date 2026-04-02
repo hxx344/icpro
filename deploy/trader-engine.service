@@ -8,11 +8,19 @@ Type=simple
 User=trader
 Group=trader
 WorkingDirectory=/opt/project_Options
-ExecStart=/opt/project_Options/.venv/bin/python -m trader.main run --config configs/trader/iron_condor_0dte.yaml
+Environment=TRADER_CONFIG_PATH=configs/trader/weekend_vol_btc.yaml
+EnvironmentFile=/opt/project_Options/deploy/trader-engine.env
+ExecStart=/opt/project_Options/.venv/bin/python -m trader.main run --config ${TRADER_CONFIG_PATH}
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/opt/project_Options/data /opt/project_Options/logs /opt/project_Options/deploy
+UMask=0077
 
 # Graceful shutdown
 KillSignal=SIGTERM

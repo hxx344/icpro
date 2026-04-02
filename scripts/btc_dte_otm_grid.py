@@ -1,6 +1,5 @@
 ﻿"""BTC DTE x OTM Grid - Short Strangle."""
 import sys, time, itertools, json
-sys.path.insert(0, "src")
 from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="WARNING")

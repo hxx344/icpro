@@ -32,12 +32,13 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from cdd_secrets import get_cdd_api_token
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 API_BASE = "https://api.cryptodatadownload.com/v1"
-API_TOKEN = "368ca0bd2ccf5620aa35c50f9a11a65943589b49"
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "market_data"
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / ".cache"
@@ -88,7 +89,8 @@ def date_to_expiry_code(d):
 class CDDSession:
     """Synchronous CDD API client with adaptive rate limiting."""
 
-    def __init__(self, token=API_TOKEN):
+    def __init__(self, token: str | None = None):
+        token = token or get_cdd_api_token()
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Token {token}"
         self.delay = INITIAL_DELAY

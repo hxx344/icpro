@@ -19,6 +19,8 @@ class BacktestConfig(BaseModel):
     underlying: str = "BTC"
     margin_mode: str = "USD"  # "USD" (Binance USDT) | "coin" (Deribit inverse)
     use_bs_only: bool = False
+    option_data_source: str = "auto"  # auto | market_data | options_hourly
+    option_snapshot_pick: str = "close"  # open | close
     iv_mode: str = "fixed"  # fixed | surface | proxy
     fixed_iv: float = 0.60
     dvol_path: str = ""
@@ -27,6 +29,7 @@ class BacktestConfig(BaseModel):
     iv_term_slope: float = 0.20
     iv_min: float = 0.05
     iv_max: float = 3.00
+    show_progress: bool = True
 
 
 class AccountConfig(BaseModel):
@@ -59,6 +62,7 @@ class ReportConfig(BaseModel):
     """Report output settings."""
 
     output_dir: str = "./reports"
+    generate_plots: bool = True
 
 
 class Config(BaseModel):

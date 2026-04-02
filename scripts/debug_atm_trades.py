@@ -1,6 +1,5 @@
 """Debug: trace individual trades for OTM=0% to verify PnL realism."""
 import sys, os, warnings
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 os.environ["LOGURU_LEVEL"] = "WARNING"
 warnings.filterwarnings("ignore")
 

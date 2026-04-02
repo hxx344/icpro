@@ -1,6 +1,5 @@
 ﻿"""ETH 0DTE ATM: TP80 with SL50-SL100 + W4% fine grid."""
 import sys
-sys.path.insert(0, "src")
 from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="WARNING")

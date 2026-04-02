@@ -1,0 +1,46 @@
+# BTC 周一买入、周五到期 ATM 双买
+# 每周一 08:00 UTC 买入最接近 ATM 的 Call + Put，持有到周五到期
+backtest:
+  name: "BTC Weekly Long Straddle (Mon entry, Fri expiry, ATM)"
+  start_date: "2023-03-01"
+  end_date: "2026-01-31"
+  time_step: "1h"
+  underlying: "BTC"
+  margin_mode: "USD"
+  use_bs_only: false
+  option_data_source: "options_hourly"
+  option_snapshot_pick: "close"
+  iv_mode: "fixed"
+  fixed_iv: 0.60
+
+account:
+  initial_balance: 1.0
+
+execution:
+  slippage: 0.0001
+  taker_fee: 0.00024
+  maker_fee: 0.00024
+  min_fee: 0.00024
+  max_fee_pct: 0.10
+  delivery_fee: 0.00015
+  delivery_fee_max_pct: 0.10
+
+strategy:
+  name: "LongStrangle"
+  params:
+    quantity: 1.0
+    min_days_to_expiry: 3.5
+    max_days_to_expiry: 4.5
+    roll_days_before_expiry: 0
+    otm_pct: 0.0
+    entry_hour: 8
+    entry_weekdays: [0]
+    roll_daily: false
+    compound: true
+    take_profit_pct: 0
+    stop_loss_pct: 0
+    max_positions: 1
+    skip_weekends: true
+
+report:
+  output_dir: "./reports/weekly_long_monfri_btc_atm"

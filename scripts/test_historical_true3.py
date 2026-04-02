@@ -105,8 +105,6 @@ async def main():
         print("Part B: Use our local settlement data to find REAL instrument names")
         print("=" * 80)
 
-        import sys
-        sys.path.insert(0, "src")
         try:
             import pandas as pd
             df = pd.read_parquet("data/settlements/btc_settlements.parquet")

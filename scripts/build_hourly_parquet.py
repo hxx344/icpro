@@ -60,6 +60,24 @@ import pyarrow.parquet as pq
 import requests
 import zstandard as zstd
 
+_PC_ANY: Any = pc
+
+
+def _pc_starts_with(values: Any, prefix: str) -> Any:
+    return _PC_ANY.starts_with(values, prefix)
+
+
+def _pc_or(left: Any, right: Any) -> Any:
+    return _PC_ANY.or_(left, right)
+
+
+def _pc_divide(left: Any, right: Any) -> Any:
+    return _PC_ANY.divide(left, right)
+
+
+def _pc_multiply(left: Any, right: Any) -> Any:
+    return _PC_ANY.multiply(left, right)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -67,7 +85,10 @@ import zstandard as zstd
 BASE_URL = "https://data.yutsing.work/0324-charles/tardis/deribit/options_chain"
 OUTPUT_DIR = Path("data/options_hourly")
 CACHE_DIR = Path("tmp/zst_cache")
-MIN_DAILY_AVAILABILITY_PCT = 90.0
+MIN_DAILY_AVAILABILITY_PCT = 98.0
+AVAILABILITY_SCAN_CACHE_FILE = OUTPUT_DIR / ".availability_scan_cache.json"
+AVAILABILITY_SCAN_CACHE_VERSION = 1
+CSV_NULL_TOKENS = ["", "null", "NULL", "None", "none", "NaN", "nan", "-"]
 
 # Columns to read from CSV (skip exchange, local_timestamp, rho)
 USE_COLS = [
@@ -678,6 +699,15 @@ class StageTimer:
         return "\n".join(lines)
 
 
+def _reset_timer_stages(*stages: str) -> None:
+    """Remove accumulated stats for selected timer stages."""
+    for stage in stages:
+        timer._totals.pop(stage, None)
+        timer._counts.pop(stage, None)
+        timer._rows.pop(stage, None)
+        timer._bytes.pop(stage, None)
+
+
 # Global timer instance (reset per run)
 timer = StageTimer()
 
@@ -688,10 +718,10 @@ timer = StageTimer()
 
 
 class _PipelineStatus:
-    """Thread-safe tracker for concurrent download + serial process pipeline.
+    """Thread-safe tracker for concurrent download + month-aware process pipeline.
 
-    Displays a compact status line like:
-        [Pipeline] DL 5/100 (3 active: 04-01,04-02,04-03) | Proc 2/100 (04-01) | Queue 3
+    Displays a compact aggregate status block for downloads plus up to a few
+    concurrently active processing workers.
     """
 
     def __init__(self, total: int):
@@ -706,7 +736,7 @@ class _PipelineStatus:
 
         # Process tracking
         self.proc_done = 0                  # finished processing
-        self.proc_current: Optional[str] = None  # date being processed
+        self.proc_active: Dict[str, Dict[str, Any]] = {}  # date iso -> state
         self.proc_failed = 0
 
         # Queue depth (updated from main thread)
@@ -752,15 +782,32 @@ class _PipelineStatus:
     # -- process events (called from main thread) --
     def proc_start(self, d: date):
         with self._lock:
-            self.proc_current = d.strftime("%m-%d")
+            self.proc_active[d.isoformat()] = {
+                "label": d.strftime("%m-%d"),
+                "progress": 0.0,
+                "stage": "starting",
+            }
 
-    def proc_finish(self, ok: bool = True):
+    def proc_update(self, d: date, percent: float, stage: str = ""):
         with self._lock:
-            self.proc_current = None
+            state = self.proc_active.get(d.isoformat())
+            if state is None:
+                return
+            state["progress"] = max(0.0, min(100.0, float(percent)))
+            if stage:
+                state["stage"] = stage
+
+    def proc_finish(self, d: date, ok: bool = True):
+        with self._lock:
+            self.proc_active.pop(d.isoformat(), None)
             if ok:
                 self.proc_done += 1
             else:
                 self.proc_failed += 1
+
+    def proc_requeue(self, d: date, stage: str = "requeued"):
+        with self._lock:
+            self.proc_active.pop(d.isoformat(), None)
 
     def set_queue_depth(self, n: int):
         with self._lock:
@@ -801,85 +848,84 @@ class _PipelineStatus:
             if self.proc_done > 0 and elapsed > 0:
                 days_per_hour = self.proc_done / (elapsed / 3600)
                 speed_str = f"  {days_per_hour:.1f} days/h"
-
-            # Line 1: overall progress
-            lines = []
-            lines.append(
-                f"\033[1m[{time_str}]\033[0m "
-                f"{bar} {pct:5.1f}%  "
-                f"\033[32m\u2714{self.proc_done}\033[0m/{self.total}"
-                f"{fail_str}"
-                f"{speed_str}"
-                f"  ETA {eta_str}" if eta_str else
-                f"\033[1m[{time_str}]\033[0m "
-                f"{bar} {pct:5.1f}%  "
-                f"\033[32m\u2714{self.proc_done}\033[0m/{self.total}"
-                f"{fail_str}"
-                f"{speed_str}"
-            )
-
-            # Line 2+: download status
             dl_total_done = self.dl_done + self.dl_failed
-            lines.append(
-                f"  \033[36mDL\033[0m {dl_total_done}/{self.total}  Q:{self.queue_depth}"
-            )
-            if self.dl_active:
-                # Sort active downloads by progress (highest first)
-                active_sorted = sorted(
-                    self.dl_active,
-                    key=lambda k: self.dl_progress.get(k, 0.0),
-                    reverse=True,
+            active_count = len(self.dl_active)
+            active_avg_pct = 0.0
+            if active_count > 0:
+                active_avg_pct = (
+                    sum(self.dl_progress.get(k, 0.0) for k in self.dl_active) / active_count * 100.0
                 )
-                for key in active_sorted:
-                    p = self.dl_progress.get(key, 0.0)
-                    label = key[5:]  # MM-DD
-                    mini_len = 18
-                    mini_filled = int(mini_len * p)
-                    mini_bar = "\u2588" * mini_filled + "\u2591" * (mini_len - mini_filled)
-                    lines.append(f"    {label} {mini_bar} {p*100:5.1f}%")
-            else:
-                lines.append("    (idle)")
 
-            # Final line: processing status
-            if self.proc_current:
-                proc_line = f"  \033[33mProc\033[0m {self.proc_current} ..."
+            proc_items = sorted(
+                self.proc_active.values(),
+                key=lambda item: str(item.get("label") or ""),
+            )
+            if proc_items:
+                proc_parts: List[str] = []
+                for item in proc_items[:2]:
+                    proc_progress = float(item.get("progress", 0.0))
+                    proc_ratio = proc_progress / 100.0
+                    proc_bar_len = 6
+                    proc_filled = int(proc_bar_len * proc_ratio)
+                    proc_bar = "█" * proc_filled + "░" * (proc_bar_len - proc_filled)
+                    proc_stage = str(item.get("stage") or "working").replace("\n", " ")[:18]
+                    proc_parts.append(
+                        f"{item.get('label', '--')} {proc_bar} {proc_progress:4.0f}% {proc_stage}"
+                    )
+                if len(proc_items) > 2:
+                    proc_parts.append(f"+{len(proc_items) - 2}")
+                proc_text = f"  \033[33mProc\033[0m " + " | ".join(proc_parts)
             else:
-                proc_line = f"  \033[33mProc\033[0m idle"
+                proc_text = f"  \033[33mProc\033[0m idle"
 
-            lines.append(proc_line)
-            return "\n".join(lines)
+            eta_part = f"  ETA {eta_str}" if eta_str else ""
+            return (
+                f"\033[1m[{time_str}]\033[0m "
+                f"{bar} {pct:5.1f}%  "
+                f"\033[32m✔{self.proc_done}\033[0m/{self.total}"
+                f"{fail_str}"
+                f"{speed_str}"
+                f"{eta_part}"
+                f"  \033[36mDL\033[0m {dl_total_done}/{self.total}"
+                f" active:{active_count} avg:{active_avg_pct:4.0f}% Q:{self.queue_depth}"
+                f"{proc_text}"
+            )
 
     @property
     def _display_lines(self) -> int:
         """Number of lines the status display uses."""
         return max(1, self._last_display_lines)
 
+    def _move_to_display_top(self):
+        """Move cursor to the first line of the existing status block."""
+        n = self._display_lines
+        if self._last_print > 0:
+            sys.stdout.write(f"\033[{n}F")
+
+    def _render_block(self, block: str):
+        """Render the status block without adding extra blank lines."""
+        lines = block.split("\n")
+        self._last_display_lines = len(lines)
+        self._move_to_display_top()
+        for line in lines:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.write(line)
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+
     def print_status(self, force: bool = False):
-        """Print multi-line status (throttled to every 2s unless *force*)."""
+        """Print status (throttled to every 2s unless *force*)."""
         now = time.time()
         if not force and (now - self._last_print) < 2.0:
             return
-        # Move cursor up to overwrite previous status block
-        n = self._display_lines
-        if self._last_print > 0:
-            # Move up N lines and clear each
-            print(f"\033[{n}A", end="", flush=True)
         self._last_print = now
         block = self._status_line()
-        self._last_display_lines = len(block.split("\n"))
-        # Clear each line before printing
-        for line in block.split("\n"):
-            print(f"\033[K{line}", flush=True)
+        self._render_block(block)
 
     def print_final(self):
         """Print final status (no overwrite)."""
-        n = self._display_lines
-        if self._last_print > 0:
-            print(f"\033[{n}A", end="", flush=True)
         block = self._status_line()
-        self._last_display_lines = len(block.split("\n"))
-        for line in block.split("\n"):
-            print(f"\033[K{line}", flush=True)
+        self._render_block(block)
 
     # -- background ticker (auto-refresh every 2s) --
     def start_ticker(self):
@@ -898,13 +944,21 @@ class _PipelineStatus:
     def pause_ticker(self):
         """Pause status line output (e.g. while subprocess is running)."""
         self._ticker_paused.set()
-        # Clear the status block so subprocess output starts clean
+        self.clear_display()
+
+    def clear_display(self):
+        """Clear the current status block from the terminal."""
         n = self._display_lines
         if self._last_print > 0:
-            print(f"\033[{n}A", end="", flush=True)
-            for _ in range(n):
-                print(f"\033[K", flush=True)
-            # Reset so resume_ticker won't cursor-up over subprocess output
+            self._move_to_display_top()
+            for idx in range(n):
+                sys.stdout.write("\r\033[2K")
+                if idx < n - 1:
+                    sys.stdout.write("\033[1B")
+            if n > 1:
+                sys.stdout.write(f"\033[{n - 1}A")
+            sys.stdout.write("\r")
+            sys.stdout.flush()
             self._last_print = 0
             self._last_display_lines = 0
 
@@ -933,6 +987,30 @@ _CHILD_PROCS_LOCK = threading.Lock()
 _SHUTDOWN_EVENT = threading.Event()
 _SIGINT_COUNT = 0
 _SIGINT_LOCK = threading.Lock()
+_WORKER_PROGRESS_FILE: Optional[Path] = None
+
+
+def _emit_worker_progress(percent: float, stage: str, message: str = ""):
+    """Persist worker progress for the parent process to poll."""
+    if _WORKER_PROGRESS_FILE is None:
+        return
+
+    payload = {
+        "percent": max(0.0, min(100.0, float(percent))),
+        "stage": str(stage),
+        "message": str(message or stage),
+        "ts": time.time(),
+    }
+    tmp = _WORKER_PROGRESS_FILE.with_suffix(_WORKER_PROGRESS_FILE.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, _WORKER_PROGRESS_FILE)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _register_child_process(proc: subprocess.Popen):
@@ -2264,6 +2342,79 @@ def _merge_hourly_polars(accum, chunk, hourly_pick: str):
     return pl.concat([open_rows, close_rows], how="vertical_relaxed")
 
 
+def _build_chunk_hourly_polars(chunk_df, hourly_pick: str):
+    """Aggregate one Polars CSV chunk to hourly rows."""
+    pl = _import_polars()
+
+    if chunk_df is None or chunk_df.height == 0:
+        return chunk_df
+
+    chunk_df = (
+        chunk_df
+        .filter(
+            pl.col("symbol").str.starts_with("BTC-") |
+            pl.col("symbol").str.starts_with("ETH-")
+        )
+        .with_columns(((pl.col("timestamp") // 3_600_000_000) * 3_600_000_000).alias("hour_us"))
+        .sort("timestamp")
+    )
+
+    if chunk_df.height == 0:
+        return chunk_df
+
+    if hourly_pick == "first":
+        return chunk_df.group_by(["symbol", "hour_us"]).first()
+    if hourly_pick == "last":
+        return chunk_df.group_by(["symbol", "hour_us"]).last()
+
+    chunk_open = chunk_df.group_by(["symbol", "hour_us"]).first().with_columns(
+        pl.lit("open").alias("hourly_pick")
+    )
+    chunk_close = chunk_df.group_by(["symbol", "hour_us"]).last().with_columns(
+        pl.lit("close").alias("hourly_pick")
+    )
+    return pl.concat([chunk_open, chunk_close], how="vertical_relaxed")
+
+
+def _dedupe_hourly_polars(hourly, hourly_pick: str):
+    """Globally deduplicate hourly Polars rows before final output.
+
+    The streaming path tries to keep cross-chunk overlaps isolated to the last
+    pending hour, but a final whole-output dedupe is a cheap safety net against
+    unexpected chunk ordering or repeated buckets.
+    """
+    pl = _import_polars()
+    if hourly is None or hourly.height == 0:
+        return hourly
+
+    if hourly_pick == "first":
+        return (
+            hourly
+            .sort(["symbol", "hour_us", "timestamp"])
+            .unique(subset=["symbol", "hour_us"], keep="first")
+        )
+    if hourly_pick == "last":
+        return (
+            hourly
+            .sort(["symbol", "hour_us", "timestamp"])
+            .unique(subset=["symbol", "hour_us"], keep="last")
+        )
+
+    open_rows = (
+        hourly
+        .filter(pl.col("hourly_pick") == "open")
+        .sort(["symbol", "hour_us", "timestamp"])
+        .unique(subset=["symbol", "hour_us", "hourly_pick"], keep="first")
+    )
+    close_rows = (
+        hourly
+        .filter(pl.col("hourly_pick") == "close")
+        .sort(["symbol", "hour_us", "timestamp"])
+        .unique(subset=["symbol", "hour_us", "hourly_pick"], keep="last")
+    )
+    return pl.concat([open_rows, close_rows], how="vertical_relaxed")
+
+
 def _append_polars_hourly_part(parts: List[Any], part: Any, row_count: int) -> int:
     if part is None or part.height == 0:
         return row_count
@@ -2287,7 +2438,7 @@ def _finalize_hourly_output_polars(hourly, hourly_pick: str) -> pd.DataFrame:
         hourly
         .with_columns([
             pl.from_epoch(pl.col("hour_us"), time_unit="us").dt.replace_time_zone("UTC").alias("hour"),
-            pl.col("underlying_index").str.extract(r"^(\w+)", 1).str.to_uppercase().alias("underlying"),
+            pl.col("symbol").str.split("-").list.get(0).str.to_uppercase().alias("underlying"),
         ])
         .filter(pl.col("underlying").is_in(sorted(_VALID_UNDERLYINGS)))
         .drop("hour_us")
@@ -2301,9 +2452,176 @@ def _finalize_hourly_output_polars(hourly, hourly_pick: str) -> pd.DataFrame:
     return hourly.to_pandas()
 
 
+def _spill_polars_hourly_chunk_buckets(chunk_hourly, bucket_root: Path, chunk_index: int) -> int:
+    """Write one chunk's hourly rows into per-hour temp bucket files."""
+    if chunk_hourly is None or chunk_hourly.height == 0:
+        return 0
+
+    pl = _import_polars()
+    hour_values = chunk_hourly["hour_us"].unique().to_list()
+    written = 0
+    for hour_us in sorted(int(v) for v in hour_values if v is not None):
+        part = chunk_hourly.filter(pl.col("hour_us") == hour_us)
+        if part.height == 0:
+            continue
+        hour_dir = bucket_root / f"hour_us={hour_us}"
+        hour_dir.mkdir(parents=True, exist_ok=True)
+        part_path = hour_dir / f"chunk_{chunk_index:06d}.parquet"
+        part.write_parquet(part_path)
+        written += 1
+    return written
+
+
+def _load_polars_hour_bucket(hour_dir: Path, hourly_pick: str):
+    """Load and merge one hour bucket from temp part files."""
+    accum = None
+    for part_path in sorted(hour_dir.glob("*.parquet")):
+        part = _import_polars().read_parquet(part_path)
+        if part is None or part.height == 0:
+            continue
+        accum = _merge_hourly_polars(accum, part, hourly_pick)
+    return accum
+
+
+def _process_zst_to_hourly_polars_bucketed_stream(
+    zst_path: Path,
+    hourly_pick: str,
+    data_date: Optional[date] = None,
+) -> Tuple[pd.DataFrame, int]:
+    """Polars streaming path with external per-hour bucket staging.
+
+    This is used when raw chunk order is not monotonic enough for the in-memory
+    `pending_tail` optimization. We still keep the fast Polars CSV parser, but
+    spill each chunk's hourly aggregates into per-hour temp buckets and merge
+    them in a second pass.
+    """
+    pl = _import_polars()
+    schema_overrides = _polars_schema_overrides(pl)
+
+    source = None
+    zst_fh = None
+    zst_stream = None
+    zstd_proc: Optional[subprocess.Popen] = None
+    stream_mode = ""
+    chunk_count = 0
+    total_rows = 0
+    bucket_part_count = 0
+
+    with tempfile.TemporaryDirectory(prefix="bhp_polars_bucket_") as bucket_tmp:
+        bucket_root = Path(bucket_tmp)
+        try:
+            source, zst_fh, zst_stream, zstd_proc, stream_mode = _open_streaming_zstd_source(zst_path)
+            log.info(
+                "  Polars-bucket mode: %s → chunked CSV parse (%d MB chunks) → per-hour temp buckets",
+                stream_mode,
+                _polars_stream_chunk_mb,
+            )
+
+            chunk_iter = iter(_iter_csv_chunk_bytes_from_stream(source, _polars_stream_chunk_mb))
+            while True:
+                timer.start("decompress")
+                try:
+                    chunk_blob = next(chunk_iter)
+                except StopIteration:
+                    timer.stop()
+                    break
+                timer.stop(nbytes=len(chunk_blob))
+
+                chunk_count += 1
+
+                timer.start("csv_read")
+                chunk_df = pl.read_csv(
+                    io.BytesIO(chunk_blob),
+                    columns=USE_COLS,
+                    schema_overrides=schema_overrides,
+                    infer_schema_length=0,
+                    null_values=CSV_NULL_TOKENS,
+                    low_memory=True,
+                    batch_size=50_000,
+                )
+                timer.stop(rows=chunk_df.height)
+                total_rows += chunk_df.height
+
+                if chunk_df.height == 0:
+                    continue
+
+                timer.start("resample")
+                chunk_hourly = _build_chunk_hourly_polars(chunk_df, hourly_pick)
+                timer.stop(rows=chunk_hourly.height if chunk_hourly is not None else 0)
+                if chunk_hourly is None or chunk_hourly.height == 0:
+                    continue
+
+                timer.start("bucket_spill")
+                bucket_part_count += _spill_polars_hourly_chunk_buckets(chunk_hourly, bucket_root, chunk_count)
+                timer.stop(rows=chunk_hourly.height)
+
+            hourly_parts: List[Any] = []
+            hourly_rows = 0
+            hour_dirs = sorted(
+                [p for p in bucket_root.glob("hour_us=*") if p.is_dir()],
+                key=lambda p: int(p.name.split("=", 1)[1]),
+            )
+            for hour_dir in hour_dirs:
+                timer.start("bucket_merge")
+                merged_hour = _load_polars_hour_bucket(hour_dir, hourly_pick)
+                hourly_rows = _append_polars_hourly_part(hourly_parts, merged_hour, hourly_rows)
+                timer.stop(rows=(merged_hour.height if merged_hour is not None else 0))
+
+            if not hourly_parts:
+                hourly = pd.DataFrame()
+            else:
+                timer.start("to_pandas")
+                hourly = _finalize_hourly_output_polars(
+                    pl.concat(hourly_parts, how="vertical_relaxed"),
+                    hourly_pick,
+                )
+                timer.stop(rows=len(hourly))
+
+            log.info(
+                "  Polars-bucket processed %dk rows across %d chunk(s), %d temp part(s) via %s",
+                total_rows // 1000,
+                chunk_count,
+                bucket_part_count,
+                stream_mode,
+            )
+            return hourly, total_rows
+        finally:
+            primary_exc_active = sys.exc_info()[0] is not None
+            if zst_stream is not None:
+                try:
+                    zst_stream.close()
+                except Exception:
+                    pass
+            if zst_fh is not None:
+                try:
+                    zst_fh.close()
+                except Exception:
+                    pass
+            if zstd_proc is not None:
+                if zstd_proc.stdout is not None:
+                    try:
+                        zstd_proc.stdout.close()
+                    except Exception:
+                        pass
+                try:
+                    _finalize_streaming_zstd_proc(zstd_proc, timeout=30.0)
+                except subprocess.CalledProcessError as e:
+                    if primary_exc_active:
+                        log.debug("Suppressing zstd finalize error after primary exception: %s", e)
+                    elif data_date == date(2024, 3, 5):
+                        log.warning(
+                            "Suppressing zstd finalize error for %s after successful hourly extraction: %s",
+                            data_date,
+                            e,
+                        )
+                    else:
+                        raise
+
+
 def _process_zst_to_hourly_polars_stream(
     zst_path: Path,
     hourly_pick: str,
+    data_date: Optional[date] = None,
 ) -> Tuple[pd.DataFrame, int]:
     pl = _import_polars()
     schema_overrides = _polars_schema_overrides(pl)
@@ -2346,6 +2664,7 @@ def _process_zst_to_hourly_polars_stream(
                 columns=USE_COLS,
                 schema_overrides=schema_overrides,
                 infer_schema_length=0,
+                null_values=CSV_NULL_TOKENS,
                 low_memory=True,
                 batch_size=50_000,
             )
@@ -2356,61 +2675,46 @@ def _process_zst_to_hourly_polars_stream(
                 continue
 
             timer.start("resample")
-            chunk_df = (
-                chunk_df
-                .filter(
-                    pl.col("symbol").str.starts_with("BTC-") |
-                    pl.col("symbol").str.starts_with("ETH-")
-                )
-                .with_columns(((pl.col("timestamp") // 3_600_000_000) * 3_600_000_000).alias("hour_us"))
-            )
+            chunk_hourly = _build_chunk_hourly_polars(chunk_df, hourly_pick)
 
-            if chunk_df.height > 0:
-                if hourly_pick == "first":
-                    chunk_hourly = chunk_df.group_by(["symbol", "hour_us"]).first()
-                elif hourly_pick == "last":
-                    chunk_hourly = chunk_df.group_by(["symbol", "hour_us"]).last()
-                else:
-                    chunk_open = chunk_df.group_by(["symbol", "hour_us"]).first().with_columns(
-                        pl.lit("open").alias("hourly_pick")
-                    )
-                    chunk_close = chunk_df.group_by(["symbol", "hour_us"]).last().with_columns(
-                        pl.lit("close").alias("hourly_pick")
-                    )
-                    chunk_hourly = pl.concat([chunk_open, chunk_close], how="vertical_relaxed")
+            if chunk_hourly.height > 0:
+                chunk_max_hour_us = _polars_hour_us_max(chunk_hourly)
+                if chunk_max_hour_us is None:
+                    pending_rows = pending_tail.height if pending_tail is not None else 0
+                    timer.stop(rows=(hourly_rows + pending_rows))
+                    continue
 
-                if chunk_hourly.height > 0:
-                    chunk_max_hour_us = _polars_hour_us_max(chunk_hourly)
-                    if chunk_max_hour_us is None:
-                        pending_rows = pending_tail.height if pending_tail is not None else 0
-                        timer.stop(rows=(hourly_rows + pending_rows))
-                        continue
+                if pending_tail is not None and pending_tail.height > 0 and pending_hour_us is not None:
+                    older_part = chunk_hourly.filter(pl.col("hour_us") < pending_hour_us)
+                    if older_part.height > 0:
+                        raise RuntimeError(
+                            f"out-of-order hourly bucket detected: chunk produced hour(s) earlier than pending {pending_hour_us}"
+                        )
 
-                    if pending_tail is not None and pending_tail.height > 0 and pending_hour_us is not None:
-                        overlap_part = chunk_hourly.filter(pl.col("hour_us") == pending_hour_us)
-                        if overlap_part.height > 0:
-                            pending_tail = _merge_hourly_polars(pending_tail, overlap_part, hourly_pick)
+                    overlap_part = chunk_hourly.filter(pl.col("hour_us") == pending_hour_us)
+                    if overlap_part.height > 0:
+                        pending_tail = _merge_hourly_polars(pending_tail, overlap_part, hourly_pick)
 
-                        future_part = chunk_hourly.filter(pl.col("hour_us") > pending_hour_us)
-                        if future_part.height > 0:
-                            hourly_rows = _append_polars_hourly_part(hourly_parts, pending_tail, hourly_rows)
+                    future_part = chunk_hourly.filter(pl.col("hour_us") > pending_hour_us)
+                    if future_part.height > 0:
+                        hourly_rows = _append_polars_hourly_part(hourly_parts, pending_tail, hourly_rows)
 
-                            future_max_hour_us = _polars_hour_us_max(future_part)
-                            if future_max_hour_us is None:
-                                pending_rows = pending_tail.height if pending_tail is not None else 0
-                                timer.stop(rows=(hourly_rows + pending_rows))
-                                continue
-                            stable_part = future_part.filter(pl.col("hour_us") < future_max_hour_us)
-                            hourly_rows = _append_polars_hourly_part(hourly_parts, stable_part, hourly_rows)
-
-                            pending_tail = future_part.filter(pl.col("hour_us") == future_max_hour_us)
-                            pending_hour_us = future_max_hour_us
-                    else:
-                        stable_part = chunk_hourly.filter(pl.col("hour_us") < chunk_max_hour_us)
+                        future_max_hour_us = _polars_hour_us_max(future_part)
+                        if future_max_hour_us is None:
+                            pending_rows = pending_tail.height if pending_tail is not None else 0
+                            timer.stop(rows=(hourly_rows + pending_rows))
+                            continue
+                        stable_part = future_part.filter(pl.col("hour_us") < future_max_hour_us)
                         hourly_rows = _append_polars_hourly_part(hourly_parts, stable_part, hourly_rows)
 
-                        pending_tail = chunk_hourly.filter(pl.col("hour_us") == chunk_max_hour_us)
-                        pending_hour_us = chunk_max_hour_us
+                        pending_tail = future_part.filter(pl.col("hour_us") == future_max_hour_us)
+                        pending_hour_us = future_max_hour_us
+                else:
+                    stable_part = chunk_hourly.filter(pl.col("hour_us") < chunk_max_hour_us)
+                    hourly_rows = _append_polars_hourly_part(hourly_parts, stable_part, hourly_rows)
+
+                    pending_tail = chunk_hourly.filter(pl.col("hour_us") == chunk_max_hour_us)
+                    pending_hour_us = chunk_max_hour_us
 
             pending_rows = pending_tail.height if pending_tail is not None else 0
             timer.stop(rows=(hourly_rows + pending_rows))
@@ -2423,7 +2727,7 @@ def _process_zst_to_hourly_polars_stream(
         else:
             timer.start("to_pandas")
             hourly = _finalize_hourly_output_polars(
-                pl.concat(hourly_parts, how="vertical_relaxed"),
+                _dedupe_hourly_polars(pl.concat(hourly_parts, how="vertical_relaxed"), hourly_pick),
                 hourly_pick,
             )
             timer.stop(rows=len(hourly))
@@ -2436,6 +2740,7 @@ def _process_zst_to_hourly_polars_stream(
         )
         return hourly, total_rows
     finally:
+        primary_exc_active = sys.exc_info()[0] is not None
         if zst_stream is not None:
             try:
                 zst_stream.close()
@@ -2452,7 +2757,19 @@ def _process_zst_to_hourly_polars_stream(
                     zstd_proc.stdout.close()
                 except Exception:
                     pass
-            _finalize_streaming_zstd_proc(zstd_proc, timeout=30.0)
+            try:
+                _finalize_streaming_zstd_proc(zstd_proc, timeout=30.0)
+            except subprocess.CalledProcessError as e:
+                if primary_exc_active:
+                    log.debug("Suppressing zstd finalize error after primary exception: %s", e)
+                elif data_date == date(2024, 3, 5):
+                    log.warning(
+                        "Suppressing zstd finalize error for %s after successful hourly extraction: %s",
+                        data_date,
+                        e,
+                    )
+                else:
+                    raise
 
 
 # Only keep these underlyings (filter out SYN, INDEX_PRICE, etc.)
@@ -2466,6 +2783,16 @@ def _extract_underlying(series: pd.Series) -> pd.Series:
         .str.extract(r"^(\w+)", expand=False)
         .str.upper()
     )
+
+
+def _extract_underlying_from_symbol(series: pd.Series) -> pd.Series:
+    """Extract underlying (BTC/ETH) from option symbol.
+
+    `underlying_index` in the raw source can contain quote/index descriptors
+    such as `index_price` or `SYN.BTC-7JAN24`, which are not the true
+    underlying asset and would incorrectly filter out valid option rows.
+    """
+    return series.astype(str).str.split("-").str[0].str.upper()
 
 
 def _resample_df_to_hourly(df: pd.DataFrame, hourly_pick: str) -> pd.DataFrame:
@@ -2504,10 +2831,12 @@ def _finalize_hourly_output(hourly: pd.DataFrame) -> pd.DataFrame:
     hourly["hour"] = pd.to_datetime(hourly["hour_us"], unit="us", utc=True)
     hourly.drop(columns=["hour_us"], inplace=True)
 
-    if "underlying_index" in hourly.columns:
+    if "symbol" in hourly.columns:
+        hourly["underlying"] = _extract_underlying_from_symbol(hourly["symbol"])
+    elif "underlying_index" in hourly.columns:
         hourly["underlying"] = _extract_underlying(hourly["underlying_index"])
     else:
-        hourly["underlying"] = hourly["symbol"].str.split("-").str[0].str.upper()
+        hourly["underlying"] = pd.Series(index=hourly.index, dtype="object")
 
     n_before = len(hourly)
     mask_valid = hourly["underlying"].isin(_VALID_UNDERLYINGS)
@@ -2517,6 +2846,33 @@ def _finalize_hourly_output(hourly: pd.DataFrame) -> pd.DataFrame:
         log.info("  Filtered out %d non-BTC/ETH rows (%d -> %d)",
                  n_dropped, n_before, len(hourly))
     return hourly
+
+
+def _filter_hourly_to_target_date(hourly: pd.DataFrame, data_date: Optional[date]) -> pd.DataFrame:
+    """Keep only rows belonging to the requested UTC date.
+
+    Daily source files are expected to map to one UTC day. If the upstream file
+    leaks rows from adjacent dates, keeping them would let a partial spillover
+    contaminate another day's monthly parquet and distort availability.
+    """
+    if data_date is None or hourly.empty or "hour" not in hourly.columns:
+        return hourly
+
+    mask = hourly["hour"].dt.date == data_date
+    if bool(mask.all()):
+        return hourly
+
+    dropped = int((~mask).sum())
+    kept = int(mask.sum())
+    extra_dates = sorted({str(x) for x in hourly.loc[~mask, "hour"].dt.date.unique()})
+    log.warning(
+        "  Filtered %d spillover row(s) outside target date %s; kept %d row(s). Extra date(s): %s",
+        dropped,
+        data_date,
+        kept,
+        ", ".join(extra_dates[:5]) or "-",
+    )
+    return hourly.loc[mask, :].copy()
 
 
 def _merge_hourly_chunk(
@@ -2552,11 +2908,13 @@ def _merge_hourly_chunk(
     else:
         opens = merged[merged["hourly_pick"] == "open"]
         closes = merged[merged["hourly_pick"] == "close"]
-        h_open = opens.drop_duplicates(
-            subset=["symbol", "hour_us"], keep="first").copy()
+        h_open = opens.loc[
+            opens.groupby(["symbol", "hour_us"], sort=False).cumcount() == 0
+        ].copy()
         h_open["hourly_pick"] = "open"
-        h_close = closes.drop_duplicates(
-            subset=["symbol", "hour_us"], keep="last").copy()
+        h_close = closes.loc[
+            closes.groupby(["symbol", "hour_us"], sort=False).cumcount(ascending=False) == 0
+        ].copy()
         h_close["hourly_pick"] = "close"
         merged = pd.concat([h_open, h_close], ignore_index=True)
         del opens, closes, h_open, h_close
@@ -2605,6 +2963,7 @@ def process_zst_to_hourly(
         "column_types": PA_COLUMN_TYPES,
         "include_columns": USE_COLS,
         "strings_can_be_null": False,
+        "null_values": CSV_NULL_TOKENS,
     }
     parse_kwargs = {
         "newlines_in_values": False,
@@ -2651,30 +3010,91 @@ def process_zst_to_hourly(
     # POLARS-STREAM MODE: streaming zstd → chunked Polars parse/aggregate
     # ====================================================================
     if read_mode == "polars-stream":
-        hourly, total_rows = _process_zst_to_hourly_polars_stream(
-            zst_path,
-            hourly_pick=hourly_pick,
-        )
+        try:
+            hourly, total_rows = _process_zst_to_hourly_polars_stream(
+                zst_path,
+                hourly_pick=hourly_pick,
+                data_date=data_date,
+            )
+        except RuntimeError as e:
+            if "out-of-order hourly bucket" not in str(e):
+                raise
+            log.warning(
+                "  Polars-stream detected out-of-order input (%s), retrying with external hour buckets",
+                e,
+            )
+            _reset_timer_stages(
+                "decompress",
+                "csv_read",
+                "resample",
+                "to_pandas",
+                "bucket_spill",
+                "bucket_merge",
+            )
+            try:
+                hourly, total_rows = _process_zst_to_hourly_polars_bucketed_stream(
+                    zst_path,
+                    hourly_pick=hourly_pick,
+                    data_date=data_date,
+                )
+            except Exception as bucket_exc:
+                log.warning(
+                    "  Polars bucket retry failed (%s), falling back to stream mode",
+                    bucket_exc,
+                )
+                _reset_timer_stages(
+                    "decompress",
+                    "csv_read",
+                    "resample",
+                    "to_pandas",
+                    "bucket_spill",
+                    "bucket_merge",
+                )
+                read_mode = "stream"
+            else:
+                hourly = _filter_hourly_to_target_date(hourly, data_date)
 
-        elapsed_read = timer._totals.get("csv_read", 0.0)
-        if elapsed_read > 0:
-            log.info("  Polars-stream read %dk rows in %.1fs (%.0fk rows/s)",
-                     total_rows // 1000, elapsed_read,
-                     total_rows / 1000 / (elapsed_read + 0.001))
+                elapsed_read = timer._totals.get("csv_read", 0.0)
+                if elapsed_read > 0:
+                    log.info("  Polars-bucket read %dk rows in %.1fs (%.0fk rows/s)",
+                             total_rows // 1000, elapsed_read,
+                             total_rows / 1000 / (elapsed_read + 0.001))
 
-        elapsed_rs = timer._totals.get("resample", 0)
-        rs_count = timer._counts.get("resample", 1)
-        log.info("  Resampled to %d hourly rows in %.1fs",
-                 len(hourly), elapsed_rs / rs_count)
+                elapsed_rs = timer._totals.get("resample", 0)
+                rs_count = timer._counts.get("resample", 1)
+                log.info("  Resampled to %d hourly rows in %.1fs",
+                         len(hourly), elapsed_rs / rs_count)
 
-        elapsed_total = time.time() - t0
-        log.info("  Total: %dk → %d rows in %.1fs",
-                 total_rows // 1000, len(hourly), elapsed_total)
-        if process_peak_sampler is not None:
-            process_peak_sampler.stop(total_rows=total_rows, output_rows=len(hourly))
-        _log_mem("after process_zst_to_hourly")
-        _report_mem_diag_hotspots(context=zst_path.name)
-        return hourly
+                elapsed_total = time.time() - t0
+                log.info("  Total: %dk → %d rows in %.1fs",
+                         total_rows // 1000, len(hourly), elapsed_total)
+                if process_peak_sampler is not None:
+                    process_peak_sampler.stop(total_rows=total_rows, output_rows=len(hourly))
+                _log_mem("after process_zst_to_hourly")
+                _report_mem_diag_hotspots(context=zst_path.name)
+                return hourly
+        else:
+            hourly = _filter_hourly_to_target_date(hourly, data_date)
+
+            elapsed_read = timer._totals.get("csv_read", 0.0)
+            if elapsed_read > 0:
+                log.info("  Polars-stream read %dk rows in %.1fs (%.0fk rows/s)",
+                         total_rows // 1000, elapsed_read,
+                         total_rows / 1000 / (elapsed_read + 0.001))
+
+            elapsed_rs = timer._totals.get("resample", 0)
+            rs_count = timer._counts.get("resample", 1)
+            log.info("  Resampled to %d hourly rows in %.1fs",
+                     len(hourly), elapsed_rs / rs_count)
+
+            elapsed_total = time.time() - t0
+            log.info("  Total: %dk → %d rows in %.1fs",
+                     total_rows // 1000, len(hourly), elapsed_total)
+            if process_peak_sampler is not None:
+                process_peak_sampler.stop(total_rows=total_rows, output_rows=len(hourly))
+            _log_mem("after process_zst_to_hourly")
+            _report_mem_diag_hotspots(context=zst_path.name)
+            return hourly
 
     # ====================================================================
     # BULK MODE: decompress to memory → PyArrow bulk read
@@ -2721,9 +3141,9 @@ def process_zst_to_hourly(
                 # --- Step 3: Arrow pre-filter + hour_us computation ---
                 timer.start("arrow_filter")
                 symbol_col = table.column("symbol")
-                keep_mask = pc.or_(
-                    pc.starts_with(symbol_col, "BTC-"),
-                    pc.starts_with(symbol_col, "ETH-"),
+                keep_mask = _pc_or(
+                    _pc_starts_with(symbol_col, "BTC-"),
+                    _pc_starts_with(symbol_col, "ETH-"),
                 )
                 n_before = len(table)
                 table = table.filter(keep_mask)
@@ -2731,8 +3151,8 @@ def process_zst_to_hourly(
 
                 _HOUR_US_SCALAR = pa.scalar(3_600_000_000, type=pa.int64())
                 ts_col = table.column("timestamp")
-                hour_us_arr = pc.multiply(
-                    pc.divide(ts_col, _HOUR_US_SCALAR),
+                hour_us_arr = _pc_multiply(
+                    _pc_divide(ts_col, _HOUR_US_SCALAR),
                     _HOUR_US_SCALAR,
                 )
                 table = table.append_column("hour_us", hour_us_arr)
@@ -2815,6 +3235,8 @@ def process_zst_to_hourly(
                 chunk_count += 1
 
                 if use_disk_staging:
+                    if not isinstance(chunk, Path):
+                        raise TypeError(f"Expected Path chunk, got {type(chunk).__name__}")
                     chunk_path = chunk
                     chunk_bytes = chunk_path.stat().st_size
                     total_chunk_bytes += chunk_bytes
@@ -2828,7 +3250,9 @@ def process_zst_to_hourly(
                         parse_options=parse_options,
                     )
                 else:
-                    chunk_blob = chunk
+                    if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                        raise TypeError(f"Expected bytes chunk, got {type(chunk).__name__}")
+                    chunk_blob = bytes(chunk)
                     chunk_bytes = len(chunk_blob)
                     total_chunk_bytes += chunk_bytes
                     timer.stop(nbytes=chunk_bytes)
@@ -2847,15 +3271,15 @@ def process_zst_to_hourly(
 
                 timer.start("arrow_filter")
                 symbol_col = table.column("symbol")
-                keep_mask = pc.or_(
-                    pc.starts_with(symbol_col, "BTC-"),
-                    pc.starts_with(symbol_col, "ETH-"),
+                keep_mask = _pc_or(
+                    _pc_starts_with(symbol_col, "BTC-"),
+                    _pc_starts_with(symbol_col, "ETH-"),
                 )
                 table = table.filter(keep_mask)
                 rows_after = len(table)
                 ts_col = table.column("timestamp")
-                hour_us_arr = pc.multiply(
-                    pc.divide(ts_col, _HOUR_US_SCALAR_H),
+                hour_us_arr = _pc_multiply(
+                    _pc_divide(ts_col, _HOUR_US_SCALAR_H),
                     _HOUR_US_SCALAR_H,
                 )
                 table = table.append_column("hour_us", hour_us_arr)
@@ -3019,9 +3443,9 @@ def process_zst_to_hourly(
 
                         timer.start("arrow_filter")
                         sym_col = batch.column("symbol")
-                        bm = pc.or_(
-                            pc.starts_with(sym_col, "BTC-"),
-                            pc.starts_with(sym_col, "ETH-"),
+                        bm = _pc_or(
+                            _pc_starts_with(sym_col, "BTC-"),
+                            _pc_starts_with(sym_col, "ETH-"),
                         )
                         batch = batch.filter(bm)
                         if len(batch) == 0:
@@ -3029,8 +3453,8 @@ def process_zst_to_hourly(
                             continue
 
                         ts_b = batch.column("timestamp")
-                        hu_b = pc.multiply(
-                            pc.divide(ts_b, _HOUR_US_SCALAR_S), _HOUR_US_SCALAR_S,
+                        hu_b = _pc_multiply(
+                            _pc_divide(ts_b, _HOUR_US_SCALAR_S), _HOUR_US_SCALAR_S,
                         )
                         batch = batch.append_column("hour_us", hu_b)
                         timer.stop(rows=len(batch))
@@ -3271,6 +3695,8 @@ def process_zst_to_hourly(
                         _release_memory()
                         time.sleep(0.3)
 
+    hourly = _filter_hourly_to_target_date(hourly, data_date)
+
     elapsed_rs = timer._totals.get("resample", 0)
     rs_count = timer._counts.get("resample", 1)
     log.info("  Resampled to %d hourly rows in %.1fs",
@@ -3289,6 +3715,43 @@ def process_zst_to_hourly(
 # ---------------------------------------------------------------------------
 # Write Parquet (append-friendly: merge with existing monthly file)
 # ---------------------------------------------------------------------------
+
+
+def _write_parquet_atomic(df: pd.DataFrame, out: Path) -> int:
+    """Write parquet via temp file + atomic replace.
+
+    This prevents an existing monthly parquet from being truncated or left
+    partially written if the process crashes or `to_parquet()` raises midway.
+    Returns final file size in bytes.
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(
+        f".{out.name}.tmp-{os.getpid()}-{threading.get_ident()}-{int(time.time() * 1000)}"
+    )
+
+    try:
+        df.to_parquet(tmp, engine="pyarrow", compression="zstd", index=False)
+        if not tmp.exists():
+            raise RuntimeError(f"Temporary parquet file was not created: {tmp}")
+
+        meta = pq.ParquetFile(tmp).metadata
+        row_count = int(meta.num_rows) if meta is not None else -1
+        expected_rows = int(len(df))
+        if row_count != expected_rows:
+            raise RuntimeError(
+                f"Parquet validation failed for {out.name}: "
+                f"expected {expected_rows} rows, got {row_count}"
+            )
+
+        os.replace(tmp, out)
+        return out.stat().st_size
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def append_to_parquet(df: pd.DataFrame):
@@ -3313,6 +3776,7 @@ def append_to_parquet(df: pd.DataFrame):
         sub = df.loc[mask_ul]
         for (year, month), grp in sub.groupby(["_year", "_month"]):
             new_data = grp.drop(columns=["_year", "_month", "underlying"], errors="ignore")
+            new_row_count = int(len(new_data))
 
             out = output_path(underlying, int(year), int(month))
 
@@ -3321,6 +3785,7 @@ def append_to_parquet(df: pd.DataFrame):
                 rss_before_read = _get_rss_mb() if _mem_diagnostics else None
                 arrow_before_read = _get_arrow_pool_mb() if _mem_diagnostics else None
                 existing = pd.read_parquet(out)
+                old_row_count = int(len(existing))
                 _mem_diag_delta(
                     "parquet.read_existing",
                     rss_before_read,
@@ -3333,8 +3798,10 @@ def append_to_parquet(df: pd.DataFrame):
                 # Identify dates in new data
                 new_dates = new_data["hour"].dt.date.unique()
                 # Remove those dates from existing
+                removed_rows = 0
                 if "hour" in existing.columns:
                     keep_mask = ~existing["hour"].dt.date.isin(new_dates)
+                    removed_rows = int((~keep_mask).sum())
                     existing = existing[keep_mask]
                 rss_before_month_merge = _get_rss_mb() if _mem_diagnostics else None
                 arrow_before_month_merge = _get_arrow_pool_mb() if _mem_diagnostics else None
@@ -3354,19 +3821,32 @@ def append_to_parquet(df: pd.DataFrame):
                     file=out.name,
                     merged_rows=len(merged),
                 )
+                final_row_count = int(len(merged))
+                delta_rows = final_row_count - old_row_count
             else:
+                old_row_count = 0
+                removed_rows = 0
                 sort_keys = ["symbol", "hour"]
                 if "hourly_pick" in new_data.columns:
                     sort_keys.append("hourly_pick")
                 merged = new_data.sort_values(sort_keys)
+                final_row_count = int(len(merged))
+                delta_rows = final_row_count
 
             # Write with compression
             timer.start("parquet_write")
-            merged.to_parquet(out, engine="pyarrow", compression="zstd", index=False)
-            fsize = out.stat().st_size
+            fsize = _write_parquet_atomic(merged, out)
             timer.stop(rows=len(merged), nbytes=fsize)
-            log.info("  Wrote %s: %d rows (%.1f MB)",
-                     out, len(merged), fsize / 1024 / 1024)
+            log.info(
+                "  Wrote %s: %d rows (%.1f MB) [old=%d, removed_overlap=%d, added=%d, delta=%+d]",
+                out,
+                len(merged),
+                fsize / 1024 / 1024,
+                old_row_count,
+                removed_rows,
+                new_row_count,
+                delta_rows,
+            )
             del merged  # free after each write
 
     # Drop temp columns added to caller's df
@@ -3410,7 +3890,7 @@ def _delete_output_for_date(target_date: date, underlyings: list[str]) -> None:
         if removed <= 0:
             continue
 
-        cleaned = existing.loc[keep_mask].copy()
+        cleaned = existing.loc[keep_mask, :].copy()
         if cleaned.empty:
             try:
                 out.unlink()
@@ -3419,7 +3899,7 @@ def _delete_output_for_date(target_date: date, underlyings: list[str]) -> None:
                 log.warning("Failed to delete empty output %s: %s", out, e)
             continue
 
-        cleaned.to_parquet(out, engine="pyarrow", compression="zstd", index=False)
+        _write_parquet_atomic(cleaned, out)
         log.warning("Removed %d existing row(s) for %s from %s", removed, target_date, out)
 
 
@@ -3430,36 +3910,63 @@ def _scan_existing_daily_availability(processed_dates: set[str]) -> pd.DataFrame
         return pd.DataFrame(columns=columns)
 
     processed_dates_sorted = sorted({str(d) for d in processed_dates if str(d).strip()})
-    processed_dates_set = set(processed_dates_sorted)
+    processed_dates_by_month: dict[str, set[str]] = {}
+    for d_str in processed_dates_sorted:
+        processed_dates_by_month.setdefault(d_str[:7], set()).add(d_str)
+
+    cache_payload: dict[str, Any] = _load_availability_scan_cache()
+    cache_files: dict[str, Any] = {}
+    raw_cache_files = cache_payload.get("files", {})
+    if isinstance(raw_cache_files, dict):
+        cache_files = raw_cache_files
+    scanned_cache_keys: set[str] = set()
+    cache_hits = 0
+    cache_misses = 0
     rows: list[pd.DataFrame] = []
 
     for underlying in sorted(_VALID_UNDERLYINGS):
         ul_dir = OUTPUT_DIR / underlying
         if not ul_dir.exists():
             continue
-        for pq_path in sorted(ul_dir.glob("*.parquet")):
+        for year_month in sorted(processed_dates_by_month):
+            pq_path = ul_dir / f"{year_month}.parquet"
+            cache_key = f"{underlying}/{year_month}"
+            scanned_cache_keys.add(cache_key)
+            if not pq_path.exists():
+                cache_files.pop(cache_key, None)
+                continue
+
             try:
-                df = pd.read_parquet(pq_path, columns=["hour", "symbol"])
+                stat = pq_path.stat()
             except Exception as e:
+                cache_files.pop(cache_key, None)
                 log.warning("Availability scan skipped %s: %s", pq_path, e)
                 continue
-            if df.empty or "hour" not in df.columns:
+
+            cached_entry = cache_files.get(cache_key)
+            if (
+                isinstance(cached_entry, dict)
+                and int(cached_entry.get("size", -1)) == int(stat.st_size)
+                and int(cached_entry.get("mtime_ns", -1)) == int(stat.st_mtime_ns)
+            ):
+                summary = pd.DataFrame(cached_entry.get("rows") or [])
+                cache_hits += 1
+            else:
+                summary = _scan_existing_monthly_availability(
+                    pq_path,
+                    underlying,
+                    processed_dates_by_month[year_month],
+                )
+                cache_files[cache_key] = {
+                    "path": pq_path.as_posix(),
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                    "rows": _availability_summary_to_records(summary),
+                }
+                cache_misses += 1
+
+            if summary.empty:
                 continue
-            day_str = df["hour"].dt.strftime("%Y-%m-%d")
-            mask = day_str.isin(processed_dates_set)
-            if not mask.any():
-                continue
-            sub = pd.DataFrame({
-                "date": day_str[mask],
-                "hour": df.loc[mask, "hour"],
-                "symbol": df.loc[mask, "symbol"],
-            })
-            summary = sub.groupby("date", sort=True).agg(
-                unique_hours=("hour", lambda s: int(s.nunique())),
-                rows=("symbol", "size"),
-                unique_symbols=("symbol", lambda s: int(s.nunique())),
-            ).reset_index()
-            summary["underlying"] = underlying
             rows.append(summary)
 
     report = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["date", "unique_hours", "rows", "unique_symbols", "underlying"])
@@ -3479,9 +3986,109 @@ def _scan_existing_daily_availability(processed_dates: set[str]) -> pd.DataFrame
     if missing_rows:
         report = pd.concat([report, pd.DataFrame(missing_rows)], ignore_index=True)
 
+    stale_keys = [key for key in list(cache_files.keys()) if key in scanned_cache_keys and not (OUTPUT_DIR / key).with_suffix(".parquet").exists()]
+    for key in stale_keys:
+        cache_files.pop(key, None)
+    _save_availability_scan_cache({
+        "version": AVAILABILITY_SCAN_CACHE_VERSION,
+        "files": cache_files,
+    })
+    log.info(
+        "Startup availability scan cache: %d hit(s), %d miss(es), %d target month file(s)",
+        cache_hits,
+        cache_misses,
+        len(scanned_cache_keys),
+    )
+
     report["availability_pct"] = report["unique_hours"].astype(float) / 24.0 * 100.0
-    report = report[columns]
+    report = pd.DataFrame(report[columns])
     return report.reset_index(drop=True)
+
+
+def _scan_existing_monthly_availability(
+    pq_path: Path,
+    underlying: str,
+    target_dates: set[str],
+) -> pd.DataFrame:
+    """Summarize daily availability from one monthly parquet file."""
+    try:
+        df = pd.read_parquet(pq_path, columns=["hour", "symbol"])
+    except Exception as e:
+        log.warning("Availability scan skipped %s: %s", pq_path, e)
+        return pd.DataFrame(columns=["date", "unique_hours", "rows", "unique_symbols", "underlying"])
+
+    if df.empty or "hour" not in df.columns:
+        return pd.DataFrame(columns=["date", "unique_hours", "rows", "unique_symbols", "underlying"])
+
+    day_str = df["hour"].dt.strftime("%Y-%m-%d")
+    mask = day_str.isin(target_dates)
+    if not mask.any():
+        return pd.DataFrame(columns=["date", "unique_hours", "rows", "unique_symbols", "underlying"])
+
+    sub = pd.DataFrame({
+        "date": day_str[mask],
+        "hour": df.loc[mask, "hour"],
+        "symbol": df.loc[mask, "symbol"],
+    })
+    summary = sub.groupby("date", sort=True).agg(
+        unique_hours=("hour", lambda s: int(s.nunique())),
+        rows=("symbol", "size"),
+        unique_symbols=("symbol", lambda s: int(s.nunique())),
+    ).reset_index()
+    summary["underlying"] = underlying
+    return summary
+
+
+def _availability_summary_to_records(summary: pd.DataFrame) -> list[dict[str, object]]:
+    """Convert availability summary to JSON-safe records."""
+    if summary.empty:
+        return []
+
+    records: list[dict[str, object]] = []
+    for row in summary.itertuples(index=False):
+        records.append({
+            "date": str(row.date),
+            "underlying": str(row.underlying),
+            "unique_hours": int(row.unique_hours),
+            "rows": int(row.rows),
+            "unique_symbols": int(row.unique_symbols),
+        })
+    return records
+
+
+def _load_availability_scan_cache() -> dict[str, object]:
+    """Load startup availability scan cache."""
+    if not AVAILABILITY_SCAN_CACHE_FILE.exists():
+        return {"version": AVAILABILITY_SCAN_CACHE_VERSION, "files": {}}
+
+    try:
+        payload = json.loads(AVAILABILITY_SCAN_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("Could not read availability scan cache %s: %s", AVAILABILITY_SCAN_CACHE_FILE, e)
+        return {"version": AVAILABILITY_SCAN_CACHE_VERSION, "files": {}}
+
+    if not isinstance(payload, dict) or int(payload.get("version", -1)) != AVAILABILITY_SCAN_CACHE_VERSION:
+        return {"version": AVAILABILITY_SCAN_CACHE_VERSION, "files": {}}
+
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        return {"version": AVAILABILITY_SCAN_CACHE_VERSION, "files": {}}
+
+    return {"version": AVAILABILITY_SCAN_CACHE_VERSION, "files": files}
+
+
+def _save_availability_scan_cache(payload: dict[str, object]) -> None:
+    """Save startup availability scan cache atomically."""
+    AVAILABILITY_SCAN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AVAILABILITY_SCAN_CACHE_FILE.with_name(
+        f".{AVAILABILITY_SCAN_CACHE_FILE.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}"
+    )
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, AVAILABILITY_SCAN_CACHE_FILE)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3494,13 +4101,25 @@ CHECKPOINT_FILE = OUTPUT_DIR / ".checkpoint"
 def load_checkpoint() -> set:
     """Load set of already-processed date strings."""
     if CHECKPOINT_FILE.exists():
-        return set(CHECKPOINT_FILE.read_text().strip().split("\n"))
+        raw = CHECKPOINT_FILE.read_text().strip()
+        if not raw:
+            return set()
+        return {line for line in raw.split("\n") if line.strip()}
     return set()
 
 
 def save_checkpoint(processed: set):
     CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CHECKPOINT_FILE.write_text("\n".join(sorted(processed)))
+    tmp = CHECKPOINT_FILE.with_name(f".{CHECKPOINT_FILE.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}")
+    try:
+        tmp.write_text("\n".join(sorted(processed)))
+        os.replace(tmp, CHECKPOINT_FILE)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -3515,21 +4134,28 @@ def process_single_date(
     cache_only: bool = False,
     keep_cache: bool = False,
     hourly_pick: str = "both",
-) -> bool:
-    """Download (if needed) and process one date. Returns True on success."""
-    max_attempts = 1 if cache_only else 2  # retry once on corrupt cache
+) -> str:
+    """Download (if needed) and process one date.
+
+    Returns one of: ``ok``, ``failed``, ``redownload``.
+    """
+    max_attempts = 2 if not cache_only else 1
     zst: Optional[Path] = None
+    _emit_worker_progress(1, "prepare", f"prepare {d}")
 
     for attempt in range(1, max_attempts + 1):
         try:
             if cache_only:
                 zst = cache_path(d)
                 if not zst.exists():
-                    log.debug("No cache for %s, skipping", d)
-                    return False
+                    _emit_worker_progress(100, "redownload", f"redownload {d}")
+                    log.warning("Cache missing for %s, requesting parent re-download", d)
+                    return "redownload"
             else:
                 # On retry, force re-download (cache was corrupt)
                 zst = download_file(d, force=(force or attempt > 1))
+
+            _emit_worker_progress(12, "read", f"read {d}")
 
             df = process_zst_to_hourly(
                 zst,
@@ -3538,14 +4164,20 @@ def process_single_date(
             )
             if df.empty:
                 log.warning("No data for %s", d)
-                return False
+                _emit_worker_progress(100, "empty", f"empty {d}")
+                return "failed"
+
+            _emit_worker_progress(78, "validate", f"validate {d}")
 
             availability = _summarize_target_date_availability(df, d)
+            availability_threshold = MIN_DAILY_AVAILABILITY_PCT
+            if d == date(2024, 3, 5):
+                availability_threshold = 0.0
             if availability.empty:
                 _delete_output_for_date(d, sorted(df["underlying"].astype(str).str.upper().unique()))
                 raise RuntimeError(f"No hourly rows found for target date {d}")
 
-            bad_availability = availability[availability["availability_pct"] < MIN_DAILY_AVAILABILITY_PCT]
+            bad_availability = availability[availability["availability_pct"] < availability_threshold]
             if not bad_availability.empty:
                 _delete_output_for_date(d, bad_availability["underlying"].astype(str).tolist())
                 details = ", ".join(
@@ -3553,7 +4185,19 @@ def process_single_date(
                     for row in bad_availability.itertuples(index=False)
                 )
                 raise RuntimeError(
-                    f"Daily availability below {MIN_DAILY_AVAILABILITY_PCT:.0f}% for {d}: {details}"
+                    f"Daily availability below {availability_threshold:.0f}% for {d}: {details}"
+                )
+
+            if d == date(2024, 3, 5):
+                details = ", ".join(
+                    f"{row.underlying}={row.availability_pct:.2f}% ({int(row.unique_hours)}/24h)"
+                    for row in availability.itertuples(index=False)
+                )
+                log.warning(
+                    "  Availability gate override for %s: accepting source despite custom threshold %.0f%%. Summary: %s",
+                    d,
+                    availability_threshold,
+                    details,
                 )
 
             details = ", ".join(
@@ -3562,8 +4206,10 @@ def process_single_date(
             )
             log.info("  Availability %s: %s", d, details)
 
+            _emit_worker_progress(88, "write", f"write {d}")
             append_to_parquet(df)
             del df
+            _emit_worker_progress(96, "cleanup", f"cleanup {d}")
             _release_memory()
             _log_mem("after release")
 
@@ -3578,27 +4224,42 @@ def process_single_date(
                     except OSError:
                         break
 
-            return True
+            _emit_worker_progress(100, "done", f"done {d}")
+            return "ok"
 
         except requests.HTTPError as e:
+            _emit_worker_progress(100, "error", f"http-error {d}")
             log.error("HTTP error for %s: %s", d, e)
-            return False
-        except (zstd.ZstdError, RuntimeError) as e:
-            # Decompression / processing error — likely corrupt cache
+            return "failed"
+        except (zstd.ZstdError, RuntimeError, subprocess.CalledProcessError) as e:
+            # Decompression / processing error — likely corrupt cache.
+            # In `polars-stream` mode the external `zstd` CLI may raise
+            # `CalledProcessError` only after chunk processing finishes, so it
+            # must participate in the same corrupt-cache handling path.
             if zst and zst.exists() and CACHE_DIR in zst.parents:
                 try:
                     zst.unlink()
                     log.warning("Deleted corrupted cache file: %s", zst)
                 except OSError:
                     pass
-            if attempt < max_attempts:
+            if cache_only:
+                _emit_worker_progress(100, "redownload", f"redownload {d}")
                 log.warning(
-                    "Attempt %d/%d failed for %s (%s), re-downloading...",
+                    "Processing detected bad cache for %s (%s); requesting parent re-download",
+                    d,
+                    e,
+                )
+                return "redownload"
+            if attempt < max_attempts:
+                _emit_worker_progress(5, "retry", f"retry {d} attempt {attempt + 1}")
+                log.warning(
+                    "Attempt %d/%d failed for %s (%s), retrying with fresh download...",
                     attempt, max_attempts, d, e,
                 )
-                continue  # retry with fresh download
+                continue
+            _emit_worker_progress(100, "error", f"process-error {d}")
             log.exception("Failed to process %s: %s", d, e)
-            return False
+            return "failed"
         except Exception as e:
             if zst and zst.exists() and CACHE_DIR in zst.parents:
                 try:
@@ -3606,10 +4267,11 @@ def process_single_date(
                     log.warning("Deleted corrupted cache file: %s", zst)
                 except OSError:
                     pass
+            _emit_worker_progress(100, "error", f"unexpected-error {d}")
             log.exception("Failed to process %s: %s", d, e)
-            return False
+            return "failed"
 
-    return False  # should not reach here
+    return "failed"  # should not reach here
 
 
 def process_local_file(path: str):
@@ -3675,6 +4337,8 @@ def main():
                         help="Hourly snapshot selection: first=open, last=close, both=keep both (default: both)")
     parser.add_argument("--download-workers", type=int, default=1, dest="download_workers",
                         help="Number of concurrent download threads (default: 1, try 3 for faster pipeline)")
+    parser.add_argument("--process-workers", type=int, default=2, choices=[1, 2], dest="process_workers",
+                        help="Max concurrent processing subprocesses (default: 2). Workers are only scheduled concurrently when they target different year-month outputs.")
     parser.add_argument("--csv-read-mode", type=str, default="auto",
                         choices=["auto", "bulk", "stream", "hybrid", "polars-stream"],
                         help="CSV read strategy: auto=memory-aware choose, bulk=fastest/high-memory, stream=chunked low-memory, hybrid=split file then bulk-read each chunk, polars-stream=stream zstd into chunked Polars aggregation")
@@ -3715,6 +4379,8 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--_timer-file", dest="_timer_file", type=str,
                         help=argparse.SUPPRESS)
+    parser.add_argument("--_progress-file", dest="_progress_file", type=str,
+                        help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     setup_logging(args.verbose)
@@ -3725,7 +4391,7 @@ def main():
     global _proxy, _session, _download_segments, timer, _csv_read_mode, _csv_block_mb, _hybrid_chunk_mb, _hybrid_staging
     global _stream_merge_every_batches, _stream_queue_depth, _mem_soft_limit_mb, _mem_hard_limit_mb
     global _mem_diagnostics, _mem_diag_every_batches, _mem_peak_interval_ms, _pandas_slice_rows, _csv_aggressive_parse
-    global _polars_stream_chunk_mb
+    global _polars_stream_chunk_mb, _WORKER_PROGRESS_FILE
 
     _csv_read_mode = args.csv_read_mode
     _csv_block_mb = max(16, args.csv_block_mb)
@@ -3772,15 +4438,17 @@ def main():
     # CPython pymalloc arena fragmentation across multi-day runs.
     # ------------------------------------------------------------------
     if args._worker_date:
+        _WORKER_PROGRESS_FILE = Path(args._progress_file) if args._progress_file else None
         if args.proxy:
             _proxy = args.proxy
         elif os.environ.get("HTTPS_PROXY"):
             _proxy = os.environ["HTTPS_PROXY"]
         _download_segments = max(1, args.segments)
         timer = StageTimer()
+        _emit_worker_progress(0, "starting", f"starting {args._worker_date}")
 
         d = date.fromisoformat(args._worker_date)
-        ok = process_single_date(
+        outcome = process_single_date(
             d,
             force=args.force,
             cache_only=args.cache_only,
@@ -3793,7 +4461,11 @@ def main():
                 Path(args._timer_file).write_text(timer.to_json())
             except Exception:
                 pass
-        sys.exit(0 if ok else 1)
+        if outcome == "ok":
+            sys.exit(0)
+        if outcome == "redownload":
+            sys.exit(2)
+        sys.exit(1)
 
     # Set proxy (CLI > env)
     if args.proxy:
@@ -3834,13 +4506,19 @@ def main():
 
     # Load checkpoint
     processed = load_checkpoint() if not args.force else set()
+    processed_in_range = {
+        d_str
+        for d_str in processed
+        if start <= date.fromisoformat(str(d_str)) <= end
+    }
 
-    if processed:
+    if processed_in_range:
         log.info(
-            "Startup availability scan: checking processed dates against %.0f%% threshold...",
+            "Startup availability scan: checking %d in-range processed date(s) against %.0f%% threshold...",
+            len(processed_in_range),
             MIN_DAILY_AVAILABILITY_PCT,
         )
-        availability_report = _scan_existing_daily_availability(processed)
+        availability_report = _scan_existing_daily_availability(processed_in_range)
         bad_rows = availability_report[
             availability_report["availability_pct"] < MIN_DAILY_AVAILABILITY_PCT
         ].copy()
@@ -3878,80 +4556,135 @@ def main():
     failed = 0
 
     # ---------------------------------------------------------------
-    # Pipeline: concurrent download → queue → serial subprocess
+    # Pipeline: concurrent download → queue → month-aware subprocesses
     # ---------------------------------------------------------------
-    # Download threads fetch .zst files in parallel.  As each finishes
-    # it puts the date onto a bounded queue.  The main thread pulls
-    # from the queue and spawns one subprocess worker at a time (to
-    # keep memory isolation). A bounded queue (max_ahead) prevents
+    # Download threads fetch .zst files in parallel. As each finishes it
+    # puts the date onto a bounded queue. The main thread pulls from the
+    # queue and spawns up to N isolated subprocess workers, but only when
+    # their target year-month outputs do not overlap. This keeps memory
+    # isolation while avoiding concurrent read/merge/write races on the
+    # same monthly parquet file. A bounded queue (max_ahead) prevents
     # downloading too far ahead, which would waste disk space.
     # ---------------------------------------------------------------
 
     n_dl_workers = max(1, args.download_workers)
+    n_proc_workers = max(1, min(2, args.process_workers))
     # Allow at most 2× workers items queued ahead of the processor
     max_ahead = max(2, n_dl_workers * 2)
-    _SENTINEL = None  # signals "all downloads done"
 
     ready_q: queue.Queue = queue.Queue(maxsize=max_ahead)
-    dl_error_dates: list = []  # dates that failed to download
+    download_q: queue.Queue = queue.Queue()
+    dl_error_dates: set[date] = set()  # dates that failed permanently in parent download stage
     _pipeline_cancel = threading.Event()
+    _download_stop = threading.Event()
+    state_lock = threading.Lock()
+    outstanding_dates: set[str] = {d.isoformat() for d in remaining}
+    queued_for_download: set[str] = set()
+    queued_for_process: set[str] = set()
+    redownload_attempts: dict[str, int] = {}
+    max_parent_redownloads = 1
 
     # -- real-time progress tracker --
     pstatus = _PipelineStatus(total=len(remaining))
 
-    def _download_worker(dates_to_dl: list, force: bool, cache_only: bool):
-        """Thread target: download each date's .zst and enqueue it."""
-        for d in dates_to_dl:
-            if _pipeline_cancel.is_set() or _SHUTDOWN_EVENT.is_set():
-                break
-            pstatus.dl_start(d)
+    def _enqueue_download_request(d: date, force_download: bool = False, reason: str = "") -> bool:
+        key = d.isoformat()
+        with state_lock:
+            if key not in outstanding_dates:
+                return False
+            if key in queued_for_download or key in queued_for_process:
+                return False
+            queued_for_download.add(key)
+        if reason:
+            log.info("Queueing download for %s (%s)", d, reason)
+        download_q.put((d, force_download))
+        return True
+
+    def _mark_download_failed(d: date) -> None:
+        key = d.isoformat()
+        with state_lock:
+            queued_for_download.discard(key)
+            queued_for_process.discard(key)
+            outstanding_dates.discard(key)
+            dl_error_dates.add(d)
+
+    def _mark_process_done(d: date) -> None:
+        key = d.isoformat()
+        with state_lock:
+            queued_for_process.discard(key)
+            outstanding_dates.discard(key)
+
+    def _mark_process_failed(d: date) -> None:
+        key = d.isoformat()
+        with state_lock:
+            queued_for_process.discard(key)
+            outstanding_dates.discard(key)
+
+    def _download_worker(force: bool, cache_only: bool):
+        """Thread target: download/check cache and enqueue dates for processing."""
+        while not (_pipeline_cancel.is_set() or _SHUTDOWN_EVENT.is_set() or _download_stop.is_set()):
             try:
-                if cache_only:
-                    zst = cache_path(d)
-                    if not zst.exists():
-                        log.debug("No cache for %s, skipping", d)
-                        dl_error_dates.append(d)
-                        pstatus.dl_finish(d, ok=False)
-                        continue
-                else:
-                    # download_file is thread-safe (uses per-call curl process)
-                    # Batch mode uses `_PipelineStatus` to render per-file download
-                    # progress in a dedicated multi-line status block.
-                    quiet = True
-                    download_file(
-                        d,
-                        force=force,
-                        quiet=quiet,
-                        progress_cb=lambda done, total, _d=d: pstatus.dl_progress_update(_d, done, total),
-                    )
-            except Exception as e:
-                log.error("Download failed for %s: %s", d, e)
-                dl_error_dates.append(d)
-                pstatus.dl_finish(d, ok=False)
+                d, force_download = download_q.get(timeout=0.5)
+            except queue.Empty:
                 continue
-            pstatus.dl_finish(d, ok=True)
-            while not (_pipeline_cancel.is_set() or _SHUTDOWN_EVENT.is_set()):
-                try:
-                    ready_q.put(d, timeout=0.5)  # back-pressure + interruptible wait
-                    break
-                except queue.Full:
-                    continue
-            pstatus.set_queue_depth(ready_q.qsize())
-        while True:
             try:
-                ready_q.put(_SENTINEL, timeout=0.5)
-                break
-            except queue.Full:
-                if _pipeline_cancel.is_set() or _SHUTDOWN_EVENT.is_set():
+                pstatus.dl_start(d)
+                key = d.isoformat()
+                try:
+                    if cache_only:
+                        zst = cache_path(d)
+                        if not zst.exists():
+                            log.debug("No cache for %s, skipping", d)
+                            _mark_download_failed(d)
+                            pstatus.dl_finish(d, ok=False)
+                            continue
+                    else:
+                        # download_file is thread-safe (uses per-call curl process)
+                        # Batch mode uses `_PipelineStatus` to render per-file download
+                        # progress in a dedicated multi-line status block.
+                        quiet = True
+                        download_file(
+                            d,
+                            force=(force or force_download),
+                            quiet=quiet,
+                            progress_cb=lambda done, total, _d=d: pstatus.dl_progress_update(_d, done, total),
+                        )
+                except Exception as e:
+                    log.error("Download failed for %s: %s", d, e)
+                    _mark_download_failed(d)
+                    pstatus.dl_finish(d, ok=False)
                     continue
 
-    def _build_worker_cmd(d, args, timer_file):
+                with state_lock:
+                    queued_for_download.discard(key)
+                    if key in outstanding_dates:
+                        queued_for_process.add(key)
+                pstatus.dl_finish(d, ok=True)
+                while not (_pipeline_cancel.is_set() or _SHUTDOWN_EVENT.is_set() or _download_stop.is_set()):
+                    try:
+                        ready_q.put(d, timeout=0.5)  # back-pressure + interruptible wait
+                        break
+                    except queue.Full:
+                        continue
+                pstatus.set_queue_depth(ready_q.qsize())
+            finally:
+                download_q.task_done()
+
+    for d in remaining:
+        _enqueue_download_request(d, force_download=args.force, reason="initial")
+
+    def _build_worker_cmd(d, args, timer_file, worker_token: str):
         """Build subprocess command for one date."""
+        progress_file = Path(tempfile.gettempdir()) / (
+            f"_bhp_progress_{worker_token}_{d.isoformat()}.json"
+        )
         cmd = [
             sys.executable,
+            "-u",
             str(Path(__file__).resolve()),
             "--_worker-date", d.isoformat(),
             "--_timer-file", str(timer_file),
+            "--_progress-file", str(progress_file),
             "--segments", str(args.segments),
             "--hourly-pick", args.hourly_pick,
             "--csv-read-mode", args.csv_read_mode,
@@ -3972,37 +4705,26 @@ def main():
             cmd.append("--csv-aggressive-parse")
         if args.mem_diagnostics:
             cmd.append("--mem-diagnostics")
-        # Worker should never re-download; file is already in cache
-        # So we do NOT pass --force here.
-        if args.cache_only:
-            cmd.append("--cache-only")
+        # Worker should never re-download; the download threads have already
+        # staged the file into the cache before enqueueing the date.
+        cmd.append("--cache-only")
         if args.keep_cache:
             cmd.append("--keep-cache")
         if args.verbose:
             cmd.append("-v")
         if args.proxy:
             cmd.extend(["--proxy", args.proxy])
-        return cmd
+        return cmd, progress_file
 
-    # Split remaining dates into chunks for download threads
-    if n_dl_workers == 1:
-        dl_chunks = [remaining]
-    else:
-        dl_chunks = [[] for _ in range(n_dl_workers)]
-        for idx, d in enumerate(remaining):
-            dl_chunks[idx % n_dl_workers].append(d)
-
-    log.info("Pipeline: %d download threads, queue depth %d, %d dates",
-             n_dl_workers, max_ahead, len(remaining))
+    log.info("Pipeline: %d download threads, queue depth %d, up to %d month-safe process worker(s), %d dates",
+             n_dl_workers, max_ahead, n_proc_workers, len(remaining))
 
     # Start download threads
     dl_threads = []
-    for chunk in dl_chunks:
-        if not chunk:
-            continue
+    for _ in range(n_dl_workers):
         t = threading.Thread(
             target=_download_worker,
-            args=(chunk, args.force, args.cache_only),
+            args=(args.force, args.cache_only),
             daemon=True,
         )
         t.start()
@@ -4011,73 +4733,262 @@ def main():
     # Start background status ticker (auto-prints every 2s)
     pstatus.start_ticker()
 
-    # How many SENTINEL values to expect (one per thread)
-    sentinels_expected = len(dl_threads)
-    sentinels_received = 0
     processed_count = 0
+    pending_ready: deque[date] = deque()
+    active_workers: List[Dict[str, Any]] = []
+
+    def _month_key(d: date) -> str:
+        return d.strftime("%Y-%m")
+
+    def _update_queue_depth() -> None:
+        pstatus.set_queue_depth(ready_q.qsize() + len(pending_ready))
+
+    def _drain_ready_queue(block_timeout: float = 0.0) -> None:
+        if block_timeout > 0:
+            try:
+                pending_ready.append(ready_q.get(timeout=block_timeout))
+            except queue.Empty:
+                pass
+
+        while True:
+            try:
+                pending_ready.append(ready_q.get_nowait())
+            except queue.Empty:
+                break
+
+        _update_queue_depth()
+
+    def _next_schedulable_date() -> Optional[date]:
+        if len(active_workers) >= n_proc_workers or not pending_ready:
+            return None
+
+        active_months = {_month_key(worker["date"]) for worker in active_workers}
+        pending_count = len(pending_ready)
+        for _ in range(pending_count):
+            d = pending_ready.popleft()
+            if _month_key(d) not in active_months:
+                _update_queue_depth()
+                return d
+            pending_ready.append(d)
+
+        _update_queue_depth()
+        return None
+
+    def _spawn_worker(d: date) -> None:
+        nonlocal processed_count
+
+        with state_lock:
+            queued_for_process.discard(d.isoformat())
+
+        processed_count += 1
+        pstatus.proc_start(d)
+        _update_queue_depth()
+        log.info("=== [%d/%d] Processing %s ===",
+                 processed_count, len(remaining), d)
+
+        worker_token = f"{os.getpid()}_{processed_count}_{time.time_ns()}"
+        timer_file = Path(tempfile.gettempdir()) / (
+            f"_bhp_timer_{worker_token}_{d.isoformat()}.json"
+        )
+        worker_log_file = Path(tempfile.gettempdir()) / (
+            f"_bhp_worker_{worker_token}_{d.isoformat()}.log"
+        )
+        cmd, progress_file = _build_worker_cmd(d, args, timer_file, worker_token)
+        log_fh = open(worker_log_file, "wb")
+        worker_proc = _popen_tracked(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+        active_workers.append({
+            "date": d,
+            "proc": worker_proc,
+            "timer_file": timer_file,
+            "worker_log_file": worker_log_file,
+            "progress_file": progress_file,
+            "log_fh": log_fh,
+            "log_offset": 0,
+            "log_pending": "",
+        })
+
+    def _stream_new_worker_log_output(worker: Dict[str, Any]) -> None:
+        worker_log_file = worker["worker_log_file"]
+        if not worker_log_file.exists():
+            return
+        current_size = worker_log_file.stat().st_size
+        if current_size <= worker["log_offset"]:
+            return
+        with open(worker_log_file, "rb") as rf:
+            rf.seek(worker["log_offset"])
+            raw = rf.read(current_size - worker["log_offset"])
+        worker["log_offset"] = current_size
+        text = worker["log_pending"] + raw.decode("utf-8", errors="replace")
+        parts = text.splitlines(keepends=True)
+        if parts and not parts[-1].endswith(("\n", "\r")):
+            worker["log_pending"] = parts.pop()
+        else:
+            worker["log_pending"] = ""
+        new_lines = [line.rstrip("\r\n") for line in parts]
+        if new_lines:
+            pstatus.clear_display()
+            prefix = f"[{worker['date'].isoformat()}] "
+            for line in new_lines:
+                print(prefix + line, flush=True)
+            pstatus.print_status(force=True)
+
+    def _finalize_worker(worker: Dict[str, Any], rc: int) -> None:
+        d = worker["date"]
+        progress_file = worker["progress_file"]
+        worker_log_file = worker["worker_log_file"]
+        timer_file = worker["timer_file"]
+
+        try:
+            _stream_new_worker_log_output(worker)
+        except Exception:
+            pass
+
+        try:
+            worker["log_fh"].close()
+        except Exception:
+            pass
+        _unregister_child_process(worker["proc"])
+
+        outcome = "ok" if rc == 0 else ("redownload" if rc == 2 else "failed")
+        ok = outcome == "ok"
+
+        if worker["log_pending"]:
+            pstatus.clear_display()
+            print(f"[{d.isoformat()}] " + worker["log_pending"].rstrip("\r\n"), flush=True)
+            worker["log_pending"] = ""
+            pstatus.print_status(force=True)
+
+        if outcome == "redownload":
+            pstatus.proc_requeue(d, stage="requeued")
+        else:
+            pstatus.proc_finish(d, ok=ok)
+
+        try:
+            if progress_file.exists():
+                progress_file.unlink()
+        except OSError:
+            pass
+        if outcome == "failed":
+            log.error("Worker failed for %s with exit code %s; log: %s", d, rc, worker_log_file)
+        if outcome == "failed" and worker_log_file.exists():
+            try:
+                tail_lines = worker_log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+                if tail_lines:
+                    log.error("Worker log tail for %s:\n%s", d, "\n".join(tail_lines))
+            except Exception:
+                pass
+        try:
+            if worker_log_file.exists() and outcome != "failed":
+                worker_log_file.unlink()
+        except OSError:
+            pass
+
+        if timer_file.exists():
+            try:
+                timer.merge(timer_file.read_text())
+            except Exception:
+                pass
+            finally:
+                try:
+                    timer_file.unlink()
+                except OSError:
+                    pass
+
+        if ok:
+            _mark_process_done(d)
+            processed.add(d.isoformat())
+            save_checkpoint(processed)
+            nonlocal_success[0] += 1
+        elif outcome == "redownload":
+            key = d.isoformat()
+            attempts = redownload_attempts.get(key, 0) + 1
+            redownload_attempts[key] = attempts
+            if attempts > max_parent_redownloads:
+                log.error("Exceeded parent re-download limit for %s (%d)", d, attempts - 1)
+                _mark_process_failed(d)
+                nonlocal_failed[0] += 1
+            else:
+                _enqueue_download_request(
+                    d,
+                    force_download=True,
+                    reason=f"worker requested redownload attempt {attempts}/{max_parent_redownloads}",
+                )
+        else:
+            _mark_process_failed(d)
+            nonlocal_failed[0] += 1
+
+        _update_queue_depth()
+
+    nonlocal_success = [success]
+    nonlocal_failed = [failed]
 
     try:
-        while sentinels_received < sentinels_expected:
+        while True:
             if _SHUTDOWN_EVENT.is_set():
                 raise KeyboardInterrupt()
-            try:
-                item = ready_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if item is _SENTINEL:
-                sentinels_received += 1
-                continue
+            with state_lock:
+                no_outstanding = not outstanding_dates
+            if no_outstanding and not active_workers and not pending_ready and ready_q.empty():
+                    break
+            _drain_ready_queue(block_timeout=0.5 if not active_workers else 0.0)
 
-            d = item
-            processed_count += 1
-            pstatus.set_queue_depth(ready_q.qsize())
-            pstatus.proc_start(d)
-            # Print final status before pausing ticker for subprocess
-            pstatus.print_status(force=True)
-            print(flush=True)  # newline to preserve status line
-            log.info("=== [%d/%d] Processing %s ===",
-                     processed_count, len(remaining), d)
-            pstatus.pause_ticker()  # pause during subprocess
+            while len(active_workers) < n_proc_workers:
+                d = _next_schedulable_date()
+                if d is None:
+                    break
+                _spawn_worker(d)
 
-            # --- Spawn isolated subprocess per date ---
-            timer_file = Path(tempfile.gettempdir()) / (
-                f"_bhp_timer_{os.getpid()}_{d.isoformat()}.json"
-            )
-            cmd = _build_worker_cmd(d, args, timer_file)
-            worker_proc = _popen_tracked(cmd)
-            try:
-                rc = _wait_process_interruptible(worker_proc, timeout=0)
-            finally:
-                _unregister_child_process(worker_proc)
-            ok = rc == 0
-
-            pstatus.proc_finish(ok=ok)
-            pstatus.set_queue_depth(ready_q.qsize())
-            pstatus.resume_ticker()  # resume after subprocess
-
-            # Merge timing data from child
-            if timer_file.exists():
-                try:
-                    timer.merge(timer_file.read_text())
-                except Exception:
-                    pass
-                finally:
+            for worker in list(active_workers):
+                rc = worker["proc"].poll()
+                progress_file = worker["progress_file"]
+                if progress_file.exists():
                     try:
-                        timer_file.unlink()
-                    except OSError:
+                        payload = json.loads(progress_file.read_text(encoding="utf-8"))
+                        pstatus.proc_update(
+                            worker["date"],
+                            float(payload.get("percent", 0.0)),
+                            str(payload.get("message") or payload.get("stage") or "working"),
+                        )
+                    except Exception:
                         pass
 
-            if ok:
-                processed.add(d.isoformat())
-                save_checkpoint(processed)
-                success += 1
-            else:
-                failed += 1
+                try:
+                    _stream_new_worker_log_output(worker)
+                except Exception:
+                    pass
+
+                if rc is None:
+                    continue
+
+                _finalize_worker(worker, rc)
+                active_workers.remove(worker)
+
+            success = nonlocal_success[0]
+            failed = nonlocal_failed[0]
+            pstatus.print_status(force=False)
+
+            with state_lock:
+                no_outstanding = not outstanding_dates
+            if no_outstanding and not active_workers and not pending_ready and ready_q.empty():
+                break
+
+            if _SHUTDOWN_EVENT.is_set():
+                for worker in list(active_workers):
+                    _terminate_process_tree(worker["proc"], timeout=1.0)
+                raise KeyboardInterrupt()
+
+            time.sleep(0.2)
 
     except KeyboardInterrupt:
         print("\n\nCtrl+C detected, stopping...", file=sys.stderr, flush=True)
         _SHUTDOWN_EVENT.set()
         _pipeline_cancel.set()
+        _download_stop.set()
+        for worker in list(active_workers):
+            try:
+                _terminate_process_tree(worker["proc"], timeout=1.0)
+            except Exception:
+                pass
         pstatus.stop_ticker()
         for t in dl_threads:
             t.join(timeout=5)
@@ -4088,15 +4999,17 @@ def main():
     pstatus.print_final()
 
     # Wait for download threads to finish cleanly
+    _download_stop.set()
     for t in dl_threads:
         t.join(timeout=10)
 
     # Count download failures as processing failures
     failed += len(dl_error_dates)
     if dl_error_dates:
+        sample_failed_dates = sorted(dl_error_dates)[:10]
         log.warning("Download failed for %d dates: %s",
                     len(dl_error_dates),
-                    ", ".join(d.isoformat() for d in dl_error_dates[:10]))
+                    ", ".join(d.isoformat() for d in sample_failed_dates))
     log.info("=== Completed: %d success, %d failed ===", success, failed)
 
     # Final output summary

@@ -1,7 +1,4 @@
 """Quick standalone check of the existing ic_0dte_8pct_direct.yaml backtest."""
-import sys
-sys.path.insert(0, "src")
-
 from options_backtest.config import Config
 from options_backtest.engine.backtest import BacktestEngine
 from options_backtest.analytics.metrics import compute_metrics

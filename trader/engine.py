@@ -159,6 +159,7 @@ class TradingEngine:
         last_tick_ago = (
             time.time() - self._last_tick_time if self._last_tick_time else None
         )
+        strategy_status = self.strategy.status() if self.strategy else {}
 
         return {
             "running": self.is_running,
@@ -173,6 +174,7 @@ class TradingEngine:
             "open_positions": (
                 self.pos_mgr.open_position_count if self.pos_mgr else 0
             ),
+            "strategy_status": strategy_status,
         }
 
     def close_all_positions(self) -> float:
@@ -363,10 +365,23 @@ class TradingEngine:
             balance_str = "error"
             upnl_str = "error"
 
+        rv_str = "-"
+        basket_str = "-"
+        try:
+            strategy_status = self.strategy.status() if self.strategy else {}
+            rv_val = strategy_status.get("entry_realized_vol_current")
+            basket_val = strategy_status.get("basket_pnl_pct")
+            if isinstance(rv_val, (int, float)):
+                rv_str = f"{rv_val:.2%}"
+            if isinstance(basket_val, (int, float)):
+                basket_str = f"{basket_val:.1f}%"
+        except Exception:
+            pass
+
         logger.info(
             f"[Heartbeat] {now_str} UTC | "
             f"balance={balance_str} | upnl={upnl_str} | "
-            f"positions={pos_count} | ticks={self._tick_count}"
+            f"positions={pos_count} | rv24={rv_str} | basket={basket_str} | ticks={self._tick_count}"
         )
 
     def _on_shutdown(self) -> None:

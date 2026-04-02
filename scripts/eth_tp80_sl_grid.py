@@ -1,6 +1,5 @@
 ﻿"""ETH TP80/SL150+W4% vs TP80/SL200+W4% comparison."""
 import sys
-sys.path.insert(0, "src")
 from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="WARNING")

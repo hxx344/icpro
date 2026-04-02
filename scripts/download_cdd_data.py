@@ -28,12 +28,13 @@ import aiohttp
 import pandas as pd
 from tqdm import tqdm
 
+from cdd_secrets import get_cdd_api_token
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 API_BASE = "https://api.cryptodatadownload.com/v1"
-API_TOKEN = "368ca0bd2ccf5620aa35c50f9a11a65943589b49"
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "market_data"
 CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / ".cache"
@@ -76,9 +77,9 @@ class AsyncRateLimiter:
 class CDDClient:
     """Async client for CryptoDataDownload API."""
 
-    def __init__(self, token: str = API_TOKEN, max_concurrent: int = MAX_CONCURRENT):
-        self.token = token
-        self.headers = {"Authorization": f"Token {token}"}
+    def __init__(self, token: str | None = None, max_concurrent: int = MAX_CONCURRENT):
+        self.token = token or get_cdd_api_token()
+        self.headers = {"Authorization": f"Token {self.token}"}
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.limiter = AsyncRateLimiter(min_interval=REQUEST_DELAY)
         self._session: aiohttp.ClientSession | None = None

@@ -1,6 +1,5 @@
 ﻿"""BTC 0DTE ATM + Wing4% : TP80 with different SL levels."""
 import sys
-sys.path.insert(0, "src")
 from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="WARNING")

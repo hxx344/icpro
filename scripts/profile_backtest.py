@@ -1,7 +1,6 @@
 """Profile backtest execution to identify bottlenecks."""
 import sys
 import time
-sys.path.insert(0, "src")
 
 from options_backtest.config import Config
 from options_backtest.engine.backtest import BacktestEngine

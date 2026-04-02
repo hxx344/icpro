@@ -1,5 +1,5 @@
 """BTC DTE=7 ATM Short Strangle — open Friday, hold to settlement."""
-import sys; sys.path.insert(0, 'src')
+import sys
 from loguru import logger; logger.remove(); logger.add(sys.stderr, level='WARNING')
 
 from options_backtest.config import Config

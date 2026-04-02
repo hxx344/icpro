@@ -98,10 +98,11 @@ def run(config: str):
     print_metrics(metrics)
 
     # Plots
-    output_dir = cfg.report.output_dir
-    paths = generate_all_plots(results, output_dir)
-    for p in paths:
-        logger.info(f"Chart saved: {p}")
+    if cfg.report.generate_plots:
+        output_dir = cfg.report.output_dir
+        paths = generate_all_plots(results, output_dir)
+        for p in paths:
+            logger.info(f"Chart saved: {p}")
 
 
 # -----------------------------------------------------------------------
@@ -121,6 +122,8 @@ STRATEGY_MAP = {
 # Register new strategies here
 STRATEGY_MAP.update({
     "nakedcall": "options_backtest.strategy.naked_call.NakedCallStrategy",
+    "weekendvol": "options_backtest.strategy.weekend_vol.WeekendVolStrategy",
+    "longstrangle": "options_backtest.strategy.long_strangle.LongStrangleStrategy",
 })
 
 
