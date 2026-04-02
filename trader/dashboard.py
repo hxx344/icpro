@@ -566,7 +566,10 @@ _mode_from_query = _mode_param_to_label.get(str(st.query_params.get("mode", ""))
 if not can_trade:
     _mode_from_query = "🔒 只读模式"
 if "trading_mode" not in st.session_state:
-    st.session_state.trading_mode = _mode_from_query or "🔒 只读模式"
+    if can_trade:
+        st.session_state.trading_mode = _mode_from_query or "🟢 交易模式"
+    else:
+        st.session_state.trading_mode = "🔒 只读模式"
 elif _mode_from_query and st.session_state.trading_mode != _mode_from_query:
     st.session_state.trading_mode = _mode_from_query
 
