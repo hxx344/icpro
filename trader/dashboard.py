@@ -437,6 +437,15 @@ config_path = get_config_path()
 cfg = load_config(config_path)          # ← This also loads .env into os.environ
 storage = init_storage(cfg.storage.db_path)
 
+logger.info(
+    "dashboard_run_start | config_path={} | query_params={} | session_keys={} | authenticated={} | auth_role={}",
+    config_path,
+    dict(st.query_params),
+    sorted(str(key) for key in st.session_state.keys()),
+    st.session_state.get("authenticated"),
+    st.session_state.get("auth_role"),
+)
+
 # ---------------------------------------------------------------------------
 # Login authentication (env: DASHBOARD_READONLY_* / DASHBOARD_TRADER_* / legacy DASHBOARD_*)
 # ---------------------------------------------------------------------------
@@ -474,6 +483,14 @@ def _check_login() -> bool:
         st.error(f"Dashboard 当前不可用，请联系管理员。错误编号: {error_id}")
         st.stop()
 
+    logger.info(
+        "dashboard_auth_check | credential_roles={} | authenticated={} | auth_role={} | query_params={}",
+        [item.get("role") for item in credentials],
+        st.session_state.get("authenticated"),
+        st.session_state.get("auth_role"),
+        dict(st.query_params),
+    )
+
     if not credentials:
         error_id = _new_error_id("auth")
         logger.error(f"Dashboard credentials missing | error_id={error_id}")
@@ -482,14 +499,22 @@ def _check_login() -> bool:
 
     # Already authenticated this session
     if st.session_state.get("authenticated") and st.session_state.get("auth_role") in {"readonly", "trader"}:
+        logger.info("dashboard_auth_reuse | auth_role={}", st.session_state.get("auth_role"))
         return True
     if st.session_state.get("authenticated"):
+        logger.warning(
+            "dashboard_auth_reset | authenticated={} | auth_role={} | query_params={}",
+            st.session_state.get("authenticated"),
+            st.session_state.get("auth_role"),
+            dict(st.query_params),
+        )
         st.session_state["authenticated"] = False
         st.session_state.pop("auth_role", None)
 
     # --- Login form ---
     st.markdown("## 🦅 铁鹰交易面板")
     st.caption("请输入用户名和密码登录")
+    logger.info("dashboard_login_form_render | query_params={}", dict(st.query_params))
     _col_l, col_form, _col_r = st.columns([1, 1.5, 1])
     with col_form:
         with st.form("login_form"):
@@ -507,16 +532,19 @@ def _check_login() -> bool:
                 None,
             )
             if matched is None:
+                logger.warning("dashboard_login_failed | username={}", username)
                 st.error("用户名或密码错误")
             else:
                 st.session_state["authenticated"] = True
                 st.session_state["auth_role"] = matched["role"]
+                logger.info("dashboard_login_success | username={} | role={}", username, matched["role"])
                 st.rerun()
 
     return False
 
 
 if not _check_login():
+    logger.info("dashboard_stop_after_login_gate")
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -679,6 +707,8 @@ page = st.sidebar.radio(
     ["📊 总览", "📈 资产曲线", "💰 损益记录", "📋 成交历史", "📡 期权行情", "🔧 策略配置", "🖥 引擎状态"],
     key="nav_page",
 )
+
+logger.info("dashboard_page_render | page={} | auth_role={} | trading_mode={} | query_params={}", page, auth_role, st.session_state.get("trading_mode"), dict(st.query_params))
 
 # ==========================================================================
 # PAGE: 总览 (Overview)
