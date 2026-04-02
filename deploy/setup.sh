@@ -15,9 +15,13 @@
 # ==============================================================
 set -euo pipefail
 
-APP_DIR="/opt/project_Options"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+
+APP_DIR="${APP_DIR:-$SOURCE_DIR}"
 VENV_DIR="$APP_DIR/.venv"
-SERVICE_USER="trader"
+SERVICE_USER="${SERVICE_USER:-$(id -un)}"
+SERVICE_GROUP="${SERVICE_GROUP:-$(id -gn "$SERVICE_USER" 2>/dev/null || id -gn)}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 TRADER_CONFIG_PATH="${TRADER_CONFIG_PATH:-configs/trader/weekend_vol_btc.yaml}"
 DASHBOARD_PUBLIC="${DASHBOARD_PUBLIC:-false}"
@@ -196,6 +200,36 @@ write_env_line() {
     printf "%s=%s\n" "$key" "$(escape_env_value "$value")"
 }
 
+escape_sed_replacement() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//&/\\&}
+    printf '%s' "$value"
+}
+
+install_rendered_service() {
+    local template_path="$1"
+    local target_path="$2"
+    local app_dir_escaped
+    local service_user_escaped
+    local service_group_escaped
+    local tmp_service
+
+    app_dir_escaped="$(escape_sed_replacement "$APP_DIR")"
+    service_user_escaped="$(escape_sed_replacement "$SERVICE_USER")"
+    service_group_escaped="$(escape_sed_replacement "$SERVICE_GROUP")"
+    tmp_service="$(mktemp)"
+
+    sed \
+        -e "s|/opt/project_Options|${app_dir_escaped}|g" \
+        -e "s|^User=.*$|User=${service_user_escaped}|" \
+        -e "s|^Group=.*$|Group=${service_group_escaped}|" \
+        "$template_path" > "$tmp_service"
+
+    sudo install -o root -g root -m 644 "$tmp_service" "$target_path"
+    rm -f "$tmp_service"
+}
+
 validate_required_inputs() {
     prompt_value APP_DIR "部署目录" "$APP_DIR"
     VENV_DIR="$APP_DIR/.venv"
@@ -304,7 +338,7 @@ echo "  WITH_MONITOR=$WITH_MONITOR"
 # --- 1. 系统依赖 ---
 echo "[1/6] 安装系统依赖..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq python3 python3-venv python3-pip git sqlite3
+sudo apt-get install -y -qq python3 python3-venv python3-pip git sqlite3 rsync
 
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
     echo "错误: 未找到 Python 解释器: $PYTHON_BIN"
@@ -328,11 +362,16 @@ else
 fi
 
 # --- 3. 部署代码 ---
-echo "[3/6] 部署代码到 $APP_DIR..."
+SOURCE_DIR_REAL="$(realpath "$SOURCE_DIR")"
+APP_DIR_REAL="$(realpath -m "$APP_DIR")"
 sudo mkdir -p "$APP_DIR"
-sudo rsync -a --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' \
-    "$(dirname "$(dirname "$(realpath "$0")")")/" "$APP_DIR/"
-sudo chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
+if [[ "$SOURCE_DIR_REAL" == "$APP_DIR_REAL" ]]; then
+    echo "  检测到原地部署模式，直接使用当前仓库目录"
+else
+    sudo rsync -a --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' \
+        "$SOURCE_DIR/" "$APP_DIR/"
+fi
+sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" "$APP_DIR"
 
 # --- 4. Python 虚拟环境 ---
 echo "[4/6] 创建 Python 虚拟环境并安装依赖..."
@@ -354,10 +393,10 @@ sudo -u "$SERVICE_USER" mkdir -p "$APP_DIR/data" "$APP_DIR/logs"
 
 # --- 6. 安装 systemd 服务 ---
 echo "[6/6] 安装 systemd 服务..."
-sudo cp "$APP_DIR/deploy/trader-engine.service" /etc/systemd/system/
-sudo cp "$APP_DIR/deploy/trader-dashboard.service" /etc/systemd/system/
+install_rendered_service "$APP_DIR/deploy/trader-engine.service" /etc/systemd/system/trader-engine.service
+install_rendered_service "$APP_DIR/deploy/trader-dashboard.service" /etc/systemd/system/trader-dashboard.service
 if [[ "$WITH_MONITOR" == "1" ]]; then
-    sudo cp "$APP_DIR/deploy/monitor-dashboard.service" /etc/systemd/system/
+    install_rendered_service "$APP_DIR/deploy/monitor-dashboard.service" /etc/systemd/system/monitor-dashboard.service
 fi
 
 tmp_engine_env=$(mktemp)
