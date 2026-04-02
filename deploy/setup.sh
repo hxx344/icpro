@@ -377,6 +377,11 @@ validate_required_inputs() {
         done
         exit 1
     fi
+
+    if [[ "$DASHBOARD_READONLY_USER_VALUE" == "$DASHBOARD_TRADER_USER_VALUE" && "$DASHBOARD_READONLY_PASS_VALUE" == "$DASHBOARD_TRADER_PASS_VALUE" ]]; then
+        echo "错误: Dashboard 只读账号与交易账号不能完全相同，否则登录后会始终被识别为只读权限。"
+        exit 1
+    fi
 }
 
 print_configuration_summary() {
