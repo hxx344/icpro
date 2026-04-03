@@ -182,7 +182,7 @@ class TradingEngine:
         if not self.pos_mgr:
             return 0.0
         logger.warning("[Engine] Manual close-all requested")
-        return self.pos_mgr.close_all(reason="manual_close_all")
+        return self.pos_mgr.close_all(reason="manual_close_all", execution_mode="market")
 
     # ------------------------------------------------------------------
     # Internal

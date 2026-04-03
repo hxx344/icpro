@@ -177,6 +177,41 @@ class PositionManager:
     def _infer_underlying(symbol: str) -> str:
         return str(symbol).split("-", 1)[0].upper() if symbol else "ETH"
 
+    def _refresh_order_result(
+        self,
+        symbol: str,
+        result: OrderResult,
+        client_order_id: str | None = None,
+    ) -> OrderResult:
+        """Refresh submitted order result from exchange when immediate status is ambiguous."""
+        status = str(result.status or "").upper()
+        if status not in {"NEW", "PENDING", "PARTIALLY_FILLED"}:
+            return result
+        if not getattr(self.client, "query_order", None):
+            return result
+
+        try:
+            refreshed = self.client.query_order(
+                symbol,
+                order_id=result.order_id or None,
+                client_order_id=client_order_id or None,
+            )
+        except Exception as e:
+            logger.debug(
+                f"Order refresh skipped for {symbol} orderId={result.order_id}: {e}"
+            )
+            return result
+
+        if refreshed.order_id:
+            result.order_id = refreshed.order_id
+        result.quantity = refreshed.quantity or result.quantity
+        result.price = refreshed.price or result.price
+        result.avg_price = refreshed.avg_price or result.avg_price
+        result.status = refreshed.status or result.status
+        result.fee = refreshed.fee or result.fee
+        result.raw = refreshed.raw or result.raw
+        return result
+
     # ------------------------------------------------------------------
     # Open a new short strangle (2-leg naked sell)
     # ------------------------------------------------------------------
@@ -703,12 +738,18 @@ class PositionManager:
                 })
 
             try:
+                _client_order_id = f"{leg_order.client_order_prefix}:mkt"
                 order_result = self.client.place_order(
                     symbol=leg_order.symbol,
                     side=leg_order.side,
                     quantity=leg_order.quantity,
                     order_type="MARKET",
-                    client_order_id=f"{leg_order.client_order_prefix}:mkt",
+                    client_order_id=_client_order_id,
+                )
+                order_result = self._refresh_order_result(
+                    leg_order.symbol,
+                    order_result,
+                    client_order_id=_client_order_id,
                 )
             except Exception as e:
                 logger.error(f"Position {group_id}: market order failed for {leg_order.leg_role}: {e}")
@@ -879,6 +920,11 @@ class PositionManager:
                         quantity=close_leg.quantity,
                         order_type="MARKET",
                         reduce_only=True,
+                        client_order_id=f"{group_id}:{close_leg.leg_role}:mkt_close",
+                    )
+                    order_result = self._refresh_order_result(
+                        close_leg.symbol,
+                        order_result,
                         client_order_id=f"{group_id}:{close_leg.leg_role}:mkt_close",
                     )
                 except Exception as e:

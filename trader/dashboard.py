@@ -107,6 +107,16 @@ def _get_test_order_task(task_id: str | None) -> dict | None:
         return snapshot
 
 
+def _get_latest_test_order_task_id() -> str | None:
+    with _TEST_ORDER_TASKS_LOCK:
+        if not _TEST_ORDER_TASKS:
+            return None
+        return max(
+            _TEST_ORDER_TASKS.items(),
+            key=lambda item: str(item[1].get("updated_at") or item[1].get("created_at") or ""),
+        )[0]
+
+
 def _update_test_order_task(task_id: str, **updates) -> None:
     with _TEST_ORDER_TASKS_LOCK:
         task = _TEST_ORDER_TASKS.setdefault(task_id, {})
@@ -135,6 +145,76 @@ def _format_test_order_message(progress: dict) -> str:
         "position_open_error": "测试下单异常",
     }
     return mapping.get(event, "测试下单处理中")
+
+
+def _infer_underlying_from_symbols(symbols: list[str]) -> str:
+    for symbol in symbols:
+        _symbol = str(symbol or "").strip().upper()
+        if _symbol and "-" in _symbol:
+            return _symbol.split("-", 1)[0]
+    return ""
+
+
+def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[str, object]:
+    order_summary = task.get("order_summary") or {}
+    group_id = str(task.get("result_group_id") or "")
+    attached = bool(task.get("attached_to_engine_for_stop_loss"))
+    stop_loss_pct = float(order_summary.get("stop_loss_pct") or 0.0)
+
+    runtime: dict[str, object] = {
+        "attached": attached,
+        "group_id": group_id,
+        "stop_loss_pct": stop_loss_pct,
+        "quantity": float(order_summary.get("quantity") or 0.0),
+        "state": "not_attached" if not attached else "unknown",
+    }
+    if not attached:
+        return runtime
+    if not group_id:
+        runtime["state"] = "missing_group_id"
+        return runtime
+    if not engine_ref or not engine_ref.is_running or engine_ref.pos_mgr is None or engine_ref.client is None:
+        runtime["state"] = "engine_unavailable"
+        return runtime
+
+    condor = engine_ref.pos_mgr.open_condors.get(group_id)
+    if condor is None or not condor.is_open:
+        runtime["state"] = "not_open"
+        return runtime
+
+    runtime["state"] = "active"
+    runtime["legs"] = len(condor.legs)
+    runtime["entry_credit"] = float(condor.total_premium or 0.0)
+
+    underlying = _infer_underlying_from_symbols([leg.symbol for leg in condor.legs])
+    runtime["underlying"] = underlying
+    if not underlying:
+        runtime["state"] = "active_no_underlying"
+        return runtime
+
+    try:
+        mark_prices = engine_ref.client.get_mark_prices(underlying)
+    except Exception as exc:
+        runtime["mark_prices_error"] = str(exc)
+        return runtime
+
+    entry_credit = 0.0
+    close_cost = 0.0
+    for leg in condor.legs:
+        sign = 1.0 if leg.side == "SELL" else -1.0
+        mark = float(mark_prices.get(leg.symbol, leg.entry_price) or leg.entry_price)
+        entry_credit += float(leg.entry_price) * float(leg.quantity) * sign
+        close_cost += mark * float(leg.quantity) * sign
+
+    basket_pnl = entry_credit - close_cost
+    runtime["entry_credit"] = entry_credit
+    runtime["close_cost"] = close_cost
+    runtime["basket_pnl"] = basket_pnl
+    runtime["basket_pnl_pct"] = (basket_pnl / entry_credit * 100.0) if entry_credit > 0 else None
+    if stop_loss_pct > 0 and entry_credit > 0:
+        runtime["stop_loss_trigger_close_cost"] = entry_credit * (1 + stop_loss_pct / 100.0)
+        runtime["stop_loss_trigger_pnl"] = -(entry_credit * stop_loss_pct / 100.0)
+    return runtime
 
 
 def _build_expiry_payoff_figure(
@@ -1979,7 +2059,9 @@ elif page == "🔧 策略配置":
                 # Manual test order
                 st.markdown("##### 🧪 测试下单")
                 _test_qty = 0.01
-                _active_test_task_id = st.session_state.get("preview_test_order_task_id")
+                _active_test_task_id = st.session_state.get("preview_test_order_task_id") or _get_latest_test_order_task_id()
+                if _active_test_task_id and not st.session_state.get("preview_test_order_task_id"):
+                    st.session_state["preview_test_order_task_id"] = _active_test_task_id
                 _active_test_task = _get_test_order_task(_active_test_task_id)
                 _test_task_running = bool(_active_test_task and _active_test_task.get("state") in {"queued", "running"})
                 _test_disabled_reason = None
@@ -1995,15 +2077,20 @@ elif page == "🔧 策略配置":
                 st.caption(
                     f"按当前预览目标固定发送 {_test_leg_count} 条腿市价单，每条腿数量 0.01，用于验证真实下单链路。"
                 )
+                _auto_sl_pref_key = f"preview_auto_sl_pref_{_pv_mode}_{_test_leg_count}"
+                _auto_sl_widget_key = f"preview_auto_sl_widget_{_pv_mode}_{_test_leg_count}"
+                if _auto_sl_pref_key not in st.session_state:
+                    st.session_state[_auto_sl_pref_key] = False
                 _tc1, _tc2 = st.columns([1, 2])
                 with _tc1:
                     _auto_stop_loss = st.checkbox(
                         "应用策略自动止损",
-                        value=False,
+                        value=bool(st.session_state.get(_auto_sl_pref_key, False)),
                         disabled=not _sl_supported,
                         help="勾选后，测试单成交后会接入当前引擎持仓管理，并按策略里的止损线自动监控平仓。",
-                        key=f"preview_auto_sl_{_pv_mode}_{_test_leg_count}",
+                        key=_auto_sl_widget_key,
                     )
+                    st.session_state[_auto_sl_pref_key] = bool(_auto_stop_loss)
                     _preview_test_clicked = st.button(
                         _test_button_label,
                         key=(
@@ -2042,6 +2129,17 @@ elif page == "🔧 策略配置":
 
                 if _sl_cfg_pct > 0:
                     _test_total_premium = _premium_per * _test_qty
+                    if not _is_ic:
+                        _current_close_cost_per = _sp_ask + _sc_ask
+                    else:
+                        _current_close_cost_per = (_sp_ask + _sc_ask) - (_lp_bid + _lc_bid)
+                    _current_close_cost_total = _current_close_cost_per * _test_qty
+                    _current_test_pnl_total = _test_total_premium - _current_close_cost_total
+                    _current_test_pnl_pct = (
+                        (_current_test_pnl_total / _test_total_premium) * 100.0
+                        if _test_total_premium > 0
+                        else None
+                    )
                     _stop_loss_trigger_cost_per = _premium_per * (1 + _sl_cfg_pct / 100.0)
                     _stop_loss_trigger_cost_total = _stop_loss_trigger_cost_per * _test_qty
                     _stop_loss_trigger_loss_total = _test_total_premium * _sl_cfg_pct / 100.0
@@ -2049,23 +2147,30 @@ elif page == "🔧 策略配置":
                     with _sl1:
                         st.metric("止损线", f"-{_sl_cfg_pct:.0f}%")
                     with _sl2:
-                        st.metric("预计止损亏损(0.01)", f"-${_stop_loss_trigger_loss_total:.2f}")
+                        st.metric("测试篮子净收权利金(0.01)", f"${_test_total_premium:.2f}")
                     with _sl3:
-                        st.metric("止损触发平仓成本(0.01)", f"${_stop_loss_trigger_cost_total:.2f}")
+                        st.metric(
+                            "当前测试篮子PnL(0.01)",
+                            f"${_current_test_pnl_total:.2f}",
+                            delta=(
+                                f"回补 ${_current_close_cost_total:.2f} / {_current_test_pnl_pct:+.0f}%"
+                                if _current_test_pnl_pct is not None
+                                else f"回补 ${_current_close_cost_total:.2f}"
+                            ),
+                            delta_color="normal" if _current_test_pnl_total >= 0 else "inverse",
+                        )
                     with _sl4:
-                        if not _is_ic:
-                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_total
-                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_total
-                            st.metric("到期参考点位", f"${_sl_ref_low:,.0f} / ${_sl_ref_high:,.0f}")
-                        else:
-                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_total
-                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_total
-                            st.metric("到期参考点位", f"${_sl_ref_low:,.0f} / ${_sl_ref_high:,.0f}")
+                        st.metric(
+                            "止损回补成本边界(0.01)",
+                            f"${_stop_loss_trigger_cost_total:.2f}",
+                            delta=f"触发PnL -${_stop_loss_trigger_loss_total:.2f}",
+                            delta_color="inverse",
+                        )
 
                     st.caption(
-                        "止损按实时篮子 PnL% 触发，不是固定现货价止损。上面的点位为到期静态近似参考："
-                        f"当前展示均按测试数量 {_test_qty:.2f} 计算：当本次测试单组合回补成本约达到 ${_stop_loss_trigger_cost_total:.2f} 时，"
-                        f"对应策略止损线；折算到 1.00 组约为 ${_stop_loss_trigger_cost_per:.2f}/组。"
+                        "止损按实时篮子 PnL% 触发。上面所有数字都按测试数量 "
+                        f"{_test_qty:.2f} 计算：当前测试篮子 PnL = 净收权利金 - 当前理论回补成本；"
+                        f"当理论回补成本达到 ${_stop_loss_trigger_cost_total:.2f} 时，对应触发止损。"
                     )
                     if _auto_stop_loss and _sl_supported:
                         st.info(
@@ -2132,6 +2237,7 @@ elif page == "🔧 策略配置":
                         _percent = int(_task.get("percent") or 0)
                         _progress = _task.get("progress") or {}
                         _legs = _task.get("legs") or []
+                        _runtime = _get_test_stop_loss_runtime(_task, engine)
 
                         st.progress(max(0, min(_percent, 100)), text=f"测试下单进度：{_percent}% | {_message}")
                         if _state in {"queued", "running"}:
@@ -2154,6 +2260,65 @@ elif page == "🔧 策略配置":
                             st.metric("已耗时", f"{_elapsed:.0f}s" if isinstance(_elapsed, (int, float)) else "-")
                         with _meta_cols[3]:
                             st.metric("剩余追单时长", f"{_remaining:.0f}s" if isinstance(_remaining, (int, float)) else "-")
+
+                        if _task.get("result_group_id") or _task.get("attached_to_engine_for_stop_loss"):
+                            st.markdown("##### 🛡️ 测试单自动止损状态")
+                            _sl_cols = st.columns(4)
+                            with _sl_cols[0]:
+                                st.metric("测试组ID", str(_task.get("result_group_id") or "-"))
+                            with _sl_cols[1]:
+                                st.metric("自动止损", "已启用" if _runtime.get("attached") else "未启用")
+                            with _sl_cols[2]:
+                                _runtime_state = str(_runtime.get("state") or "unknown")
+                                _runtime_state_label = {
+                                    "active": "监控中",
+                                    "active_no_underlying": "监控中",
+                                    "not_open": "已不在引擎持仓",
+                                    "engine_unavailable": "引擎不可用",
+                                    "missing_group_id": "缺少组ID",
+                                    "not_attached": "未接入",
+                                }.get(_runtime_state, _runtime_state)
+                                st.metric("引擎接管状态", _runtime_state_label)
+                            with _sl_cols[3]:
+                                _rt_sl_pct = _runtime.get("stop_loss_pct")
+                                st.metric("策略止损线", f"-{float(_rt_sl_pct):.0f}%" if _rt_sl_pct else "-")
+
+                            if _runtime.get("attached") and _runtime.get("state") in {"active", "active_no_underlying"}:
+                                _rt_cols = st.columns(3)
+                                with _rt_cols[0]:
+                                    st.metric(
+                                        "当前篮子PnL",
+                                        f"${float(_runtime.get('basket_pnl') or 0.0):.2f}",
+                                        delta=(
+                                            f"{float(_runtime.get('basket_pnl_pct')):+.0f}%"
+                                            if isinstance(_runtime.get("basket_pnl_pct"), (int, float))
+                                            else None
+                                        ),
+                                        delta_color="normal" if float(_runtime.get("basket_pnl") or 0.0) >= 0 else "inverse",
+                                    )
+                                with _rt_cols[1]:
+                                    st.metric("当前理论回补成本", f"${float(_runtime.get('close_cost') or 0.0):.2f}")
+                                with _rt_cols[2]:
+                                    st.metric(
+                                        "止损回补边界",
+                                        f"${float(_runtime.get('stop_loss_trigger_close_cost') or 0.0):.2f}",
+                                        delta=(
+                                            f"触发PnL ${float(_runtime.get('stop_loss_trigger_pnl') or 0.0):.2f}"
+                                            if _runtime.get("stop_loss_trigger_pnl") is not None
+                                            else None
+                                        ),
+                                        delta_color="inverse",
+                                    )
+                                if _runtime.get("mark_prices_error"):
+                                    st.warning(f"测试单已接入自动止损，但当前获取标记价格失败：{_runtime['mark_prices_error']}")
+                                else:
+                                    st.success("该测试单当前已接入引擎持仓管理，自动止损正在按策略规则监控。")
+                            elif _runtime.get("attached") and _runtime.get("state") == "not_open":
+                                st.info("该测试单之前已接入自动止损，但当前已不在引擎持仓中，可能已被手动平仓、止损平仓，或引擎已重建持仓状态。")
+                            elif _runtime.get("attached") and _runtime.get("state") == "engine_unavailable":
+                                st.warning("该测试单已标记为接入自动止损，但当前引擎未运行或不可用，无法确认实时监控状态。")
+                            elif not _runtime.get("attached"):
+                                st.caption("本次测试单未接入自动止损，仅用于验证下单链路。")
 
                         if _legs:
                             _legs_df = pd.DataFrame([
