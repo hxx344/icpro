@@ -755,6 +755,17 @@ class TestOrderLookup:
             assert params.get("origClientOrderId") == "CID-XYZ"
             assert "orderId" not in params
 
+    def test_cancel_order_does_not_fallback_when_order_id_cancel_rejected(self, client):
+        response = MagicMock()
+        response.status_code = 400
+        response.json.return_value = {"code": -6063, "msg": "Cancel rejected by system"}
+        http_error = requests.HTTPError("bad request", response=response)
+
+        with patch.object(client.session, "delete", side_effect=http_error) as m:
+            assert client.cancel_order("ETH-260321-2000-C", order_id="123", client_order_id="CID-XYZ") is False
+
+        assert m.call_count == 1
+
 
 class TestClosePosition:
     def test_close_long(self, sim_client):

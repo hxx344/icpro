@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import platform
@@ -1593,13 +1594,16 @@ elif page == "📋 成交历史":
         # --- Export ---
         st.divider()
         csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "📥 导出 CSV",
-            data=csv,
-            file_name=f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            on_click="ignore",
-            key="trade_history_export_csv",
+        csv_filename = f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        csv_b64 = base64.b64encode(csv).decode("ascii")
+        st.markdown(
+            (
+                f'<a href="data:text/csv;base64,{csv_b64}" download="{csv_filename}" '
+                'style="display:inline-block;padding:0.45rem 0.9rem;border-radius:0.5rem;'
+                'background:#1f77b4;color:white;text-decoration:none;font-weight:600;">'
+                '📥 导出 CSV</a>'
+            ),
+            unsafe_allow_html=True,
         )
 
 

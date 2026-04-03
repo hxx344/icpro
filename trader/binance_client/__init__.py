@@ -270,7 +270,13 @@ class BinanceOptionsClient:
         try:
             return self._request_json("DELETE", path, params=self._sign(dict(params or {})))
         except Exception as e:
-            logger.error(f"Binance DELETE {path} failed: {self._format_http_error(e)}")
+            code, msg = self._extract_api_error(e)
+            if path == "/eapi/v1/order" and code in {-2013, -6063}:
+                logger.debug(
+                    f"Binance DELETE {path} returned non-cancelable order state: {msg or self._format_http_error(e)}"
+                )
+            else:
+                logger.error(f"Binance DELETE {path} failed: {self._format_http_error(e)}")
             raise
 
     @staticmethod
@@ -768,18 +774,33 @@ class BinanceOptionsClient:
             self._private_delete("/eapi/v1/order", params)
             return True
         except Exception as e:
-            if client_order_id:
-                try:
-                    self._private_delete("/eapi/v1/order", {"symbol": symbol, "origClientOrderId": client_order_id})
-                    return True
-                except Exception:
-                    pass
             code, msg = self._extract_api_error(e)
             if code == -2013:
                 logger.debug(
                     f"Cancel order {lookup} ignored because exchange reports missing order: {msg or 'Order does not exist'}"
                 )
                 return False
+            if code == -6063:
+                logger.debug(
+                    f"Cancel order {lookup} ignored because exchange reports it is not cancelable: {msg or 'Cancel rejected by system'}"
+                )
+                return False
+            if client_order_id and not order_id:
+                try:
+                    self._private_delete("/eapi/v1/order", {"symbol": symbol, "origClientOrderId": client_order_id})
+                    return True
+                except Exception as fallback_exc:
+                    fallback_code, fallback_msg = self._extract_api_error(fallback_exc)
+                    if fallback_code == -2013:
+                        logger.debug(
+                            f"Cancel order {lookup} ignored because exchange reports missing order: {fallback_msg or 'Order does not exist'}"
+                        )
+                        return False
+                    if fallback_code == -6063:
+                        logger.debug(
+                            f"Cancel order {lookup} ignored because exchange reports it is not cancelable: {fallback_msg or 'Cancel rejected by system'}"
+                        )
+                        return False
             logger.error(f"Cancel order {lookup} failed: {self._format_http_error(e)}")
             return False
 
