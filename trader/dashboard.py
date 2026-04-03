@@ -1108,37 +1108,55 @@ if page == "📊 总览":
 elif page == "📈 资产曲线":
     st.title("📈 资产曲线")
 
-    # Try to get live account data and auto-record a snapshot
+    _EQ_PLOT_MAX_POINTS = 1500
+
+    # 手动刷新实时权益快照；避免每次切页都同步请求交易所导致页面卡顿
     @st.cache_resource
     def _get_client_eq(_exchange_cfg) -> BinanceOptionsClient:
         return BinanceOptionsClient(_exchange_cfg)
 
     _eq_client = _get_client_eq(cfg.exchange)
     _eq_has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
+    _eq_can_refresh_live = _eq_has_creds and not cfg.exchange.simulate_private
 
-    if _eq_has_creds and not cfg.exchange.simulate_private:
+    _eq_col_info, _eq_col_action = st.columns([3, 1])
+    with _eq_col_info:
+        st.caption("本页默认直接读取本地权益快照，避免切页时实时请求交易所造成卡顿。")
+    with _eq_col_action:
+        _eq_refresh_clicked = st.button(
+            "🔄 刷新实时快照",
+            use_container_width=True,
+            disabled=not _eq_can_refresh_live,
+            key="equity_curve_refresh_snapshot",
+        )
+
+    if _eq_refresh_clicked:
         try:
-            _eq_acct = _eq_client.get_account()
-            if not _eq_acct.raw.get("simulated") and _eq_acct.total_balance > 0:
-                _eq_positions = []
-                try:
-                    _eq_positions = _eq_client.get_positions(cfg.strategy.underlying.upper())
-                except Exception:
-                    pass
-                _eq_upnl = sum(
-                    float(p.get("unrealizedPnl") or p.get("unrealizedPNL") or 0)
-                    for p in _eq_positions
-                ) if _eq_positions else _eq_acct.unrealized_pnl
-                _eq_spot = _eq_client.get_spot_price(cfg.strategy.underlying)
-                storage.record_equity_snapshot(
-                    total_equity=_eq_acct.total_balance,
-                    available_balance=_eq_acct.available_balance,
-                    unrealized_pnl=_eq_upnl,
-                    position_count=len(_eq_positions),
-                    underlying_price=_eq_spot,
-                )
-        except Exception:
-            pass
+            with st.spinner("正在拉取交易所账户并写入权益快照..."):
+                _eq_acct = _eq_client.get_account()
+                if not _eq_acct.raw.get("simulated") and _eq_acct.total_balance > 0:
+                    _eq_positions = []
+                    try:
+                        _eq_positions = _eq_client.get_positions(cfg.strategy.underlying.upper())
+                    except Exception:
+                        pass
+                    _eq_upnl = sum(
+                        float(p.get("unrealizedPnl") or p.get("unrealizedPNL") or 0)
+                        for p in _eq_positions
+                    ) if _eq_positions else _eq_acct.unrealized_pnl
+                    _eq_spot = _eq_client.get_spot_price(cfg.strategy.underlying)
+                    storage.record_equity_snapshot(
+                        total_equity=_eq_acct.total_balance,
+                        available_balance=_eq_acct.available_balance,
+                        unrealized_pnl=_eq_upnl,
+                        position_count=len(_eq_positions),
+                        underlying_price=_eq_spot,
+                    )
+                    st.success("实时权益快照已刷新。")
+                else:
+                    st.info("当前未获取到有效实时账户权益，已保留历史快照显示。")
+        except Exception as e:
+            st.warning(f"刷新实时权益快照失败：{e}")
 
     equity_curve = storage.get_equity_curve(start_date, end_date)
 
@@ -1176,6 +1194,18 @@ elif page == "📈 资产曲线":
         dd_series = (peak_series - df["total_equity"]) / peak_series * 100
         dd_series = dd_series.fillna(0)
 
+        plot_df = df
+        plot_dd_series = dd_series
+        if len(df) > _EQ_PLOT_MAX_POINTS:
+            _plot_step = max(1, (len(df) + _EQ_PLOT_MAX_POINTS - 1) // _EQ_PLOT_MAX_POINTS)
+            plot_df = df.iloc[::_plot_step].copy()
+            plot_dd_series = dd_series.iloc[::_plot_step].copy()
+            if plot_df.index[-1] != df.index[-1]:
+                plot_df = pd.concat([plot_df, df.iloc[[-1]].copy()])
+                plot_dd_series = pd.concat([plot_dd_series, dd_series.iloc[[-1]].copy()])
+            plot_df = plot_df.reset_index(drop=True)
+            plot_dd_series = plot_dd_series.reset_index(drop=True)
+
         # --- KPI summary row ---
         if len(df) > 1:
             first_eq = df["total_equity"].iloc[0]
@@ -1195,6 +1225,9 @@ elif page == "📈 资产曲线":
         with k4:
             st.metric("数据点数", f"{len(df):,}")
 
+        if len(plot_df) < len(df):
+            st.caption(f"为提升加载速度，图表已从 {len(df):,} 个数据点抽样显示为 {len(plot_df):,} 个点。")
+
         st.divider()
 
         # ======== Main equity chart ========
@@ -1208,7 +1241,7 @@ elif page == "📈 资产曲线":
         # -- Row 1: Equity area + available balance --
         fig.add_trace(
             go.Scatter(
-                x=df["timestamp"], y=df["total_equity"],
+                x=plot_df["timestamp"], y=plot_df["total_equity"],
                 name="权益",
                 line=dict(color=_EQUITY_COLOR, width=2),
                 fill="tozeroy",
@@ -1219,7 +1252,7 @@ elif page == "📈 资产曲线":
         )
         fig.add_trace(
             go.Scatter(
-                x=df["timestamp"], y=df["available_balance"],
+                x=plot_df["timestamp"], y=plot_df["available_balance"],
                 name="可用余额",
                 line=dict(color=_BALANCE_COLOR, width=1.2, dash="dot"),
                 hovertemplate="%{y:,.2f}",
@@ -1228,10 +1261,10 @@ elif page == "📈 资产曲线":
         )
 
         # -- Row 2: Unrealized PnL bars --
-        upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in df["unrealized_pnl"]]
+    upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in plot_df["unrealized_pnl"]]
         fig.add_trace(
             go.Bar(
-                x=df["timestamp"], y=df["unrealized_pnl"],
+        x=plot_df["timestamp"], y=plot_df["unrealized_pnl"],
                 name="未实现 PnL",
                 marker_color=upnl_colors,
                 marker_line_width=0,
@@ -1244,7 +1277,7 @@ elif page == "📈 资产曲线":
         # -- Row 3: Drawdown area (inverted) --
         fig.add_trace(
             go.Scatter(
-                x=df["timestamp"], y=dd_series,
+                x=plot_df["timestamp"], y=plot_dd_series,
                 name="回撤 %",
                 line=dict(color=_DD_COLOR, width=1.2),
                 fill="tozeroy",
@@ -1279,7 +1312,7 @@ elif page == "📈 资产曲线":
         st.plotly_chart(fig, width='stretch')
 
         # ======== Position count + underlying overlay ========
-        has_ul = "underlying_price" in df.columns and df["underlying_price"].sum() > 0
+        has_ul = "underlying_price" in plot_df.columns and plot_df["underlying_price"].sum() > 0
         if has_ul:
             fig2 = make_subplots(
                 rows=1, cols=1,
@@ -1287,7 +1320,7 @@ elif page == "📈 资产曲线":
             )
             fig2.add_trace(
                 go.Scatter(
-                    x=df["timestamp"], y=df["underlying_price"],
+                    x=plot_df["timestamp"], y=plot_df["underlying_price"],
                     name="标的价格 (USD)",
                     line=dict(color="#00b4d8", width=1.5),
                     hovertemplate="$%{y:,.2f}",
@@ -1296,7 +1329,7 @@ elif page == "📈 资产曲线":
             )
             fig2.add_trace(
                 go.Scatter(
-                    x=df["timestamp"], y=df["position_count"],
+                    x=plot_df["timestamp"], y=plot_df["position_count"],
                     name="持仓数", mode="lines+markers",
                     line=dict(color=_POS_COLOR, width=1.5),
                     marker=dict(size=4, color=_POS_COLOR),
@@ -1321,7 +1354,7 @@ elif page == "📈 资产曲线":
             # Position count only
             fig_pos = go.Figure()
             fig_pos.add_trace(go.Scatter(
-                x=df["timestamp"], y=df["position_count"],
+                x=plot_df["timestamp"], y=plot_df["position_count"],
                 name="持仓数", mode="lines+markers",
                 line=dict(color=_POS_COLOR, width=2),
                 marker=dict(size=4),
