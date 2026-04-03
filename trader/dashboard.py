@@ -468,7 +468,7 @@ def _check_login() -> bool:
         with st.form("login_form"):
             username = st.text_input("用户名")
             password = st.text_input("密码", type="password")
-            submitted = st.form_submit_button("登录", width='stretch', type="primary")
+            submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
 
         if submitted:
             if username == expected_user and password == expected_pass:
@@ -560,18 +560,18 @@ elif engine.is_running:
 
     col_stop, col_close = st.sidebar.columns(2)
     with col_stop:
-        if st.button("⏹ 停止引擎", width='stretch', type="secondary"):
+        if st.button("⏹ 停止引擎", use_container_width=True, type="secondary"):
             engine.stop()
             st.rerun()
     with col_close:
-        if st.button("🚨 全部平仓", width='stretch', type="primary"):
+        if st.button("🚨 全部平仓", use_container_width=True, type="primary"):
             pnl = engine.close_all_positions()
             st.sidebar.info(f"已平仓, PnL: ${pnl:,.4f}")
             st.rerun()
 else:
     if is_trade_mode:
         st.sidebar.error("🔴 引擎未运行")
-        if st.sidebar.button("🚀 启动引擎", width='stretch', type="primary"):
+        if st.sidebar.button("🚀 启动引擎", use_container_width=True, type="primary"):
             ok = engine.start()
             if ok:
                 st.sidebar.success("引擎已启动!")
@@ -623,7 +623,7 @@ elif auto_refresh and _pause_auto_refresh:
     st.sidebar.caption("策略配置页已暂停整页自动刷新，避免表单/下单预览卡顿")
 
 # Manual refresh
-if st.sidebar.button("🔄 立即刷新", width='stretch'):
+if st.sidebar.button("🔄 立即刷新", use_container_width=True):
     st.rerun()
 
 # --------------------------------------------------------------------------
@@ -1560,7 +1560,7 @@ elif page == "🔧 策略配置":
         st.divider()
         _save_col1, _save_col2 = st.columns([1, 4])
         with _save_col1:
-            _submitted = st.form_submit_button("💾 保存配置", width='stretch', type="primary")
+            _submitted = st.form_submit_button("💾 保存配置", use_container_width=True, type="primary")
         with _save_col2:
             st.caption("保存后需要重启引擎才能生效")
 
@@ -2012,7 +2012,7 @@ elif page == "🔧 策略配置":
                             f"{_buy_put.symbol if _buy_put else 'none'}_"
                             f"{_buy_call.symbol if _buy_call else 'none'}"
                         ),
-                        width='stretch',
+                        use_container_width=True,
                         type="secondary",
                         disabled=_test_disabled_reason is not None,
                     )
@@ -2638,12 +2638,12 @@ elif page == "🖥 引擎状态":
 
     with col_a1:
         if es["running"]:
-            if st.button("⏹ 停止引擎", width='stretch', type="secondary",
+            if st.button("⏹ 停止引擎", use_container_width=True, type="secondary",
                           disabled=not is_trade_mode):
                 engine.stop()
                 st.rerun()
         else:
-            if st.button("🚀 启动引擎", width='stretch', type="primary",
+            if st.button("🚀 启动引擎", use_container_width=True, type="primary",
                           disabled=not is_trade_mode):
                 ok = engine.start()
                 if not ok:
@@ -2651,14 +2651,14 @@ elif page == "🖥 引擎状态":
                 st.rerun()
 
     with col_a2:
-        if st.button("🚨 紧急全部平仓", width='stretch', type="primary",
+        if st.button("🚨 紧急全部平仓", use_container_width=True, type="primary",
                       disabled=(not es["running"] or not is_trade_mode)):
             pnl = engine.close_all_positions()
             st.success(f"已平仓, PnL: ${pnl:,.4f}")
             st.rerun()
 
     with col_a3:
-        if st.button("🔄 重置引擎", width='stretch',
+        if st.button("🔄 重置引擎", use_container_width=True,
                       disabled=(es["running"] or not is_trade_mode),
                       help="停止并释放引擎实例，下次启动将重新初始化"):
             reset_engine()

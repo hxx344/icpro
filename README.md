@@ -12,7 +12,7 @@ git clone https://github.com/hxx344/icpro.git
 cd icpro
 
 # 创建虚拟环境
-python -m venv .venv
+python3 -m venv .venv
 
 # Windows
 .venv\Scripts\activate
