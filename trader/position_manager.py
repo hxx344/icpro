@@ -6,6 +6,7 @@ local trade records, and provides aggregated risk views.
 
 from __future__ import annotations
 
+import re
 import time as _time
 import uuid
 from dataclasses import dataclass, field
@@ -115,6 +116,7 @@ class PositionManager:
     MARKET_BATCH_DEPTH_BUFFER_MULT = 1.5
     MARKET_BATCH_WAIT_SEC = 30.0
     MARKET_BATCH_POLL_SEC = 0.5
+    MARKET_PARTIAL_RETRY_WINDOW_SEC = 600.0
 
     def __init__(
         self,
@@ -229,6 +231,108 @@ class PositionManager:
             client_order_id=client_order_id,
         )
 
+    def _extract_api_error(self, exc: Exception) -> tuple[int | None, str | None]:
+        extractor = getattr(self.client, "_extract_api_error", None)
+        if callable(extractor):
+            try:
+                code, msg = extractor(exc)
+                return code, msg
+            except Exception:
+                pass
+
+        message = str(exc or "")
+        for pattern in (
+            r"Binance error\s+(-?\d+):\s*(.*)",
+            r"code\s*[=:]\s*(-?\d+)",
+        ):
+            match = re.search(pattern, message, re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                code = int(match.group(1))
+            except Exception:
+                code = None
+            if match.lastindex and match.lastindex >= 2:
+                detail = (match.group(2) or "").strip()
+                return code, detail or message or None
+            return code, message or None
+        return None, message or None
+
+    def _is_margin_insufficient_error(self, exc: Exception) -> bool:
+        code, msg = self._extract_api_error(exc)
+        msg_norm = str(msg or exc).lower()
+        return code == -2027 or "margin is insuff" in msg_norm or "insufficient margin" in msg_norm
+
+    def _set_leg_last_error(self, leg: LegOrder, exc: Exception) -> None:
+        code, msg = self._extract_api_error(exc)
+        setattr(leg, "last_error_code", code)
+        setattr(leg, "last_error_message", msg or str(exc))
+
+    @staticmethod
+    def _filled_leg_count(leg_orders: list[LegOrder]) -> int:
+        return sum(1 for leg in leg_orders if PositionManager._remaining_leg_qty(leg) <= 1e-9)
+
+    @staticmethod
+    def _filled_leg_orders(results: list[LegOrder]) -> list[LegOrder]:
+        return [r for r in results if float(r.filled_qty or 0.0) > 1e-9]
+
+    def _persist_position_from_results(
+        self,
+        group_id: str,
+        underlying_price: float,
+        results: list[LegOrder],
+        requested_quantity: float,
+    ) -> tuple[IronCondorPosition | None, float]:
+        filled_results = self._filled_leg_orders(results)
+        if not filled_results:
+            return None, 0.0
+
+        condor = IronCondorPosition(
+            group_id=group_id,
+            entry_time=datetime.now(timezone.utc),
+            underlying_price=underlying_price,
+        )
+        total_premium = 0.0
+
+        for leg_order in filled_results:
+            leg_qty = leg_order.filled_qty or requested_quantity
+            meta = {
+                "leg_role": leg_order.leg_role,
+                "option_type": leg_order.option_type,
+                "strike": leg_order.strike,
+                "underlying_price": underlying_price,
+                "group_id": group_id,
+            }
+            trade_id = self.storage.record_trade(
+                trade_group=group_id,
+                symbol=leg_order.symbol,
+                side=leg_order.side,
+                quantity=leg_qty,
+                price=leg_order.avg_price,
+                fee=leg_order.fee,
+                order_id=leg_order.order_id,
+                meta=meta,
+            )
+
+            leg = CondorLeg(
+                symbol=leg_order.symbol,
+                side=leg_order.side,
+                option_type=leg_order.option_type,
+                strike=leg_order.strike,
+                quantity=leg_qty,
+                entry_price=leg_order.avg_price,
+                trade_id=trade_id,
+                order_id=leg_order.order_id,
+            )
+            setattr(condor, leg_order.leg_role, leg)
+            total_premium += leg_order.avg_price * leg_qty * (1.0 if leg_order.side == "SELL" else -1.0)
+
+        condor.total_premium = total_premium
+        setattr(condor, "expected_leg_count", len(results))
+        setattr(condor, "is_partial_open", len(filled_results) != len(results))
+        self.open_condors[group_id] = condor
+        return condor, total_premium
+
     @staticmethod
     def _remaining_leg_qty(leg: LegOrder) -> float:
         return max(float(leg.quantity or 0.0) - float(leg.filled_qty or 0.0), 0.0)
@@ -300,6 +404,8 @@ class PositionManager:
         legs: list[LegOrder],
         batch_qty: float,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
+        max_spread_usd: float | None = None,
+        wait_sec: float | None = None,
     ) -> dict[str, dict[str, float | bool | str]] | None:
         def _collect_blockers(
             max_spread_usd: float,
@@ -322,33 +428,38 @@ class PositionManager:
             return _blockers, _snapshots
 
         required_depth = batch_qty * self.MARKET_BATCH_DEPTH_BUFFER_MULT
-        deadline = _time.monotonic() + self.MARKET_BATCH_WAIT_SEC
+        initial_max_spread = float(max_spread_usd or self.MARKET_BATCH_MAX_SPREAD_USD)
+        relaxed_max_spread = None if max_spread_usd is not None else float(self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD)
+        deadline = _time.monotonic() + float(wait_sec or self.MARKET_BATCH_WAIT_SEC)
         poll_idx = 0
 
         while True:
             poll_idx += 1
-            blockers, snapshots = _collect_blockers(self.MARKET_BATCH_MAX_SPREAD_USD)
+            blockers, snapshots = _collect_blockers(initial_max_spread)
 
             if not blockers:
                 return snapshots
 
             now = _time.monotonic()
             if now >= deadline:
-                relaxed_blockers, relaxed_snapshots = _collect_blockers(self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD)
-                if not relaxed_blockers:
+                if relaxed_max_spread is not None:
+                    relaxed_blockers, relaxed_snapshots = _collect_blockers(relaxed_max_spread)
+                else:
+                    relaxed_blockers, relaxed_snapshots = blockers, snapshots
+                if relaxed_max_spread is not None and not relaxed_blockers:
                     logger.warning(
-                        f"Market batch {group_id} timed out at spread<={self.MARKET_BATCH_MAX_SPREAD_USD:.2f}; "
-                        f"relaxing to spread<={self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD:.2f} for batch_qty={batch_qty:.4f}"
+                        f"Market batch {group_id} timed out at spread<={initial_max_spread:.2f}; "
+                        f"relaxing to spread<={relaxed_max_spread:.2f} for batch_qty={batch_qty:.4f}"
                     )
                     if status_callback is not None:
                         status_callback({
                             "event": "market_batch_spread_relaxed",
-                            "message": f"等待超时，放宽最大价差到 {self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD:.0f} USD：批次={batch_qty:.4f}",
+                            "message": f"等待超时，放宽最大价差到 {relaxed_max_spread:.0f} USD：批次={batch_qty:.4f}",
                             "group_id": group_id,
                             "execution_mode": "market",
                             "batch_qty": batch_qty,
                             "required_depth": required_depth,
-                            "max_spread_usd": self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
+                            "max_spread_usd": relaxed_max_spread,
                             "legs": [
                                 {
                                     "leg_role": leg.leg_role,
@@ -372,6 +483,7 @@ class PositionManager:
                         "execution_mode": "market",
                         "batch_qty": batch_qty,
                         "required_depth": required_depth,
+                        "max_spread_usd": initial_max_spread,
                         "blockers": blockers,
                         "legs": [
                             {
@@ -397,7 +509,7 @@ class PositionManager:
                     "execution_mode": "market",
                     "batch_qty": batch_qty,
                     "required_depth": required_depth,
-                    "max_spread_usd": self.MARKET_BATCH_MAX_SPREAD_USD,
+                    "max_spread_usd": initial_max_spread,
                     "poll_index": poll_idx,
                     "blockers": blockers,
                     "legs": [
@@ -652,6 +764,46 @@ class PositionManager:
                 f"Short Strangle {group_id}: {len(failed)} leg(s) failed to fill – "
                 + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
             )
+            if execution_mode_norm == "market":
+                filled_results = self._filled_leg_orders(results)
+                if filled_results:
+                    try:
+                        condor, total_premium = self._persist_position_from_results(
+                            group_id=group_id,
+                            underlying_price=underlying_price,
+                            results=results,
+                            requested_quantity=quantity,
+                        )
+                    except Exception as e:
+                        logger.error(f"Short Strangle {group_id}: partial persistence failed: {e}")
+                        return None
+
+                    if condor is not None:
+                        logger.warning(
+                            f"Short Strangle {group_id}: partial fill kept live without rollback; "
+                            f"filled={len(filled_results)}/{len(results)}"
+                        )
+                        if status_callback is not None:
+                            status_callback({
+                                "event": "position_open_partial",
+                                "message": "已有成交腿保留，未再执行回滚；剩余腿未完成",
+                                "group_id": group_id,
+                                "execution_mode": execution_mode_norm,
+                                "failed_legs": [r.leg_role for r in failed],
+                                "legs": [
+                                    {
+                                        "leg_role": r.leg_role,
+                                        "symbol": r.symbol,
+                                        "side": r.side,
+                                        "quantity": r.quantity,
+                                        "filled_qty": r.filled_qty,
+                                        "status": r.status,
+                                        "avg_price": r.avg_price,
+                                    }
+                                    for r in results
+                                ],
+                            })
+                        return condor
             filled_results = [
                 (r.leg_role, OrderResult(
                     order_id=r.order_id, symbol=r.symbol, side=r.side,
@@ -692,48 +844,14 @@ class PositionManager:
             return None
 
         try:
-            condor = IronCondorPosition(
+            condor, total_premium = self._persist_position_from_results(
                 group_id=group_id,
-                entry_time=datetime.now(timezone.utc),
                 underlying_price=underlying_price,
+                results=results,
+                requested_quantity=quantity,
             )
-
-            total_premium = 0.0
-            for leg_order in results:
-                leg_qty = leg_order.filled_qty or quantity
-                meta = {
-                    "leg_role": leg_order.leg_role,
-                    "option_type": leg_order.option_type,
-                    "strike": leg_order.strike,
-                    "underlying_price": underlying_price,
-                    "group_id": group_id,
-                }
-                trade_id = self.storage.record_trade(
-                    trade_group=group_id,
-                    symbol=leg_order.symbol,
-                    side=leg_order.side,
-                    quantity=leg_qty,
-                    price=leg_order.avg_price,
-                    fee=leg_order.fee,
-                    order_id=leg_order.order_id,
-                    meta=meta,
-                )
-
-                leg = CondorLeg(
-                    symbol=leg_order.symbol,
-                    side=leg_order.side,
-                    option_type=leg_order.option_type,
-                    strike=leg_order.strike,
-                    quantity=leg_qty,
-                    entry_price=leg_order.avg_price,
-                    trade_id=trade_id,
-                    order_id=leg_order.order_id,
-                )
-                setattr(condor, leg_order.leg_role, leg)
-                total_premium += leg_order.avg_price * leg_qty
-
-            condor.total_premium = total_premium
-            self.open_condors[group_id] = condor
+            if condor is None:
+                raise RuntimeError("No filled legs to persist after successful execution")
         except Exception as e:
             logger.error(f"Short Strangle {group_id}: persistence failed after fills: {e}")
             rollback_failures = self._rollback_legs([
@@ -906,6 +1024,46 @@ class PositionManager:
                 f"Iron Condor {group_id}: {len(failed)} leg(s) failed to fill – "
                 + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
             )
+            if execution_mode_norm == "market":
+                filled_results = self._filled_leg_orders(results)
+                if filled_results:
+                    try:
+                        condor, total_premium = self._persist_position_from_results(
+                            group_id=group_id,
+                            underlying_price=underlying_price,
+                            results=results,
+                            requested_quantity=quantity,
+                        )
+                    except Exception as e:
+                        logger.error(f"Iron Condor {group_id}: partial persistence failed: {e}")
+                        return None
+
+                    if condor is not None:
+                        logger.warning(
+                            f"Iron Condor {group_id}: partial fill kept live without rollback; "
+                            f"filled={len(filled_results)}/{len(results)}"
+                        )
+                        if status_callback is not None:
+                            status_callback({
+                                "event": "position_open_partial",
+                                "message": "已有成交腿保留，未再执行回滚；剩余腿未完成",
+                                "group_id": group_id,
+                                "execution_mode": execution_mode_norm,
+                                "failed_legs": [r.leg_role for r in failed],
+                                "legs": [
+                                    {
+                                        "leg_role": r.leg_role,
+                                        "symbol": r.symbol,
+                                        "side": r.side,
+                                        "quantity": r.quantity,
+                                        "filled_qty": r.filled_qty,
+                                        "status": r.status,
+                                        "avg_price": r.avg_price,
+                                    }
+                                    for r in results
+                                ],
+                            })
+                        return condor
             # Rollback filled legs
             filled_results = [
                 (r.leg_role, OrderResult(
@@ -946,54 +1104,14 @@ class PositionManager:
             return None
 
         try:
-            # All filled – build condor position
-            condor = IronCondorPosition(
+            condor, total_premium = self._persist_position_from_results(
                 group_id=group_id,
-                entry_time=datetime.now(timezone.utc),
                 underlying_price=underlying_price,
+                results=results,
+                requested_quantity=quantity,
             )
-
-            total_premium = 0.0
-
-            for leg_order in results:
-                leg_qty = leg_order.filled_qty or quantity
-                meta = {
-                    "leg_role": leg_order.leg_role,
-                    "option_type": leg_order.option_type,
-                    "strike": leg_order.strike,
-                    "underlying_price": underlying_price,
-                    "group_id": group_id,
-                }
-                trade_id = self.storage.record_trade(
-                    trade_group=group_id,
-                    symbol=leg_order.symbol,
-                    side=leg_order.side,
-                    quantity=leg_qty,
-                    price=leg_order.avg_price,
-                    fee=leg_order.fee,
-                    order_id=leg_order.order_id,
-                    meta=meta,
-                )
-
-                leg = CondorLeg(
-                    symbol=leg_order.symbol,
-                    side=leg_order.side,
-                    option_type=leg_order.option_type,
-                    strike=leg_order.strike,
-                    quantity=leg_qty,
-                    entry_price=leg_order.avg_price,
-                    trade_id=trade_id,
-                    order_id=leg_order.order_id,
-                )
-                setattr(condor, leg_order.leg_role, leg)
-
-                if leg_order.side == "SELL":
-                    total_premium += leg_order.avg_price * leg_qty
-                else:
-                    total_premium -= leg_order.avg_price * leg_qty
-
-            condor.total_premium = total_premium
-            self.open_condors[group_id] = condor
+            if condor is None:
+                raise RuntimeError("No filled legs to persist after successful execution")
         except Exception as e:
             logger.error(f"Iron Condor {group_id}: persistence failed after fills: {e}")
             rollback_failures = self._rollback_legs([
@@ -1071,6 +1189,7 @@ class PositionManager:
 
         total_legs = len(leg_orders)
         batch_index = 0
+        completion_deadline: float | None = None
         for leg in leg_orders:
             leg.status = leg.status or "PENDING"
             leg.filled_qty = float(leg.filled_qty or 0.0)
@@ -1083,6 +1202,10 @@ class PositionManager:
             if not pending:
                 break
 
+            partial_mode = self._filled_leg_count(leg_orders) > 0
+            if partial_mode and completion_deadline is None:
+                completion_deadline = _time.monotonic() + self.MARKET_PARTIAL_RETRY_WINDOW_SEC
+
             batch_index += 1
             batch_qty = min(
                 self.MARKET_BATCH_MAX_QTY,
@@ -1093,8 +1216,35 @@ class PositionManager:
                 legs=pending,
                 batch_qty=batch_qty,
                 status_callback=status_callback,
+                max_spread_usd=self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD if partial_mode else None,
             )
             if snapshots is None:
+                if partial_mode and completion_deadline is not None and _time.monotonic() < completion_deadline:
+                    if status_callback is not None:
+                        status_callback({
+                            "event": "market_batch_retry_pending",
+                            "message": f"已有单腿成交，继续放宽条件补齐剩余腿：批次={batch_qty:.4f}",
+                            "group_id": group_id,
+                            "execution_mode": "market",
+                            "batch_index": batch_index,
+                            "batch_qty": batch_qty,
+                            "max_spread_usd": self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
+                            "retry_window_sec": self.MARKET_PARTIAL_RETRY_WINDOW_SEC,
+                            "legs": [
+                                {
+                                    "leg_role": leg.leg_role,
+                                    "symbol": leg.symbol,
+                                    "side": leg.side,
+                                    "quantity": leg.quantity,
+                                    "filled_qty": leg.filled_qty,
+                                    "status": leg.status,
+                                    "avg_price": leg.avg_price,
+                                    "attempts": leg.attempts,
+                                }
+                                for leg in leg_orders
+                            ],
+                        })
+                    continue
                 for leg in pending:
                     if self._remaining_leg_qty(leg) > 1e-9:
                         leg.status = "FAILED"
@@ -1149,7 +1299,19 @@ class PositionManager:
                     )
                     self._merge_leg_fill(leg, order_result)
                 except Exception as e:
+                    self._set_leg_last_error(leg, e)
                     logger.error(f"Position {group_id}: batched market order failed for {leg.leg_role}: {e}")
+                    partial_fill_started = partial_mode or self._filled_leg_count(leg_orders) > 0
+                    if self._is_margin_insufficient_error(e):
+                        setattr(leg, "abort_reason", "margin_insufficient")
+                        leg.status = "FAILED"
+                        fatal_error = (leg, e)
+                        break
+                    if partial_fill_started:
+                        if completion_deadline is None:
+                            completion_deadline = _time.monotonic() + self.MARKET_PARTIAL_RETRY_WINDOW_SEC
+                        leg.status = "PENDING"
+                        continue
                     leg.status = "FAILED"
                     fatal_error = (leg, e)
                     break
@@ -1188,6 +1350,7 @@ class PositionManager:
 
             if fatal_error is not None:
                 failed_leg, exc = fatal_error
+                partial_fill_started = partial_mode or self._filled_leg_count(leg_orders) > 0
                 if status_callback is not None:
                     status_callback({
                         "event": "position_open_error",
@@ -1195,6 +1358,7 @@ class PositionManager:
                         "group_id": group_id,
                         "execution_mode": "market",
                         "failed_leg": failed_leg.leg_role,
+                        "abort_reason": getattr(failed_leg, "abort_reason", "submit_failed"),
                         "legs": [
                             {
                                 "leg_role": leg.leg_role,
@@ -1209,9 +1373,19 @@ class PositionManager:
                             for leg in leg_orders
                         ],
                     })
+                if partial_fill_started and getattr(failed_leg, "abort_reason", "") != "margin_insufficient":
+                    if completion_deadline is not None and _time.monotonic() < completion_deadline:
+                        failed_leg.status = "PENDING"
+                        continue
                 break
 
             if any(str(leg.status or "").upper() == "FAILED" for leg in leg_orders):
+                partial_fill_started = partial_mode or self._filled_leg_count(leg_orders) > 0
+                if partial_fill_started and completion_deadline is not None and _time.monotonic() < completion_deadline:
+                    for leg in leg_orders:
+                        if self._remaining_leg_qty(leg) > 1e-9 and str(leg.status or "").upper() == "FAILED":
+                            leg.status = "PENDING"
+                    continue
                 break
 
         for leg in leg_orders:

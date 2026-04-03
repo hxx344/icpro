@@ -247,10 +247,17 @@ class OptionSellingStrategy:
             if condor:
                 self._last_trade_date = today
                 self.storage.save_state("last_trade_date", today)
-                logger.info(
-                    f"[Strategy] Short Strangle opened: {condor.group_id} "
-                    f"premium={condor.total_premium:.4f}"
-                )
+                expected_legs = 2
+                if len(condor.legs) < expected_legs:
+                    logger.warning(
+                        f"[Strategy] Short Strangle partially opened: {condor.group_id} "
+                        f"legs={len(condor.legs)}/{expected_legs} premium={condor.total_premium:.4f}"
+                    )
+                else:
+                    logger.info(
+                        f"[Strategy] Short Strangle opened: {condor.group_id} "
+                        f"premium={condor.total_premium:.4f}"
+                    )
             else:
                 logger.error("[Strategy] Failed to open Short Strangle")
             return
@@ -325,10 +332,17 @@ class OptionSellingStrategy:
         if condor:
             self._last_trade_date = today
             self.storage.save_state("last_trade_date", today)
-            logger.info(
-                f"[Strategy] Iron Condor opened: {condor.group_id} "
-                f"premium={condor.total_premium:.4f}"
-            )
+            expected_legs = 4
+            if len(condor.legs) < expected_legs:
+                logger.warning(
+                    f"[Strategy] Iron Condor partially opened: {condor.group_id} "
+                    f"legs={len(condor.legs)}/{expected_legs} premium={condor.total_premium:.4f}"
+                )
+            else:
+                logger.info(
+                    f"[Strategy] Iron Condor opened: {condor.group_id} "
+                    f"premium={condor.total_premium:.4f}"
+                )
         else:
             logger.error("[Strategy] Failed to open Iron Condor")
 
@@ -752,14 +766,25 @@ class WeekendVolStrategy:
         if condor:
             self._last_trade_week = week_id
             self.storage.save_state("wv_last_trade_week", week_id)
-            self._mark_order_success(
-                group_id=condor.group_id,
-                message=f"实盘开仓成功: {condor.group_id}",
-            )
-            logger.info(
-                f"[WeekendVol] Position opened: {condor.group_id} "
-                f"premium={condor.total_premium:.6f}"
-            )
+            expected_legs = 4 if self.cfg.wing_delta > 0 and buy_call and buy_put else 2
+            if len(condor.legs) < expected_legs:
+                self._mark_order_partial(
+                    group_id=condor.group_id,
+                    message=f"实盘部分开仓: {condor.group_id}，已成交 {len(condor.legs)}/{expected_legs} 条腿",
+                )
+                logger.warning(
+                    f"[WeekendVol] Position partially opened: {condor.group_id} "
+                    f"legs={len(condor.legs)}/{expected_legs} premium={condor.total_premium:.6f}"
+                )
+            else:
+                self._mark_order_success(
+                    group_id=condor.group_id,
+                    message=f"实盘开仓成功: {condor.group_id}",
+                )
+                logger.info(
+                    f"[WeekendVol] Position opened: {condor.group_id} "
+                    f"premium={condor.total_premium:.6f}"
+                )
         else:
             self._record_live_order_failure(
                 underlying=ul,
@@ -781,6 +806,16 @@ class WeekendVolStrategy:
     def _mark_order_success(self, group_id: str, message: str) -> None:
         self._last_order_attempt_at = datetime.now(timezone.utc).isoformat()
         self._last_order_status = "success"
+        self._last_order_message = message
+        self._last_order_group_id = group_id
+        self._last_order_exchange_positions_checked = False
+        self._last_order_exchange_positions_underlying = ""
+        self._last_order_exchange_positions = []
+        self._last_order_exchange_positions_error = ""
+
+    def _mark_order_partial(self, group_id: str, message: str) -> None:
+        self._last_order_attempt_at = datetime.now(timezone.utc).isoformat()
+        self._last_order_status = "partial"
         self._last_order_message = message
         self._last_order_group_id = group_id
         self._last_order_exchange_positions_checked = False
