@@ -185,6 +185,8 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
     runtime["state"] = "active"
     runtime["legs"] = len(condor.legs)
     runtime["entry_credit"] = float(condor.total_premium or 0.0)
+    runtime["sell_put_strike"] = float(condor.sell_put.strike) if condor.sell_put else None
+    runtime["sell_call_strike"] = float(condor.sell_call.strike) if condor.sell_call else None
 
     underlying = _infer_underlying_from_symbols([leg.symbol for leg in condor.legs])
     runtime["underlying"] = underlying
@@ -213,7 +215,16 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
     runtime["basket_pnl_pct"] = (basket_pnl / entry_credit * 100.0) if entry_credit > 0 else None
     if stop_loss_pct > 0 and entry_credit > 0:
         runtime["stop_loss_trigger_close_cost"] = entry_credit * (1 + stop_loss_pct / 100.0)
+        runtime["stop_loss_trigger_price_boundary"] = (
+            runtime["stop_loss_trigger_close_cost"] / runtime["quantity"]
+            if float(runtime.get("quantity") or 0.0) > 0
+            else None
+        )
         runtime["stop_loss_trigger_pnl"] = -(entry_credit * stop_loss_pct / 100.0)
+        if runtime.get("sell_put_strike") is not None:
+            runtime["stop_loss_trigger_spot_low"] = float(runtime["sell_put_strike"]) - float(runtime["stop_loss_trigger_price_boundary"] or 0.0)
+        if runtime.get("sell_call_strike") is not None:
+            runtime["stop_loss_trigger_spot_high"] = float(runtime["sell_call_strike"]) + float(runtime["stop_loss_trigger_price_boundary"] or 0.0)
     return runtime
 
 
@@ -2143,6 +2154,8 @@ elif page == "🔧 策略配置":
                     _stop_loss_trigger_cost_per = _premium_per * (1 + _sl_cfg_pct / 100.0)
                     _stop_loss_trigger_cost_total = _stop_loss_trigger_cost_per * _test_qty
                     _stop_loss_trigger_loss_total = _test_total_premium * _sl_cfg_pct / 100.0
+                    _stop_loss_trigger_spot_low = _sell_put.strike - _stop_loss_trigger_cost_per
+                    _stop_loss_trigger_spot_high = _sell_call.strike + _stop_loss_trigger_cost_per
                     _sl1, _sl2, _sl3, _sl4 = st.columns(4)
                     with _sl1:
                         st.metric("止损线", f"-{_sl_cfg_pct:.0f}%")
@@ -2161,16 +2174,18 @@ elif page == "🔧 策略配置":
                         )
                     with _sl4:
                         st.metric(
-                            "止损回补成本边界(0.01)",
-                            f"${_stop_loss_trigger_cost_total:.2f}",
-                            delta=f"触发PnL -${_stop_loss_trigger_loss_total:.2f}",
+                            "止损触发价格(近似)",
+                            f"${_stop_loss_trigger_spot_low:,.0f} / ${_stop_loss_trigger_spot_high:,.0f}",
+                            delta=f"测试0.01回补成本 ${_stop_loss_trigger_cost_total:.2f}",
                             delta_color="inverse",
                         )
 
                     st.caption(
                         "止损按实时篮子 PnL% 触发。上面所有数字都按测试数量 "
                         f"{_test_qty:.2f} 计算：当前测试篮子 PnL = 净收权利金 - 当前理论回补成本；"
-                        f"当理论回补成本达到 ${_stop_loss_trigger_cost_total:.2f} 时，对应触发止损。"
+                        f"当标的价格大致到达 ${_stop_loss_trigger_spot_low:,.0f} / ${_stop_loss_trigger_spot_high:,.0f} 一带时，"
+                        f"通常对应接近止损触发区；"
+                        f"按测试数量 {_test_qty:.2f} 折算，等价于回补成本 ${_stop_loss_trigger_cost_total:.2f}。"
                     )
                     if _auto_stop_loss and _sl_supported:
                         st.info(
@@ -2300,10 +2315,14 @@ elif page == "🔧 策略配置":
                                     st.metric("当前理论回补成本", f"${float(_runtime.get('close_cost') or 0.0):.2f}")
                                 with _rt_cols[2]:
                                     st.metric(
-                                        "止损回补边界",
-                                        f"${float(_runtime.get('stop_loss_trigger_close_cost') or 0.0):.2f}",
+                                        "止损触发价格(近似)",
+                                        (
+                                            f"${float(_runtime.get('stop_loss_trigger_spot_low') or 0.0):,.0f} / ${float(_runtime.get('stop_loss_trigger_spot_high') or 0.0):,.0f}"
+                                            if _runtime.get("stop_loss_trigger_spot_low") is not None and _runtime.get("stop_loss_trigger_spot_high") is not None
+                                            else "-"
+                                        ),
                                         delta=(
-                                            f"触发PnL ${float(_runtime.get('stop_loss_trigger_pnl') or 0.0):.2f}"
+                                            f"当前仓回补成本 ${float(_runtime.get('stop_loss_trigger_close_cost') or 0.0):.2f} | 触发PnL ${float(_runtime.get('stop_loss_trigger_pnl') or 0.0):.2f}"
                                             if _runtime.get("stop_loss_trigger_pnl") is not None
                                             else None
                                         ),
