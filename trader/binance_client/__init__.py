@@ -515,7 +515,48 @@ class BinanceOptionsClient:
             })
         return out
 
-    def place_order(
+    def get_order_book(self, symbol: str, limit: int = 5) -> dict[str, list[tuple[float, float]]]:
+        if self.cfg.simulate_private:
+            ticker = self.get_ticker(symbol)
+            if ticker is None:
+                return {"bids": [], "asks": []}
+            synthetic_depth = 999.0
+            return {
+                "bids": [(float(ticker.bid_price or 0.0), synthetic_depth)],
+                "asks": [(float(ticker.ask_price or 0.0), synthetic_depth)],
+            }
+
+        try:
+            result = self._public_get("/eapi/v1/depth", {"symbol": symbol, "limit": max(int(limit), 1)})
+        except Exception as e:
+            logger.error(f"Failed to fetch order book for {symbol}: {e}")
+            return {"bids": [], "asks": []}
+
+        if not isinstance(result, dict):
+            return {"bids": [], "asks": []}
+
+        def _parse_side(rows: Any) -> list[tuple[float, float]]:
+            parsed: list[tuple[float, float]] = []
+            if not isinstance(rows, list):
+                return parsed
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                try:
+                    price = float(row[0])
+                    qty = float(row[1])
+                except Exception:
+                    continue
+                if price > 0 and qty > 0:
+                    parsed.append((price, qty))
+            return parsed
+
+        return {
+            "bids": _parse_side(result.get("bids")),
+            "asks": _parse_side(result.get("asks")),
+        }
+
+    def submit_order(
         self,
         symbol: str,
         side: str,
@@ -588,9 +629,44 @@ class BinanceOptionsClient:
             raw=result,
         )
 
-    def close_position(self, symbol: str, side: str, quantity: float) -> OrderResult:
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MARKET",
+        price=None,
+        time_in_force: Optional[str] = None,
+        reduce_only: bool = False,
+        client_order_id=None,
+    ) -> OrderResult:
+        return self.submit_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            time_in_force=time_in_force,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+        )
+
+    def close_position(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        client_order_id: str | None = None,
+    ) -> OrderResult:
         close_side = "SELL" if side == "LONG" else "BUY"
-        return self.place_order(symbol, close_side, abs(float(quantity)), order_type="MARKET", reduce_only=True)
+        return self.submit_order(
+            symbol,
+            close_side,
+            abs(float(quantity)),
+            order_type="MARKET",
+            reduce_only=True,
+            client_order_id=client_order_id,
+        )
 
     def query_order(
         self,

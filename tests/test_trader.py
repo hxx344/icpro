@@ -161,8 +161,27 @@ class MockClient:
             raw={"test": True},
         )
 
+    def submit_order(self, symbol, side, quantity, order_type="MARKET",
+                     price=None, time_in_force=None, reduce_only=False, client_order_id=None):
+        return self.place_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+        )
+
     def close_position(self, symbol, side, quantity):
         return self.place_order(symbol, "SELL" if side == "LONG" else "BUY", quantity)
+
+    def get_order_book(self, symbol, limit=5):
+        ticker = self.get_ticker(symbol)
+        return {
+            "bids": [(ticker.bid_price, 10.0)],
+            "asks": [(ticker.ask_price, 10.0)],
+        }
 
     def get_ticker(self, symbol):
         for t in self._tickers:

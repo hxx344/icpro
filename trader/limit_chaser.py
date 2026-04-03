@@ -184,6 +184,31 @@ class LimitChaser:
             return True
         return False
 
+    def _submit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        time_in_force: str | None = None,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+    ) -> OrderResult:
+        submit_fn = getattr(self.client, "submit_order", None)
+        if submit_fn is None:
+            submit_fn = self.client.place_order
+        return submit_fn(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            time_in_force=time_in_force,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+        )
+
     def _make_client_order_id(self, leg: LegOrder, intent: str) -> str:
         """Build a deterministic short client order id for idempotent recovery."""
         base = leg.client_order_prefix or (
@@ -468,7 +493,7 @@ class LimitChaser:
 
             try:
                 self._start_new_child_order(leg)
-                result = self.client.place_order(
+                result = self._submit_order(
                     symbol=leg.symbol,
                     side=leg.side,
                     quantity=remaining_qty,
@@ -585,7 +610,7 @@ class LimitChaser:
 
         try:
             self._start_new_child_order(leg)
-            result = self.client.place_order(
+            result = self._submit_order(
                 symbol=leg.symbol,
                 side=leg.side,
                 quantity=remaining_qty,
@@ -753,7 +778,7 @@ class LimitChaser:
 
             try:
                 self._start_new_child_order(leg)
-                result = self.client.place_order(
+                result = self._submit_order(
                     symbol=leg.symbol,
                     side=leg.side,
                     quantity=remaining_qty,

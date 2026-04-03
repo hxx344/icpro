@@ -402,7 +402,7 @@ def cmd_close_all(args) -> None:
 
     app = TraderApp(cfg)
     logger.warning("CLOSING ALL POSITIONS")
-    pnl = app.pos_mgr.close_all(reason="manual_close_all")
+    pnl = app.pos_mgr.close_all(reason="manual_close_all", execution_mode="market")
     logger.info(f"All positions closed. Total PnL: {pnl:.4f}")
     app.storage.close()
 

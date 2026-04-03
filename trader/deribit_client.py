@@ -223,7 +223,7 @@ class DeribitOptionsClient:
             raw=result,
         )
 
-    def place_order(
+    def submit_order(
         self,
         symbol: str,
         side: str,
@@ -279,9 +279,29 @@ class DeribitOptionsClient:
             raw=result if isinstance(result, dict) else {"result": result},
         )
 
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+    ) -> OrderResult:
+        return self.submit_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+        )
+
     def close_position(self, symbol: str, side: str, quantity: float) -> OrderResult:
         close_side = "SELL" if side == "LONG" else "BUY"
-        return self.place_order(
+        return self.submit_order(
             symbol=symbol,
             side=close_side,
             quantity=quantity,

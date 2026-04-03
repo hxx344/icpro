@@ -6,6 +6,7 @@ local trade records, and provides aggregated risk views.
 
 from __future__ import annotations
 
+import time as _time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -108,6 +109,12 @@ class PositionManager:
     - Record all trades to persistent storage
     """
 
+    MARKET_BATCH_MAX_QTY = 1.0
+    MARKET_BATCH_MAX_SPREAD_USD = 5.0
+    MARKET_BATCH_DEPTH_BUFFER_MULT = 1.5
+    MARKET_BATCH_WAIT_SEC = 30.0
+    MARKET_BATCH_POLL_SEC = 0.5
+
     def __init__(
         self,
         client: Any,
@@ -196,6 +203,182 @@ class PositionManager:
     def _infer_underlying(symbol: str) -> str:
         return str(symbol).split("-", 1)[0].upper() if symbol else "ETH"
 
+    def _submit_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        order_type: str = "MARKET",
+        price: float | None = None,
+        time_in_force: str | None = None,
+        reduce_only: bool = False,
+        client_order_id: str | None = None,
+    ) -> OrderResult:
+        submit_fn = getattr(self.client, "submit_order", None)
+        if submit_fn is None:
+            submit_fn = self.client.place_order
+        return submit_fn(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            price=price,
+            time_in_force=time_in_force,
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+        )
+
+    @staticmethod
+    def _remaining_leg_qty(leg: LegOrder) -> float:
+        return max(float(leg.quantity or 0.0) - float(leg.filled_qty or 0.0), 0.0)
+
+    @staticmethod
+    def _merge_leg_fill(leg: LegOrder, result: OrderResult) -> None:
+        filled_qty = max(float(result.quantity or 0.0), 0.0)
+        avg_price = float(result.avg_price or result.price or 0.0)
+        fee = max(float(result.fee or 0.0), 0.0)
+
+        prev_qty = float(leg.filled_qty or 0.0)
+        add_qty = min(filled_qty, max(float(leg.quantity or 0.0) - prev_qty, 0.0))
+        if add_qty > 1e-9 and avg_price > 0:
+            total_qty = prev_qty + add_qty
+            total_notional = float(leg.avg_price or 0.0) * prev_qty + avg_price * add_qty
+            leg.avg_price = total_notional / total_qty
+            leg.filled_qty = total_qty
+        elif add_qty > 1e-9:
+            leg.filled_qty = prev_qty + add_qty
+
+        leg.fee = float(leg.fee or 0.0) + fee
+        if result.order_id:
+            leg.order_id = result.order_id
+
+        remaining = PositionManager._remaining_leg_qty(leg)
+        status = str(result.status or "").upper()
+        if remaining <= 1e-9:
+            leg.status = "FILLED"
+        elif status in {"PARTIALLY_FILLED", "NEW", "PENDING"}:
+            leg.status = status
+        elif status in {"FAILED", "ERROR", "REJECTED", "EXPIRED", "CANCELED", "CANCELLED"}:
+            leg.status = "FAILED"
+        elif filled_qty > 0:
+            leg.status = "PARTIALLY_FILLED"
+        else:
+            leg.status = status or leg.status or "PENDING"
+
+    def _get_market_book_snapshot(self, leg: LegOrder) -> dict[str, float | bool | str]:
+        get_order_book = getattr(self.client, "get_order_book", None)
+        if not get_order_book:
+            return {
+                "symbol": leg.symbol,
+                "valid": False,
+                "spread": float("inf"),
+                "best_bid": 0.0,
+                "best_ask": 0.0,
+                "available_qty": 0.0,
+            }
+
+        book = get_order_book(leg.symbol, limit=5)
+        bids = list(book.get("bids") or [])
+        asks = list(book.get("asks") or [])
+        best_bid, bid_qty = bids[0] if bids else (0.0, 0.0)
+        best_ask, ask_qty = asks[0] if asks else (0.0, 0.0)
+        spread = (float(best_ask) - float(best_bid)) if best_bid > 0 and best_ask > 0 else float("inf")
+        available_qty = float(ask_qty if str(leg.side).upper() == "BUY" else bid_qty)
+        return {
+            "symbol": leg.symbol,
+            "valid": best_bid > 0 and best_ask > 0,
+            "spread": spread,
+            "best_bid": float(best_bid),
+            "best_ask": float(best_ask),
+            "available_qty": available_qty,
+        }
+
+    def _wait_until_market_batch_ready(
+        self,
+        group_id: str,
+        legs: list[LegOrder],
+        batch_qty: float,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, dict[str, float | bool | str]] | None:
+        required_depth = batch_qty * self.MARKET_BATCH_DEPTH_BUFFER_MULT
+        deadline = _time.monotonic() + self.MARKET_BATCH_WAIT_SEC
+        poll_idx = 0
+
+        while True:
+            poll_idx += 1
+            blockers: list[dict[str, Any]] = []
+            snapshots: dict[str, dict[str, float | bool | str]] = {}
+            for leg in legs:
+                snap = self._get_market_book_snapshot(leg)
+                snapshots[leg.symbol] = snap
+                spread = float(snap.get("spread") or float("inf"))
+                available_qty = float(snap.get("available_qty") or 0.0)
+                valid = bool(snap.get("valid"))
+                if (not valid) or spread > self.MARKET_BATCH_MAX_SPREAD_USD or available_qty + 1e-9 < required_depth:
+                    blockers.append({
+                        "symbol": leg.symbol,
+                        "leg_role": leg.leg_role,
+                        "spread": spread,
+                        "available_qty": available_qty,
+                    })
+
+            if not blockers:
+                return snapshots
+
+            now = _time.monotonic()
+            if now >= deadline:
+                if status_callback is not None:
+                    status_callback({
+                        "event": "market_batch_timeout",
+                        "message": f"批量下单等待超时：批次={batch_qty:.4f}",
+                        "group_id": group_id,
+                        "execution_mode": "market",
+                        "batch_qty": batch_qty,
+                        "required_depth": required_depth,
+                        "blockers": blockers,
+                        "legs": [
+                            {
+                                "leg_role": leg.leg_role,
+                                "symbol": leg.symbol,
+                                "side": leg.side,
+                                "quantity": leg.quantity,
+                                "filled_qty": leg.filled_qty,
+                                "status": leg.status,
+                                "avg_price": leg.avg_price,
+                                "attempts": leg.attempts,
+                            }
+                            for leg in legs
+                        ],
+                    })
+                return None
+
+            if status_callback is not None:
+                status_callback({
+                    "event": "market_batch_wait",
+                    "message": f"等待盘口满足批量下单：批次={batch_qty:.4f}",
+                    "group_id": group_id,
+                    "execution_mode": "market",
+                    "batch_qty": batch_qty,
+                    "required_depth": required_depth,
+                    "max_spread_usd": self.MARKET_BATCH_MAX_SPREAD_USD,
+                    "poll_index": poll_idx,
+                    "blockers": blockers,
+                    "legs": [
+                        {
+                            "leg_role": leg.leg_role,
+                            "symbol": leg.symbol,
+                            "side": leg.side,
+                            "quantity": leg.quantity,
+                            "filled_qty": leg.filled_qty,
+                            "status": leg.status,
+                            "avg_price": leg.avg_price,
+                            "attempts": leg.attempts,
+                        }
+                        for leg in legs
+                    ],
+                })
+            _time.sleep(self.MARKET_BATCH_POLL_SEC)
+
     def _refresh_order_result(
         self,
         symbol: str,
@@ -209,27 +392,143 @@ class PositionManager:
         if not getattr(self.client, "query_order", None):
             return result
 
+        last_error: Exception | None = None
+        for attempt in range(1, 5):
+            try:
+                refreshed = self.client.query_order(
+                    symbol,
+                    order_id=result.order_id or None,
+                    client_order_id=client_order_id or None,
+                )
+            except Exception as e:
+                last_error = e
+                logger.debug(
+                    f"Order refresh attempt {attempt}/4 skipped for {symbol} orderId={result.order_id}: {e}"
+                )
+                if attempt < 4:
+                    _time.sleep(0.5)
+                continue
+
+            if refreshed.order_id:
+                result.order_id = refreshed.order_id
+            result.quantity = refreshed.quantity or result.quantity
+            result.price = refreshed.price or result.price
+            result.avg_price = refreshed.avg_price or result.avg_price
+            result.status = refreshed.status or result.status
+            result.fee = refreshed.fee or result.fee
+            result.raw = refreshed.raw or result.raw
+
+            refreshed_status = str(result.status or "").upper()
+            if refreshed_status not in {"NEW", "PENDING", "PARTIALLY_FILLED"}:
+                break
+            if attempt < 4:
+                _time.sleep(0.5)
+
+        if last_error is not None and str(result.status or "").upper() in {"NEW", "PENDING", "PARTIALLY_FILLED"}:
+            logger.debug(
+                f"Order refresh exhausted for {symbol} orderId={result.order_id}; will rely on exchange position reconciliation"
+            )
+        return result
+
+    def _cancel_leg_order(self, leg: LegOrder) -> bool:
+        cancel_fn = getattr(self.client, "cancel_order", None)
+        order_id = str(leg.order_id or "").strip() or None
+        client_order_id = str(getattr(leg, "client_order_id", "") or "").strip() or None
+        if cancel_fn is None or (order_id is None and client_order_id is None):
+            return False
         try:
-            refreshed = self.client.query_order(
-                symbol,
-                order_id=result.order_id or None,
-                client_order_id=client_order_id or None,
+            cancelled = bool(
+                cancel_fn(
+                    leg.symbol,
+                    order_id=order_id,
+                    client_order_id=client_order_id,
+                )
             )
         except Exception as e:
             logger.debug(
-                f"Order refresh skipped for {symbol} orderId={result.order_id}: {e}"
+                f"Cancel unresolved order skipped for {leg.symbol} orderId={order_id} clientOrderId={client_order_id}: {e}"
             )
-            return result
+            cancelled = False
+        leg.order_id = ""
+        leg.client_order_id = ""
+        return cancelled
 
-        if refreshed.order_id:
-            result.order_id = refreshed.order_id
-        result.quantity = refreshed.quantity or result.quantity
-        result.price = refreshed.price or result.price
-        result.avg_price = refreshed.avg_price or result.avg_price
-        result.status = refreshed.status or result.status
-        result.fee = refreshed.fee or result.fee
-        result.raw = refreshed.raw or result.raw
-        return result
+    @staticmethod
+    def _expected_position_side_for_leg(leg: LegOrder, reduce_only: bool = False) -> str:
+        if reduce_only:
+            return "LONG" if str(leg.side).upper() == "SELL" else "SHORT"
+        return "SHORT" if str(leg.side).upper() == "SELL" else "LONG"
+
+    def _reconcile_market_results_with_exchange_positions(
+        self,
+        leg_orders: list[LegOrder],
+        reduce_only: bool = False,
+        max_polls: int = 3,
+        poll_delay_sec: float = 0.25,
+    ) -> None:
+        """Reconcile order results against live exchange positions.
+
+        If live positions still do not match the expected result after a batch,
+        cancel any unresolved current order and leave the residual quantity to be
+        supplemented by the next batch.
+        """
+        if not leg_orders or not getattr(self.client, "get_positions", None):
+            return
+
+        underlying = self._infer_underlying(leg_orders[0].symbol)
+        target_legs = list(leg_orders)
+        for poll_idx in range(max_polls):
+            try:
+                positions = self.client.get_positions(underlying)
+            except Exception as e:
+                logger.debug(f"Market result reconcile skipped for {underlying}: {e}")
+                return
+
+            positions_by_symbol_side = {
+                (
+                    str(pos.get("symbol") or "").upper(),
+                    str(pos.get("side") or "").upper(),
+                ): pos
+                for pos in positions
+                if abs(float(pos.get("quantity") or 0.0)) > 0
+            }
+
+            unresolved = []
+            for leg in target_legs:
+                expected_side = self._expected_position_side_for_leg(leg, reduce_only=reduce_only)
+                pos = positions_by_symbol_side.get((str(leg.symbol or "").upper(), expected_side))
+                pos_qty = abs(float((pos or {}).get("quantity") or 0.0))
+                target_qty = float(leg.quantity or 0.0)
+
+                if reduce_only:
+                    remaining_on_exchange = min(pos_qty, target_qty)
+                    progress_qty = max(target_qty - remaining_on_exchange, 0.0)
+                else:
+                    progress_qty = min(pos_qty, target_qty)
+                    pos_entry = float((pos or {}).get("entryPrice") or 0.0)
+                    if pos_entry > 0:
+                        leg.avg_price = pos_entry
+
+                leg.filled_qty = progress_qty
+                remaining_qty = self._remaining_leg_qty(leg)
+                if remaining_qty <= 1e-9:
+                    leg.status = "FILLED"
+                    continue
+
+                unresolved.append(leg)
+
+            if not unresolved:
+                return
+            target_legs = unresolved
+            if poll_idx < max_polls - 1:
+                _time.sleep(poll_delay_sec)
+
+        for leg in target_legs:
+            if self._remaining_leg_qty(leg) <= 1e-9:
+                leg.status = "FILLED"
+                continue
+            self._cancel_leg_order(leg)
+            leg.status = "PENDING"
 
     # ------------------------------------------------------------------
     # Open a new short strangle (2-leg naked sell)
@@ -243,7 +542,7 @@ class PositionManager:
         sell_put_strike: float,
         quantity: float,
         underlying_price: float,
-        execution_mode: str = "chaser",
+        execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> IronCondorPosition | None:
         """Open a naked short strangle (2 legs).
@@ -252,7 +551,7 @@ class PositionManager:
         fill, or None on failure.
         """
         group_id = f"SS_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        execution_mode_norm = str(execution_mode or "chaser").strip().lower()
+        execution_mode_norm = str(execution_mode or "market").strip().lower()
         if execution_mode_norm not in {"chaser", "market"}:
             raise ValueError(f"Unsupported execution_mode: {execution_mode}")
 
@@ -476,16 +775,16 @@ class PositionManager:
         buy_put_strike: float,
         quantity: float,
         underlying_price: float,
-        execution_mode: str = "chaser",
+        execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> IronCondorPosition | None:
         """Open a full iron condor.
 
-        `execution_mode="chaser"` uses the adaptive limit chaser.
-        `execution_mode="market"` submits each leg as a market order.
+        Default `execution_mode="market"` submits each leg as a market order.
+        `execution_mode="chaser"` remains available as an optional adaptive limit chaser.
         """
         group_id = f"IC_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        execution_mode_norm = str(execution_mode or "chaser").strip().lower()
+        execution_mode_norm = str(execution_mode or "market").strip().lower()
         if execution_mode_norm not in {"chaser", "market"}:
             raise ValueError(f"Unsupported execution_mode: {execution_mode}")
 
@@ -726,21 +1025,115 @@ class PositionManager:
         leg_orders: list[LegOrder],
         quantity: float,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
+        reduce_only: bool = False,
+        client_order_tag: str = "mkt",
     ) -> list[LegOrder] | None:
-        """Submit option legs sequentially as market orders."""
-        results: list[LegOrder] = []
-        total_legs = len(leg_orders)
+        """Submit market legs in synchronized <=1 BTC batches after spread/depth checks."""
+        if not leg_orders:
+            return []
 
-        for idx, leg_order in enumerate(leg_orders, start=1):
+        total_legs = len(leg_orders)
+        batch_index = 0
+        for leg in leg_orders:
+            leg.status = leg.status or "PENDING"
+            leg.filled_qty = float(leg.filled_qty or 0.0)
+            leg.avg_price = float(leg.avg_price or 0.0)
+            leg.fee = float(leg.fee or 0.0)
+            leg.attempts = int(leg.attempts or 0)
+
+        while True:
+            pending = [leg for leg in leg_orders if self._remaining_leg_qty(leg) > 1e-9]
+            if not pending:
+                break
+
+            batch_index += 1
+            batch_qty = min(
+                self.MARKET_BATCH_MAX_QTY,
+                min(self._remaining_leg_qty(leg) for leg in pending),
+            )
+            snapshots = self._wait_until_market_batch_ready(
+                group_id=group_id,
+                legs=pending,
+                batch_qty=batch_qty,
+                status_callback=status_callback,
+            )
+            if snapshots is None:
+                for leg in pending:
+                    if self._remaining_leg_qty(leg) > 1e-9:
+                        leg.status = "FAILED"
+                break
+
             if status_callback is not None:
                 status_callback({
-                    "event": "market_order_submit",
-                    "message": f"正在发送 {leg_order.leg_role} 市价单",
+                    "event": "market_batch_submit",
+                    "message": f"第 {batch_index} 批开始同步下单，批次={batch_qty:.4f}",
                     "group_id": group_id,
                     "execution_mode": "market",
-                    "filled_legs": sum(1 for leg in results if leg.status == "FILLED"),
+                    "batch_index": batch_index,
+                    "batch_qty": batch_qty,
+                    "filled_legs": sum(1 for leg in leg_orders if self._remaining_leg_qty(leg) <= 1e-9),
                     "total_legs": total_legs,
-                    "fill_ratio": (idx - 1) / total_legs,
+                    "fill_ratio": sum(float(leg.filled_qty or 0.0) for leg in leg_orders) / max(sum(float(leg.quantity or 0.0) for leg in leg_orders), 1e-9),
+                    "legs": [
+                        {
+                            "leg_role": leg.leg_role,
+                            "symbol": leg.symbol,
+                            "side": leg.side,
+                            "quantity": leg.quantity,
+                            "filled_qty": leg.filled_qty,
+                            "status": leg.status,
+                            "avg_price": leg.avg_price,
+                            "attempts": leg.attempts,
+                            "spread": float((snapshots.get(leg.symbol) or {}).get("spread") or 0.0),
+                            "top_qty": float((snapshots.get(leg.symbol) or {}).get("available_qty") or 0.0),
+                        }
+                        for leg in leg_orders
+                    ],
+                })
+
+            fatal_error: tuple[LegOrder, Exception] | None = None
+            for leg in pending:
+                client_order_id = f"{leg.client_order_prefix}:{client_order_tag}:{batch_index:02d}"
+                try:
+                    leg.attempts += 1
+                    leg.client_order_id = client_order_id
+                    order_result = self._submit_order(
+                        symbol=leg.symbol,
+                        side=leg.side,
+                        quantity=batch_qty,
+                        order_type="MARKET",
+                        reduce_only=reduce_only,
+                        client_order_id=client_order_id,
+                    )
+                    order_result = self._refresh_order_result(
+                        leg.symbol,
+                        order_result,
+                        client_order_id=client_order_id,
+                    )
+                    self._merge_leg_fill(leg, order_result)
+                except Exception as e:
+                    logger.error(f"Position {group_id}: batched market order failed for {leg.leg_role}: {e}")
+                    leg.status = "FAILED"
+                    fatal_error = (leg, e)
+                    break
+
+            self._reconcile_market_results_with_exchange_positions(
+                leg_orders,
+                reduce_only=reduce_only,
+            )
+
+            if status_callback is not None:
+                filled_count = sum(1 for leg in leg_orders if self._remaining_leg_qty(leg) <= 1e-9)
+                status_callback({
+                    "event": "market_batch_result",
+                    "message": f"第 {batch_index} 批完成",
+                    "group_id": group_id,
+                    "execution_mode": "market",
+                    "batch_index": batch_index,
+                    "batch_qty": batch_qty,
+                    "filled_legs": filled_count,
+                    "total_legs": total_legs,
+                    "fill_ratio": sum(float(leg.filled_qty or 0.0) for leg in leg_orders) / max(sum(float(leg.quantity or 0.0) for leg in leg_orders), 1e-9),
                     "legs": [
                         {
                             "leg_role": leg.leg_role,
@@ -752,59 +1145,19 @@ class PositionManager:
                             "avg_price": leg.avg_price,
                             "attempts": leg.attempts,
                         }
-                        for leg in [*results, leg_order, *leg_orders[idx:]]
+                        for leg in leg_orders
                     ],
                 })
 
-            try:
-                _client_order_id = f"{leg_order.client_order_prefix}:mkt"
-                order_result = self.client.place_order(
-                    symbol=leg_order.symbol,
-                    side=leg_order.side,
-                    quantity=leg_order.quantity,
-                    order_type="MARKET",
-                    client_order_id=_client_order_id,
-                )
-                order_result = self._refresh_order_result(
-                    leg_order.symbol,
-                    order_result,
-                    client_order_id=_client_order_id,
-                )
-            except Exception as e:
-                logger.error(f"Position {group_id}: market order failed for {leg_order.leg_role}: {e}")
-                rollback_fills = [
-                    (leg.leg_role, OrderResult(
-                        order_id=leg.order_id,
-                        symbol=leg.symbol,
-                        side=leg.side,
-                        quantity=leg.filled_qty,
-                        price=leg.avg_price,
-                        avg_price=leg.avg_price,
-                        status="FILLED",
-                        fee=leg.fee,
-                        raw={},
-                    ))
-                    for leg in results if leg.filled_qty > 0
-                ]
-                if rollback_fills:
-                    rollback_failures = self._rollback_legs(rollback_fills)
-                else:
-                    rollback_failures = []
+            if fatal_error is not None:
+                failed_leg, exc = fatal_error
                 if status_callback is not None:
                     status_callback({
                         "event": "position_open_error",
-                        "message": (
-                            f"市价单提交失败: {leg_order.leg_role} | {e}；且回滚失败：{', '.join(rollback_failures)}"
-                            if rollback_failures
-                            else f"市价单提交失败: {leg_order.leg_role} | {e}"
-                        ),
+                        "message": f"批量市价单提交失败: {failed_leg.leg_role} | {exc}",
                         "group_id": group_id,
                         "execution_mode": "market",
-                        "failed_leg": leg_order.leg_role,
-                        "rollback_failed_legs": rollback_failures,
-                        "filled_legs": sum(1 for leg in results if leg.status == "FILLED"),
-                        "total_legs": total_legs,
-                        "fill_ratio": sum(1 for leg in results if leg.status == "FILLED") / total_legs,
+                        "failed_leg": failed_leg.leg_role,
                         "legs": [
                             {
                                 "leg_role": leg.leg_role,
@@ -816,45 +1169,21 @@ class PositionManager:
                                 "avg_price": leg.avg_price,
                                 "attempts": leg.attempts,
                             }
-                            for leg in results
+                            for leg in leg_orders
                         ],
                     })
-                return None
+                break
 
-            leg_order.order_id = order_result.order_id
-            leg_order.status = order_result.status or "FILLED"
-            leg_order.filled_qty = order_result.quantity or quantity
-            leg_order.avg_price = order_result.avg_price
-            leg_order.fee = order_result.fee
-            leg_order.attempts = 1
-            results.append(leg_order)
+            if any(str(leg.status or "").upper() == "FAILED" for leg in leg_orders):
+                break
 
-            if status_callback is not None:
-                filled_count = sum(1 for leg in results if leg.status == "FILLED")
-                status_callback({
-                    "event": "market_order_filled" if leg_order.status == "FILLED" else "market_order_result",
-                    "message": f"{leg_order.leg_role} 市价单结果: {leg_order.status}",
-                    "group_id": group_id,
-                    "execution_mode": "market",
-                    "filled_legs": filled_count,
-                    "total_legs": total_legs,
-                    "fill_ratio": filled_count / total_legs,
-                    "legs": [
-                        {
-                            "leg_role": leg.leg_role,
-                            "symbol": leg.symbol,
-                            "side": leg.side,
-                            "quantity": leg.quantity,
-                            "filled_qty": leg.filled_qty,
-                            "status": leg.status,
-                            "avg_price": leg.avg_price,
-                            "attempts": leg.attempts,
-                        }
-                        for leg in [*results, *leg_orders[idx:]]
-                    ],
-                })
+        for leg in leg_orders:
+            if self._remaining_leg_qty(leg) <= 1e-9:
+                leg.status = "FILLED"
+            elif str(leg.status or "").upper() not in {"FAILED", "ERROR"}:
+                leg.status = "FAILED"
 
-        return results
+        return leg_orders
 
     def _execute_market_iron_condor(
         self,
@@ -879,7 +1208,7 @@ class PositionManager:
         for leg_role, result in filled_legs:
             try:
                 close_side = "SELL" if result.side == "BUY" else "BUY"
-                self.client.place_order(
+                self._submit_order(
                     symbol=result.symbol,
                     side=close_side,
                     quantity=result.quantity,
@@ -896,7 +1225,7 @@ class PositionManager:
     # Close an iron condor
     # ------------------------------------------------------------------
 
-    def close_iron_condor(self, group_id: str, reason: str = "", execution_mode: str = "chaser") -> float:
+    def close_iron_condor(self, group_id: str, reason: str = "", execution_mode: str = "market") -> float:
         """Close all legs of an iron condor.
 
         Returns total realized PnL.
@@ -906,7 +1235,7 @@ class PositionManager:
             logger.warning(f"Condor {group_id} not found or already closed")
             return 0.0
 
-        execution_mode_norm = str(execution_mode or "chaser").strip().lower()
+        execution_mode_norm = str(execution_mode or "market").strip().lower()
         if execution_mode_norm not in {"chaser", "market"}:
             raise ValueError(f"Unsupported close execution_mode: {execution_mode}")
 
@@ -930,33 +1259,16 @@ class PositionManager:
         # Execute close via limit chaser or market orders
         underlying = self._infer_underlying(condor.legs[0].symbol) if condor.legs else "ETH"
         if execution_mode_norm == "market":
-            results = []
             for close_leg in close_legs:
-                try:
-                    order_result = self.client.place_order(
-                        symbol=close_leg.symbol,
-                        side=close_leg.side,
-                        quantity=close_leg.quantity,
-                        order_type="MARKET",
-                        reduce_only=True,
-                        client_order_id=f"{group_id}:{close_leg.leg_role}:mkt_close",
-                    )
-                    order_result = self._refresh_order_result(
-                        close_leg.symbol,
-                        order_result,
-                        client_order_id=f"{group_id}:{close_leg.leg_role}:mkt_close",
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to market-close {close_leg.symbol}: {e}")
-                    close_leg.status = "ERROR"
-                    close_leg.avg_price = 0.0
-                    close_leg.filled_qty = 0.0
-                else:
-                    close_leg.status = order_result.status or "FILLED"
-                    close_leg.avg_price = order_result.avg_price
-                    close_leg.filled_qty = order_result.quantity
-                    close_leg.fee = order_result.fee
-                results.append(close_leg)
+                close_leg.client_order_prefix = f"{group_id}:{close_leg.leg_role}"
+            results = self._execute_market_legs(
+                group_id=group_id,
+                leg_orders=close_legs,
+                quantity=0.0,
+                status_callback=None,
+                reduce_only=True,
+                client_order_tag="mkt_close",
+            ) or close_legs
         else:
             results = self.chaser.execute_legs(close_legs, underlying=underlying)
 
@@ -1000,7 +1312,7 @@ class PositionManager:
 
         return total_pnl
 
-    def close_all(self, reason: str = "close_all", execution_mode: str = "chaser") -> float:
+    def close_all(self, reason: str = "close_all", execution_mode: str = "market") -> float:
         """Close all open iron condors."""
         total = 0.0
         group_ids = list(dict.fromkeys([
@@ -1038,27 +1350,72 @@ class PositionManager:
         total_pnl = 0.0
         affected_groups: set[str] = set()
 
-        for pos in positions:
-            symbol = str(pos.get("symbol") or "")
-            side = str(pos.get("side") or "").upper()
-            qty = abs(float(pos.get("quantity") or 0.0))
-            if not symbol or qty <= 0:
-                continue
+        attempted_symbols: set[str] = set()
+        symbol_close_prices: dict[str, float] = {}
+        max_passes = 3
 
-            logger.warning(
-                f"Exchange-driven close-all: closing {symbol} side={side} qty={qty:.4f} reason={reason}"
-            )
-            try:
-                order_result = self.client.close_position(symbol, side, qty)
-                order_result = self._refresh_order_result(symbol, order_result)
-            except Exception as e:
-                logger.error(f"Exchange-driven close failed for {symbol}: {e}")
-                continue
+        for attempt in range(1, max_passes + 1):
+            positions = self.client.get_positions(underlying) if underlying else self.client.get_positions()
+            if not positions:
+                break
 
-            close_price = float(order_result.avg_price or order_result.price or 0.0)
+            close_legs: list[LegOrder] = []
+            for pos in positions:
+                symbol = str(pos.get("symbol") or "")
+                side = str(pos.get("side") or "").upper()
+                qty = abs(float(pos.get("quantity") or 0.0))
+                if not symbol or qty <= 0:
+                    continue
+                attempted_symbols.add(symbol)
+                close_side = "SELL" if side == "LONG" else "BUY"
+                option_type = "call" if symbol.upper().endswith("-C") else "put"
+                close_legs.append(LegOrder(
+                    leg_role=f"closeall_{attempt}_{symbol}",
+                    symbol=symbol,
+                    side=close_side,
+                    quantity=qty,
+                    strike=0.0,
+                    option_type=option_type,
+                    client_order_prefix=f"closeall:{reason}:{attempt}:{symbol}",
+                ))
+                logger.warning(
+                    f"Exchange-driven close-all: pass={attempt}/{max_passes} queued {symbol} "
+                    f"side={side} qty={qty:.4f} reason={reason}"
+                )
+
+            if not close_legs:
+                break
+
+            results = self._execute_market_legs(
+                group_id=f"closeall:{reason}:{attempt}",
+                leg_orders=close_legs,
+                quantity=0.0,
+                status_callback=None,
+                reduce_only=True,
+                client_order_tag="mkt_closeall",
+            ) or close_legs
+
+            for close_leg in results:
+                close_price = float(close_leg.avg_price or 0.0)
+                if close_price > 0:
+                    symbol_close_prices[close_leg.symbol] = close_price
+
+            if attempt < max_passes:
+                _time.sleep(0.35)
+
+        remaining_positions = self.client.get_positions(underlying) if underlying else self.client.get_positions()
+        remaining_symbols = {
+            str(pos.get("symbol") or "")
+            for pos in remaining_positions
+            if abs(float(pos.get("quantity") or 0.0)) > 0
+        }
+        closed_symbols = attempted_symbols - remaining_symbols
+
+        for symbol in sorted(closed_symbols):
+            close_price = float(symbol_close_prices.get(symbol) or 0.0)
             if close_price <= 0:
                 logger.warning(
-                    f"Exchange-driven close for {symbol} returned no usable close price; local pnl sync skipped"
+                    f"Exchange-driven close verified {symbol} is no longer open, but no close price was captured; local pnl sync skipped"
                 )
                 continue
 
@@ -1083,7 +1440,12 @@ class PositionManager:
 
             total_pnl += symbol_pnl
             logger.info(
-                f"Exchange-driven close completed for {symbol}: close={close_price:.4f}, synced_pnl={symbol_pnl:.4f}"
+                f"Exchange-driven close verified for {symbol}: close={close_price:.4f}, synced_pnl={symbol_pnl:.4f}"
+            )
+
+        if remaining_symbols:
+            logger.warning(
+                f"Exchange-driven close-all incomplete after {max_passes} pass(es): remaining={sorted(remaining_symbols)}"
             )
 
         for gid in list(affected_groups):

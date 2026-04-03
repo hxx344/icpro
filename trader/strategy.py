@@ -241,6 +241,7 @@ class OptionSellingStrategy:
                 sell_put_strike=sell_put.strike,
                 quantity=quantity,
                 underlying_price=spot,
+                execution_mode="market",
             )
 
             if condor:
@@ -318,6 +319,7 @@ class OptionSellingStrategy:
             buy_put_strike=buy_put.strike,
             quantity=quantity,
             underlying_price=spot,
+            execution_mode="market",
         )
 
         if condor:
@@ -711,6 +713,7 @@ class WeekendVolStrategy:
                     buy_put_strike=buy_put.strike,
                     quantity=quantity,
                     underlying_price=spot,
+                    execution_mode="market",
                 )
             except Exception as e:
                 self._record_live_order_failure(
@@ -736,6 +739,7 @@ class WeekendVolStrategy:
                     sell_put_strike=sell_put.strike,
                     quantity=quantity,
                     underlying_price=spot,
+                    execution_mode="market",
                 )
             except Exception as e:
                 self._record_live_order_failure(

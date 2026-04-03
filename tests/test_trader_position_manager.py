@@ -39,12 +39,12 @@ from trader.storage import Storage
 # ======================================================================
 
 
-def _make_order_result(side="SELL", avg_price=0.05, fee=0.001) -> OrderResult:
+def _make_order_result(side="SELL", avg_price=0.05, fee=0.001, quantity=1.0, symbol="ETH-260321-2700-C") -> OrderResult:
     return OrderResult(
         order_id="ORD_001",
-        symbol="ETH-260321-2700-C",
+        symbol=symbol,
         side=side,
-        quantity=1.0,
+        quantity=quantity,
         price=avg_price,
         avg_price=avg_price,
         status="FILLED",
@@ -76,6 +76,17 @@ def _make_leg(
 def mock_client():
     client = MagicMock(spec=BinanceOptionsClient)
     client.place_order.return_value = _make_order_result()
+    client.submit_order.side_effect = lambda **kwargs: _make_order_result(
+        side=kwargs.get("side", "SELL"),
+        quantity=float(kwargs.get("quantity", 1.0)),
+        symbol=kwargs.get("symbol", "ETH-260321-2700-C"),
+    )
+    client.get_order_book.return_value = {
+        "bids": [(100.0, 10.0)],
+        "asks": [(105.0, 10.0)],
+    }
+    client.get_positions.return_value = []
+    client.cancel_order.return_value = True
     return client
 
 
@@ -198,7 +209,118 @@ class TestOpenIronCondor:
         assert condor is not None
         assert len(condor.legs) == 4
         assert condor.is_open is True
-        assert exec_mock.call_args.kwargs["underlying"] == "ETH"
+
+    def test_market_open_splits_into_one_btc_batches(self, pos_mgr, mock_client):
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 2.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 2.0, "entryPrice": 0.05},
+            ],
+        ]
+
+        condor = pos_mgr.open_short_strangle(
+            sell_call_symbol="BTC-260321-100000-C",
+            sell_put_symbol="BTC-260321-80000-P",
+            sell_call_strike=100000,
+            sell_put_strike=80000,
+            quantity=2.0,
+            underlying_price=90000.0,
+            execution_mode="market",
+        )
+
+        assert condor is not None
+        assert mock_client.submit_order.call_count == 4
+        quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
+        assert quantities == [1.0, 1.0, 1.0, 1.0]
+
+    def test_market_open_does_not_upsize_sub_one_btc_order(self, pos_mgr, mock_client):
+        mock_client.get_positions.side_effect = [[
+            {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+            {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+        ]]
+
+        condor = pos_mgr.open_short_strangle(
+            sell_call_symbol="BTC-260321-100000-C",
+            sell_put_symbol="BTC-260321-80000-P",
+            sell_call_strike=100000,
+            sell_put_strike=80000,
+            quantity=0.4,
+            underlying_price=90000.0,
+            execution_mode="market",
+        )
+
+        assert condor is not None
+        assert mock_client.submit_order.call_count == 2
+        quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
+        assert quantities == [0.4, 0.4]
+
+    def test_market_open_cancels_unresolved_order_and_supplements_gap(self, pos_mgr, mock_client):
+        submit_results = [
+            _make_order_result(side="SELL", quantity=1.0, symbol="BTC-260321-100000-C"),
+            OrderResult(
+                order_id="ORD_PUT_1",
+                symbol="BTC-260321-80000-P",
+                side="SELL",
+                quantity=0.0,
+                price=0.0,
+                avg_price=0.0,
+                status="NEW",
+                fee=0.0,
+                raw={},
+            ),
+            _make_order_result(side="SELL", quantity=0.6, symbol="BTC-260321-80000-P"),
+        ]
+        mock_client.submit_order.side_effect = submit_results
+        mock_client.query_order.side_effect = [
+            OrderResult("ORD_PUT_1", "BTC-260321-80000-P", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+            OrderResult("ORD_PUT_1", "BTC-260321-80000-P", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+            OrderResult("ORD_PUT_1", "BTC-260321-80000-P", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+            OrderResult("ORD_PUT_1", "BTC-260321-80000-P", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+        ]
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+            ],
+        ]
+
+        condor = pos_mgr.open_short_strangle(
+            sell_call_symbol="BTC-260321-100000-C",
+            sell_put_symbol="BTC-260321-80000-P",
+            sell_call_strike=100000,
+            sell_put_strike=80000,
+            quantity=1.0,
+            underlying_price=90000.0,
+            execution_mode="market",
+        )
+
+        assert condor is not None
+        assert [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list] == [1.0, 1.0, 0.6]
+        assert mock_client.cancel_order.call_count >= 1
 
     def test_failed_leg_triggers_rollback(self, pos_mgr, mock_client):
         """某腿挂单失败时应回滚已成交的腿."""
@@ -215,7 +337,11 @@ class TestOpenIronCondor:
                     leg.status = "FAILED"
             return legs
 
-        mock_client.place_order.return_value = _make_order_result()
+        mock_client.submit_order.side_effect = lambda **kwargs: _make_order_result(
+            side=kwargs.get("side", "SELL"),
+            quantity=float(kwargs.get("quantity", 1.0)),
+            symbol=kwargs.get("symbol", "ETH-260321-2700-C"),
+        )
 
         with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_partial_fill):
             condor = pos_mgr.open_iron_condor(
@@ -228,7 +354,7 @@ class TestOpenIronCondor:
 
         assert condor is None
         # 2 filled legs should be rolled back via market orders
-        assert mock_client.place_order.call_count == 2
+        assert mock_client.submit_order.call_count == 2
 
     def test_failed_leg_rollback_uses_actual_filled_qty(self, pos_mgr, mock_client):
         """回滚应按已成交量，而不是原始请求量。"""
@@ -244,7 +370,11 @@ class TestOpenIronCondor:
                     leg.status = "FAILED"
             return legs
 
-        mock_client.place_order.return_value = _make_order_result()
+        mock_client.submit_order.side_effect = lambda **kwargs: _make_order_result(
+            side=kwargs.get("side", "SELL"),
+            quantity=float(kwargs.get("quantity", 1.0)),
+            symbol=kwargs.get("symbol", "ETH-260321-2700-C"),
+        )
 
         with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_partial_fill):
             condor = pos_mgr.open_iron_condor(
@@ -256,7 +386,7 @@ class TestOpenIronCondor:
             )
 
         assert condor is None
-        quantities = [call.kwargs["quantity"] for call in mock_client.place_order.call_args_list]
+        quantities = [call.kwargs["quantity"] for call in mock_client.submit_order.call_args_list]
         assert quantities == [0.4, 0.4]
 
     def test_successful_open_records_actual_filled_qty(self, pos_mgr, storage):
@@ -310,24 +440,24 @@ class TestOpenIronCondor:
 
 
 class TestCloseIronCondor:
-    def _setup_open_condor(self, pos_mgr, storage):
+    def _setup_open_condor(self, pos_mgr, storage, qty: float = 1.0):
         """手动注入一个已开仓的 condor."""
         gid = "IC_TEST"
 
         # 模拟 4 笔 trade
-        tid1 = storage.record_trade(gid, "SP", "SELL", 1.0, 0.03, meta={"leg_role": "sell_put"})
-        tid2 = storage.record_trade(gid, "BP", "BUY", 1.0, 0.01, meta={"leg_role": "buy_put"})
-        tid3 = storage.record_trade(gid, "SC", "SELL", 1.0, 0.04, meta={"leg_role": "sell_call"})
-        tid4 = storage.record_trade(gid, "BC", "BUY", 1.0, 0.015, meta={"leg_role": "buy_call"})
+        tid1 = storage.record_trade(gid, "SP", "SELL", qty, 0.03, meta={"leg_role": "sell_put"})
+        tid2 = storage.record_trade(gid, "BP", "BUY", qty, 0.01, meta={"leg_role": "buy_put"})
+        tid3 = storage.record_trade(gid, "SC", "SELL", qty, 0.04, meta={"leg_role": "sell_call"})
+        tid4 = storage.record_trade(gid, "BC", "BUY", qty, 0.015, meta={"leg_role": "buy_call"})
 
         condor = IronCondorPosition(
             group_id=gid,
             entry_time=datetime.now(timezone.utc),
             underlying_price=2500.0,
-            sell_put=CondorLeg("SP", "SELL", "put", 2300, 1.0, 0.03, tid1),
-            buy_put=CondorLeg("BP", "BUY", "put", 2250, 1.0, 0.01, tid2),
-            sell_call=CondorLeg("SC", "SELL", "call", 2700, 1.0, 0.04, tid3),
-            buy_call=CondorLeg("BC", "BUY", "call", 2750, 1.0, 0.015, tid4),
+            sell_put=CondorLeg("SP", "SELL", "put", 2300, qty, 0.03, tid1),
+            buy_put=CondorLeg("BP", "BUY", "put", 2250, qty, 0.01, tid2),
+            sell_call=CondorLeg("SC", "SELL", "call", 2700, qty, 0.04, tid3),
+            buy_call=CondorLeg("BC", "BUY", "call", 2750, qty, 0.015, tid4),
             total_premium=0.045,  # (0.03+0.04) - (0.01+0.015)
         )
         pos_mgr.open_condors[gid] = condor
@@ -368,6 +498,118 @@ class TestCloseIronCondor:
         with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_fill_close_legs):
             total = pos_mgr.close_all(reason="emergency")
         assert len(pos_mgr.open_condors) == 0
+
+    def test_market_close_splits_into_one_btc_batches(self, pos_mgr, mock_client, storage):
+        gid = self._setup_open_condor(pos_mgr, storage, qty=2.0)
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 1.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 1.0, "entryPrice": 0.015},
+            ],
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 1.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 1.0, "entryPrice": 0.015},
+            ],
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 1.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 1.0, "entryPrice": 0.015},
+            ],
+            [],
+        ]
+
+        pnl = pos_mgr.close_iron_condor(gid, reason="test_market", execution_mode="market")
+
+        assert gid not in pos_mgr.open_condors
+        assert mock_client.submit_order.call_count == 8
+        quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
+        assert quantities == [1.0] * 8
+
+    def test_market_close_cancels_unresolved_order_and_supplements_gap(self, pos_mgr, mock_client, storage):
+        gid = self._setup_open_condor(pos_mgr, storage, qty=1.0)
+        submit_results = [
+            _make_order_result(side="BUY", quantity=1.0, symbol="SP"),
+            OrderResult("ORD_BP_1", "BP", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+            _make_order_result(side="BUY", quantity=1.0, symbol="SC"),
+            _make_order_result(side="SELL", quantity=1.0, symbol="BC"),
+            _make_order_result(side="SELL", quantity=0.6, symbol="BP"),
+        ]
+        mock_client.submit_order.side_effect = submit_results
+        mock_client.query_order.side_effect = [
+            OrderResult("ORD_BP_1", "BP", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+            OrderResult("ORD_BP_1", "BP", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+            OrderResult("ORD_BP_1", "BP", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+            OrderResult("ORD_BP_1", "BP", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
+        ]
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "BP", "side": "LONG", "quantity": 0.4, "entryPrice": 0.01},
+            ],
+            [
+                {"symbol": "BP", "side": "LONG", "quantity": 0.4, "entryPrice": 0.01},
+            ],
+            [
+                {"symbol": "BP", "side": "LONG", "quantity": 0.4, "entryPrice": 0.01},
+            ],
+            [],
+        ]
+
+        pnl = pos_mgr.close_iron_condor(gid, reason="supplement_close", execution_mode="market")
+
+        assert gid not in pos_mgr.open_condors
+        assert [call.kwargs["symbol"] for call in mock_client.submit_order.call_args_list].count("BP") == 2
+        assert any(float(call.kwargs["quantity"]) == 0.6 for call in mock_client.submit_order.call_args_list)
+        assert mock_client.cancel_order.call_count >= 1
+
+    def test_emergency_close_all_exchange_positions_splits_batches(self, pos_mgr, mock_client, storage):
+        gid = self._setup_open_condor(pos_mgr, storage, qty=2.0)
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 2.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 2.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 2.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 2.0, "entryPrice": 0.015},
+            ],
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 2.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 2.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 2.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 2.0, "entryPrice": 0.015},
+            ],
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 1.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 1.0, "entryPrice": 0.015},
+            ],
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 1.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 1.0, "entryPrice": 0.015},
+            ],
+            [
+                {"symbol": "SP", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.03},
+                {"symbol": "BP", "side": "LONG", "quantity": 1.0, "entryPrice": 0.01},
+                {"symbol": "SC", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.04},
+                {"symbol": "BC", "side": "LONG", "quantity": 1.0, "entryPrice": 0.015},
+            ],
+            [],
+            [],
+            [],
+            [],
+        ]
+
+        total = pos_mgr.close_all_exchange_positions(reason="emergency_test")
+
+        assert mock_client.submit_order.call_count == 8
+        quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
+        assert quantities == [1.0] * 8
 
 
 # ======================================================================
