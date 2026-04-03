@@ -24,6 +24,8 @@ pip install -U pip setuptools wheel
 pip install -e ".[dev,trader]"
 ```
 
+> **Streamlit 版本要求**：当前 Dashboard 使用了 `st.fragment`，因此需要 `streamlit>=1.37`。如果你是在旧虚拟环境里升级项目，安装完成后可用 `python -m pip show streamlit` 确认版本。
+
 ### 2. 配置 API 密钥
 
 ```bash
@@ -84,6 +86,8 @@ streamlit run trader/dashboard.py -- --config configs/trader/weekend_vol_btc.yam
 # 7) 或使用 systemd 服务（参考 deploy/setup.sh）
 sudo bash deploy/setup.sh
 ```
+
+> 如果 VPS 里是之前遗留的旧环境，执行完安装后请确认 `streamlit` 版本不低于 `1.37`，否则 `Dashboard` 中使用的 `st.fragment` 无法运行。
 
 ## 交易策略
 
