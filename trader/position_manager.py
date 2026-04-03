@@ -407,6 +407,10 @@ class PositionManager:
     def _filled_leg_orders(results: list[LegOrder]) -> list[LegOrder]:
         return [r for r in results if float(r.filled_qty or 0.0) > 1e-9]
 
+    @staticmethod
+    def _has_margin_insufficient_failure(results: list[LegOrder]) -> bool:
+        return any(getattr(r, "abort_reason", "") == "margin_insufficient" for r in results)
+
     def _persist_position_from_results(
         self,
         group_id: str,
@@ -895,7 +899,8 @@ class PositionManager:
                 f"Short Strangle {group_id}: {len(failed)} leg(s) failed to fill – "
                 + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
             )
-            if execution_mode_norm == "market":
+            rollback_due_to_margin = self._has_margin_insufficient_failure(failed)
+            if execution_mode_norm == "market" and not rollback_due_to_margin:
                 filled_results = self._filled_leg_orders(results)
                 if filled_results:
                     try:
@@ -947,7 +952,12 @@ class PositionManager:
             rollback_failures = self._rollback_legs(filled_results)
             if status_callback is not None:
                 _rollback_msg = (
-                    "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
+                    "保证金不足导致至少有一条腿未成交，且回滚失败，可能存在残留仓位："
+                    + ", ".join(rollback_failures)
+                    if rollback_due_to_margin and rollback_failures
+                    else "保证金不足导致至少有一条腿未成交，已完成回滚"
+                    if rollback_due_to_margin
+                    else "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
                     + ", ".join(rollback_failures)
                     if rollback_failures
                     else "至少有一条腿未成交，已完成回滚"
@@ -958,6 +968,7 @@ class PositionManager:
                     "group_id": group_id,
                     "execution_mode": execution_mode_norm,
                     "failed_legs": [r.leg_role for r in failed],
+                    "abort_reason": "margin_insufficient" if rollback_due_to_margin else "submit_failed",
                     "rollback_failed_legs": rollback_failures,
                     "legs": [
                         {
@@ -1155,7 +1166,8 @@ class PositionManager:
                 f"Iron Condor {group_id}: {len(failed)} leg(s) failed to fill – "
                 + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
             )
-            if execution_mode_norm == "market":
+            rollback_due_to_margin = self._has_margin_insufficient_failure(failed)
+            if execution_mode_norm == "market" and not rollback_due_to_margin:
                 filled_results = self._filled_leg_orders(results)
                 if filled_results:
                     try:
@@ -1210,7 +1222,12 @@ class PositionManager:
                 status_callback({
                     "event": "position_open_failed",
                     "message": (
-                        "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
+                        "保证金不足导致至少有一条腿未成交，且回滚失败，可能存在残留仓位："
+                        + ", ".join(rollback_failures)
+                        if rollback_due_to_margin and rollback_failures
+                        else "保证金不足导致至少有一条腿未成交，已完成回滚"
+                        if rollback_due_to_margin
+                        else "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
                         + ", ".join(rollback_failures)
                         if rollback_failures
                         else "至少有一条腿未成交，已完成回滚"
@@ -1218,6 +1235,7 @@ class PositionManager:
                     "group_id": group_id,
                     "execution_mode": execution_mode_norm,
                     "failed_legs": [r.leg_role for r in failed],
+                    "abort_reason": "margin_insufficient" if rollback_due_to_margin else "submit_failed",
                     "rollback_failed_legs": rollback_failures,
                     "legs": [
                         {

@@ -346,10 +346,11 @@ class TestOpenIronCondor:
         assert [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list] == [1.0, 1.0, 0.6]
         assert mock_client.cancel_order.call_count >= 1
 
-    def test_market_open_keeps_partial_fill_on_margin_insufficient(self, pos_mgr, mock_client):
+    def test_market_open_rolls_back_partial_fill_on_margin_insufficient(self, pos_mgr, mock_client):
         mock_client.submit_order.side_effect = [
             _make_order_result(side="SELL", quantity=0.6, symbol="BTC-260321-80000-P"),
             RuntimeError("Binance error -2027: Option margin is insufficient."),
+            _make_order_result(side="BUY", quantity=0.6, symbol="BTC-260321-80000-P"),
         ]
         mock_client.get_positions.side_effect = [
             [{"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.6, "entryPrice": 0.05}],
@@ -367,11 +368,8 @@ class TestOpenIronCondor:
             execution_mode="market",
         )
 
-        assert condor is not None
-        assert len(condor.legs) == 1
-        assert condor.sell_put is not None
-        assert condor.sell_call is None
-        assert mock_client.submit_order.call_count == 2
+        assert condor is None
+        assert mock_client.submit_order.call_count == 3
         assert mock_client.cancel_order.call_count >= 1
 
     def test_market_open_retries_remaining_leg_instead_of_rollback(self, pos_mgr, mock_client):
