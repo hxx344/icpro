@@ -42,7 +42,7 @@ sudo -u "$SERVICE_USER" bash -c "
     cd $APP_DIR
     python3 -m venv .venv
     .venv/bin/pip install --upgrade pip -q
-    .venv/bin/pip install -e '.[trader]' -q
+    .venv/bin/pip install --upgrade -e '.[trader]' -q
 "
 
 # --- 5. 创建数据目录 ---

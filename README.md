@@ -21,10 +21,12 @@ source .venv/bin/activate
 
 # 安装依赖
 pip install -U pip setuptools wheel
-pip install -e ".[dev,trader]"
+pip install -U -e ".[dev,trader]"
 ```
 
 > **Streamlit 版本要求**：当前 Dashboard 使用了 `st.fragment`，因此需要 `streamlit>=1.37`。如果你是在旧虚拟环境里升级项目，安装完成后可用 `python -m pip show streamlit` 确认版本。
+>
+> 如果在执行 `pip install -U pip setuptools wheel` 时看到类似 `streamlit 1.28.2 requires packaging<24` 的报错，不是这一步失败，而是**旧版 Streamlit 还没升级前**的临时依赖冲突提示。继续执行下一步项目安装即可；若升级后仍残留旧版，可再手动执行 `pip install -U "streamlit>=1.37,<2.0"`。
 
 ### 2. 配置 API 密钥
 
@@ -74,7 +76,7 @@ source .venv/bin/activate
 
 # 4) 安装项目依赖
 pip install -U pip setuptools wheel
-pip install -e ".[trader]"
+pip install -U -e ".[trader]"
 
 # 5) 配置 API 密钥
 export BINANCE_API_KEY="your_key"
