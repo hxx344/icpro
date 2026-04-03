@@ -160,6 +160,10 @@ class TradingEngine:
             time.time() - self._last_tick_time if self._last_tick_time else None
         )
         strategy_status = self.strategy.status() if self.strategy else {}
+        effective_open_positions = strategy_status.get(
+            "open_positions",
+            self.pos_mgr.open_position_count if self.pos_mgr else 0,
+        )
 
         return {
             "running": self.is_running,
@@ -171,9 +175,7 @@ class TradingEngine:
             "last_error": self._last_error,
             "error_count": self._error_count,
             "check_interval": self.cfg.monitor.check_interval_sec,
-            "open_positions": (
-                self.pos_mgr.open_position_count if self.pos_mgr else 0
-            ),
+            "open_positions": effective_open_positions,
             "strategy_status": strategy_status,
         }
 
@@ -355,7 +357,13 @@ class TradingEngine:
         if not self.client:
             return
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        strategy_status: dict[str, Any] = {}
         pos_count = self.pos_mgr.open_position_count if self.pos_mgr else 0
+        try:
+            strategy_status = self.strategy.status() if self.strategy else {}
+            pos_count = strategy_status.get("open_positions", pos_count)
+        except Exception:
+            strategy_status = {}
         try:
             account = self.client.get_account()
             if account.raw.get("simulated"):
@@ -371,7 +379,6 @@ class TradingEngine:
         rv_str = "-"
         basket_str = "-"
         try:
-            strategy_status = self.strategy.status() if self.strategy else {}
             rv_val = strategy_status.get("entry_realized_vol_current")
             basket_val = strategy_status.get("basket_pnl_pct")
             if isinstance(rv_val, (int, float)):

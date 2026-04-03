@@ -522,6 +522,21 @@ class WeekendVolStrategy:
         self._last_order_exchange_positions_underlying: str = ""
         self._last_order_exchange_positions: list[dict[str, Any]] = []
         self._last_order_exchange_positions_error: str = ""
+        self._last_guard_exchange_positions: list[dict[str, Any]] = []
+        self._last_guard_exchange_positions_error: str = ""
+
+    def _get_exchange_position_guard_snapshot(self) -> tuple[list[dict[str, Any]], str]:
+        try:
+            positions = self.client.get_positions(self.cfg.underlying.upper())
+            if not isinstance(positions, list):
+                positions = []
+            self._last_guard_exchange_positions = positions
+            self._last_guard_exchange_positions_error = ""
+            return positions, ""
+        except Exception as e:
+            self._last_guard_exchange_positions = []
+            self._last_guard_exchange_positions_error = str(e)
+            return [], str(e)
 
     # ------------------------------------------------------------------
     # Main entry: called periodically by engine / main loop
@@ -575,17 +590,16 @@ class WeekendVolStrategy:
             return False
 
         # Exchange position guard
-        try:
-            exchange_positions = self.client.get_positions(self.cfg.underlying.upper())
-            if exchange_positions:
-                symbols = [p["symbol"] for p in exchange_positions]
-                logger.warning(
-                    f"[WeekendVol] Exchange has {len(exchange_positions)} "
-                    f"existing position(s): {symbols} – skipping"
-                )
-                return False
-        except Exception as e:
-            logger.error(f"[WeekendVol] Position check failed: {e} – skipping")
+        exchange_positions, exchange_error = self._get_exchange_position_guard_snapshot()
+        if exchange_positions:
+            symbols = [p["symbol"] for p in exchange_positions]
+            logger.warning(
+                f"[WeekendVol] Exchange has {len(exchange_positions)} "
+                f"existing position(s): {symbols} – skipping"
+            )
+            return False
+        if exchange_error:
+            logger.error(f"[WeekendVol] Position check failed: {exchange_error} – skipping")
             return False
 
         return True
@@ -1117,6 +1131,14 @@ class WeekendVolStrategy:
         """Return current strategy status."""
         rv24 = self._compute_realized_vol(self.cfg.underlying.upper(), log_result=False)
         basket_pnl_pct = self._current_basket_pnl_pct()
+        local_open_positions = self.pos_mgr.open_position_count
+        exchange_positions = list(self._last_guard_exchange_positions or [])
+        exchange_position_count = len(exchange_positions)
+        effective_open_positions = local_open_positions
+        position_source = "local"
+        if exchange_position_count > 0 and local_open_positions <= 0:
+            effective_open_positions = 1
+            position_source = "exchange"
         return {
             "strategy": "WeekendVol",
             "mode": "weekend_vol",
@@ -1141,7 +1163,12 @@ class WeekendVolStrategy:
             "last_order_exchange_positions": self._last_order_exchange_positions,
             "last_order_exchange_positions_error": self._last_order_exchange_positions_error,
             "last_trade_week": self._last_trade_week,
-            "open_positions": self.pos_mgr.open_position_count,
+            "open_positions": effective_open_positions,
+            "local_open_positions": local_open_positions,
+            "exchange_position_count": exchange_position_count,
+            "exchange_position_symbols": [str(p.get("symbol") or "") for p in exchange_positions],
+            "exchange_position_check_error": self._last_guard_exchange_positions_error,
+            "position_source": position_source,
             "max_positions": self.cfg.max_positions,
             "positions": self.pos_mgr.summary(),
         }

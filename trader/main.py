@@ -235,7 +235,13 @@ class TraderApp:
     def _heartbeat(self) -> None:
         """Log periodic heartbeat with status summary."""
         now = datetime.now(timezone.utc)
+        strategy_status = {}
         pos_count = self.pos_mgr.open_position_count
+        try:
+            strategy_status = self.strategy.status()
+            pos_count = strategy_status.get("open_positions", pos_count)
+        except Exception:
+            strategy_status = {}
 
         try:
             account = self.client.get_account()
@@ -248,7 +254,6 @@ class TraderApp:
         rv_str = "-"
         basket_str = "-"
         try:
-            strategy_status = self.strategy.status()
             rv_val = strategy_status.get("entry_realized_vol_current")
             basket_val = strategy_status.get("basket_pnl_pct")
             if isinstance(rv_val, (int, float)):

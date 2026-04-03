@@ -982,6 +982,9 @@ if page == "📊 总览":
     open_trades = storage.get_open_trades()
     _overview_spot_cache: dict[str, float] = {}
 
+    if not open_trades and exchange_positions:
+        st.warning("本地数据库当前持仓为空，但交易所存在实时持仓。当前以交易所持仓为准；本地账本与交易所已不一致。")
+
     if open_trades:
         # Group by trade_group
         groups: dict[str, list[dict]] = {}
@@ -2845,6 +2848,9 @@ elif page == "🖥 引擎状态":
         st.metric("API 环境", env)
 
     strategy_status = es.get("strategy_status") or {}
+    if strategy_status.get("position_source") == "exchange":
+        _symbols = strategy_status.get("exchange_position_symbols") or []
+        st.caption(f"当前持仓组数按交易所实时持仓兜底显示；本地数据库为空，交易所合约: {', '.join(_symbols) if _symbols else '-'}")
     if getattr(cfg.strategy, "mode", "") == "weekend_vol":
         col9, col10, col11, col12 = st.columns(4)
         with col9:
