@@ -66,7 +66,7 @@ from trader.config import load_config, TraderConfig
 from trader.storage import Storage
 from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.binance_client import BinanceOptionsClient
-from trader.position_manager import PositionManager
+from trader.position_manager import PositionManager, IronCondorPosition, CondorLeg
 from trader.limit_chaser import ChaserConfig as DashboardChaserConfig
 
 # ---------------------------------------------------------------------------
@@ -391,7 +391,7 @@ def _start_test_order_task(
                     return _symbol.split("-", 1)[0]
             return ""
 
-        def _capture_exchange_positions_on_failure() -> dict[str, object]:
+        def _capture_exchange_positions_snapshot() -> dict[str, object]:
             _underlying = _infer_underlying_from_order()
             if not _underlying:
                 return {
@@ -412,6 +412,60 @@ def _start_test_order_task(
                     "exchange_positions_underlying": _underlying,
                     "exchange_positions_error": str(_snapshot_exc),
                 }
+
+        def _recover_test_position_from_snapshot(snapshot: dict[str, object]) -> IronCondorPosition | None:
+            _positions = snapshot.get("exchange_positions") or []
+            if not isinstance(_positions, list) or not _positions:
+                return None
+
+            _expected_roles = [
+                ("sell_put", order_params.get("sell_put_symbol"), order_params.get("sell_put_strike"), "put", "SELL"),
+                ("sell_call", order_params.get("sell_call_symbol"), order_params.get("sell_call_strike"), "call", "SELL"),
+            ]
+            if order_params.get("buy_put_symbol"):
+                _expected_roles.append(("buy_put", order_params.get("buy_put_symbol"), order_params.get("buy_put_strike"), "put", "BUY"))
+            if order_params.get("buy_call_symbol"):
+                _expected_roles.append(("buy_call", order_params.get("buy_call_symbol"), order_params.get("buy_call_strike"), "call", "BUY"))
+
+            _positions_by_symbol = {
+                str(p.get("symbol") or "").upper(): p
+                for p in _positions
+                if abs(float(p.get("quantity") or 0.0)) > 0
+            }
+
+            _matched: list[tuple[str, str, float | None, str, str, dict]] = []
+            for _role, _symbol, _strike, _option_type, _side in _expected_roles:
+                _sym = str(_symbol or "").upper()
+                _pos = _positions_by_symbol.get(_sym)
+                if _pos is None:
+                    return None
+                _matched.append((_role, _sym, _strike, _option_type, _side, _pos))
+
+            _group_id = str(last_progress.get("group_id") or f"REC_{task_id[:8]}")
+            _condor = IronCondorPosition(
+                group_id=_group_id,
+                entry_time=datetime.now(timezone.utc),
+                underlying_price=float(order_params.get("underlying_price") or 0.0),
+                is_open=True,
+            )
+            _total_premium = 0.0
+            for _role, _sym, _strike, _option_type, _side, _pos in _matched:
+                _entry_price = float(_pos.get("entryPrice") or 0.0)
+                _qty = abs(float(_pos.get("quantity") or order_params.get("quantity") or 0.0))
+                _leg = CondorLeg(
+                    symbol=_sym,
+                    side=_side,
+                    option_type=_option_type,
+                    strike=float(_strike or 0.0),
+                    quantity=_qty,
+                    entry_price=_entry_price,
+                    trade_id=0,
+                    order_id="",
+                )
+                setattr(_condor, _role, _leg)
+                _total_premium += _entry_price * _qty if _side == "SELL" else -_entry_price * _qty
+            _condor.total_premium = _total_premium
+            return _condor
 
         def _on_progress(progress: dict) -> None:
             last_progress.clear()
@@ -472,6 +526,7 @@ def _start_test_order_task(
                 _group_id = str(getattr(condor, "group_id", ""))
                 if attach_to_engine_for_stop_loss and engine_ref.pos_mgr is not None:
                     engine_ref.pos_mgr.open_condors[_group_id] = condor
+                _snapshot = _capture_exchange_positions_snapshot()
                 _update_test_order_task(
                     task_id,
                     state="success",
@@ -484,27 +539,75 @@ def _start_test_order_task(
                     percent=100,
                     result_group_id=_group_id,
                     attached_to_engine_for_stop_loss=attach_to_engine_for_stop_loss,
-                )
-            else:
-                _snapshot = _capture_exchange_positions_on_failure()
-                _update_test_order_task(
-                    task_id,
-                    state="failed",
-                    status="failed",
-                    message=str(last_progress.get("message") or "测试下单失败：至少有一条腿未成交或被回滚"),
+                    recovered_via_exchange_snapshot=False,
                     **_snapshot,
                 )
+            else:
+                _snapshot = _capture_exchange_positions_snapshot()
+                _recovered_condor = _recover_test_position_from_snapshot(_snapshot)
+                if _recovered_condor is not None:
+                    _group_id = str(_recovered_condor.group_id)
+                    if attach_to_engine_for_stop_loss and engine_ref.pos_mgr is not None:
+                        engine_ref.pos_mgr.open_condors[_group_id] = _recovered_condor
+                    _update_test_order_task(
+                        task_id,
+                        state="success",
+                        status="success",
+                        message=(
+                            f"测试下单已通过交易所持仓复核确认为成功：{_group_id}；已接入策略止损管理"
+                            if attach_to_engine_for_stop_loss
+                            else f"测试下单已通过交易所持仓复核确认为成功：{_group_id}；未接入自动止损"
+                        ),
+                        percent=100,
+                        result_group_id=_group_id,
+                        attached_to_engine_for_stop_loss=attach_to_engine_for_stop_loss,
+                        recovered_via_exchange_snapshot=True,
+                        **_snapshot,
+                    )
+                else:
+                    _update_test_order_task(
+                        task_id,
+                        state="failed",
+                        status="failed",
+                        message=str(last_progress.get("message") or "测试下单失败：至少有一条腿未成交或被回滚"),
+                        recovered_via_exchange_snapshot=False,
+                        **_snapshot,
+                    )
         except Exception as exc:
-            _snapshot = _capture_exchange_positions_on_failure()
-            _update_test_order_task(
-                task_id,
-                state="error",
-                status="error",
-                message=f"测试下单异常: {exc}",
-                error=str(exc),
-                traceback=traceback.format_exc(),
-                **_snapshot,
-            )
+            _snapshot = _capture_exchange_positions_snapshot()
+            _recovered_condor = _recover_test_position_from_snapshot(_snapshot)
+            if _recovered_condor is not None:
+                _group_id = str(_recovered_condor.group_id)
+                if attach_to_engine_for_stop_loss and engine_ref.pos_mgr is not None:
+                    engine_ref.pos_mgr.open_condors[_group_id] = _recovered_condor
+                _update_test_order_task(
+                    task_id,
+                    state="success",
+                    status="success",
+                    message=(
+                        f"测试下单虽有异常，但交易所持仓复核确认已成功：{_group_id}；已接入策略止损管理"
+                        if attach_to_engine_for_stop_loss
+                        else f"测试下单虽有异常，但交易所持仓复核确认已成功：{_group_id}；未接入自动止损"
+                    ),
+                    percent=100,
+                    result_group_id=_group_id,
+                    attached_to_engine_for_stop_loss=attach_to_engine_for_stop_loss,
+                    recovered_via_exchange_snapshot=True,
+                    error=str(exc),
+                    traceback=traceback.format_exc(),
+                    **_snapshot,
+                )
+            else:
+                _update_test_order_task(
+                    task_id,
+                    state="error",
+                    status="error",
+                    message=f"测试下单异常: {exc}",
+                    error=str(exc),
+                    traceback=traceback.format_exc(),
+                    recovered_via_exchange_snapshot=False,
+                    **_snapshot,
+                )
 
     thread = threading.Thread(target=_runner, name=f"test-order-{task_id[:8]}", daemon=True)
     _update_test_order_task(task_id, thread_name=thread.name)
@@ -2261,6 +2364,8 @@ elif page == "🔧 策略配置":
                             st.success(_message)
                         elif _state in {"failed", "error"}:
                             st.error(_message)
+                        if _task.get("recovered_via_exchange_snapshot"):
+                            st.warning("本次测试单是通过交易所持仓复核确认为成功的；前序下单返回或本地记账曾出现异常。")
 
                         _elapsed = _progress.get("elapsed_sec")
                         _remaining = _progress.get("remaining_sec")
@@ -2355,16 +2460,32 @@ elif page == "🔧 策略配置":
                             ])
                             st.dataframe(_legs_df, width="stretch", hide_index=True)
 
+                        _snapshot_checked = bool(_task.get("exchange_positions_checked"))
+                        _snapshot_underlying = str(_task.get("exchange_positions_underlying") or "")
+                        _snapshot_error = _task.get("exchange_positions_error")
+                        _snapshot_positions = _task.get("exchange_positions") or []
+                        if _snapshot_checked and (_snapshot_error or _snapshot_positions):
+                            st.markdown("##### 📦 当前测试持仓复核")
+                            if _snapshot_error:
+                                st.warning(f"持仓复核失败（{_snapshot_underlying or '-'}）：{_snapshot_error}")
+                            elif _snapshot_positions:
+                                _snapshot_rows = [
+                                    {
+                                        "合约": p.get("symbol", ""),
+                                        "方向": p.get("side", ""),
+                                        "数量": float(p.get("quantity") or 0.0),
+                                        "开仓价": f"${float(p.get('entryPrice') or 0.0):.4f}",
+                                        "未实现PnL": f"${float(p.get('unrealizedPnl') or 0.0):.4f}",
+                                    }
+                                    for p in _snapshot_positions
+                                ]
+                                st.dataframe(pd.DataFrame(_snapshot_rows), width="stretch", hide_index=True)
+
                         if _task.get("traceback"):
                             with st.expander("查看异常堆栈"):
                                 st.code(_task["traceback"])
 
                         if _state in {"failed", "error"}:
-                            _snapshot_checked = bool(_task.get("exchange_positions_checked"))
-                            _snapshot_underlying = str(_task.get("exchange_positions_underlying") or "")
-                            _snapshot_error = _task.get("exchange_positions_error")
-                            _snapshot_positions = _task.get("exchange_positions") or []
-
                             st.markdown("##### 🔎 失败后交易所持仓复核")
                             if _snapshot_checked:
                                 if _snapshot_error:

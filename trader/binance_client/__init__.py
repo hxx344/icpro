@@ -632,16 +632,22 @@ class BinanceOptionsClient:
                         f"{self._format_http_error(e)}; retrying with clientOrderId"
                     )
                     try:
-                        result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+                        result = _query({"symbol": symbol, "clientOrderId": client_order_id})
                     except Exception as fallback_exc:
-                        _raise_not_found(fallback_exc)
+                        try:
+                            result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+                        except Exception:
+                            _raise_not_found(fallback_exc)
                 else:
                     _raise_not_found(e)
         elif client_order_id:
             try:
-                result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+                result = _query({"symbol": symbol, "clientOrderId": client_order_id})
             except Exception as e:
-                _raise_not_found(e)
+                try:
+                    result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
+                except Exception:
+                    _raise_not_found(e)
         else:
             raise ValueError("Either order_id or client_order_id is required")
 
@@ -672,13 +678,19 @@ class BinanceOptionsClient:
         if order_id:
             params["orderId"] = order_id
         elif client_order_id:
-            params["origClientOrderId"] = client_order_id
+            params["clientOrderId"] = client_order_id
         else:
             raise ValueError("Either order_id or client_order_id is required")
         try:
             self._private_delete("/eapi/v1/order", params)
             return True
         except Exception as e:
+            if client_order_id:
+                try:
+                    self._private_delete("/eapi/v1/order", {"symbol": symbol, "origClientOrderId": client_order_id})
+                    return True
+                except Exception:
+                    pass
             code, msg = self._extract_api_error(e)
             if code == -2013:
                 logger.debug(
