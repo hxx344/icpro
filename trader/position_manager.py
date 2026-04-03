@@ -111,6 +111,7 @@ class PositionManager:
 
     MARKET_BATCH_MAX_QTY = 1.0
     MARKET_BATCH_MAX_SPREAD_USD = 5.0
+    MARKET_BATCH_RELAXED_MAX_SPREAD_USD = 15.0
     MARKET_BATCH_DEPTH_BUFFER_MULT = 1.5
     MARKET_BATCH_WAIT_SEC = 30.0
     MARKET_BATCH_POLL_SEC = 0.5
@@ -300,33 +301,69 @@ class PositionManager:
         batch_qty: float,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, dict[str, float | bool | str]] | None:
+        def _collect_blockers(
+            max_spread_usd: float,
+        ) -> tuple[list[dict[str, Any]], dict[str, dict[str, float | bool | str]]]:
+            _blockers: list[dict[str, Any]] = []
+            _snapshots: dict[str, dict[str, float | bool | str]] = {}
+            for leg in legs:
+                snap = self._get_market_book_snapshot(leg)
+                _snapshots[leg.symbol] = snap
+                spread = float(snap.get("spread") or float("inf"))
+                available_qty = float(snap.get("available_qty") or 0.0)
+                valid = bool(snap.get("valid"))
+                if (not valid) or spread > max_spread_usd or available_qty + 1e-9 < required_depth:
+                    _blockers.append({
+                        "symbol": leg.symbol,
+                        "leg_role": leg.leg_role,
+                        "spread": spread,
+                        "available_qty": available_qty,
+                    })
+            return _blockers, _snapshots
+
         required_depth = batch_qty * self.MARKET_BATCH_DEPTH_BUFFER_MULT
         deadline = _time.monotonic() + self.MARKET_BATCH_WAIT_SEC
         poll_idx = 0
 
         while True:
             poll_idx += 1
-            blockers: list[dict[str, Any]] = []
-            snapshots: dict[str, dict[str, float | bool | str]] = {}
-            for leg in legs:
-                snap = self._get_market_book_snapshot(leg)
-                snapshots[leg.symbol] = snap
-                spread = float(snap.get("spread") or float("inf"))
-                available_qty = float(snap.get("available_qty") or 0.0)
-                valid = bool(snap.get("valid"))
-                if (not valid) or spread > self.MARKET_BATCH_MAX_SPREAD_USD or available_qty + 1e-9 < required_depth:
-                    blockers.append({
-                        "symbol": leg.symbol,
-                        "leg_role": leg.leg_role,
-                        "spread": spread,
-                        "available_qty": available_qty,
-                    })
+            blockers, snapshots = _collect_blockers(self.MARKET_BATCH_MAX_SPREAD_USD)
 
             if not blockers:
                 return snapshots
 
             now = _time.monotonic()
             if now >= deadline:
+                relaxed_blockers, relaxed_snapshots = _collect_blockers(self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD)
+                if not relaxed_blockers:
+                    logger.warning(
+                        f"Market batch {group_id} timed out at spread<={self.MARKET_BATCH_MAX_SPREAD_USD:.2f}; "
+                        f"relaxing to spread<={self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD:.2f} for batch_qty={batch_qty:.4f}"
+                    )
+                    if status_callback is not None:
+                        status_callback({
+                            "event": "market_batch_spread_relaxed",
+                            "message": f"等待超时，放宽最大价差到 {self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD:.0f} USD：批次={batch_qty:.4f}",
+                            "group_id": group_id,
+                            "execution_mode": "market",
+                            "batch_qty": batch_qty,
+                            "required_depth": required_depth,
+                            "max_spread_usd": self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
+                            "legs": [
+                                {
+                                    "leg_role": leg.leg_role,
+                                    "symbol": leg.symbol,
+                                    "side": leg.side,
+                                    "quantity": leg.quantity,
+                                    "filled_qty": leg.filled_qty,
+                                    "status": leg.status,
+                                    "avg_price": leg.avg_price,
+                                    "attempts": leg.attempts,
+                                }
+                                for leg in legs
+                            ],
+                        })
+                    return relaxed_snapshots
                 if status_callback is not None:
                     status_callback({
                         "event": "market_batch_timeout",

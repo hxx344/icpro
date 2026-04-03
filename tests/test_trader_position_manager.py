@@ -266,6 +266,30 @@ class TestOpenIronCondor:
         quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
         assert quantities == [0.4, 0.4]
 
+    def test_market_batch_relaxes_spread_to_15_after_timeout(self, pos_mgr, mock_client):
+        leg = LegOrder(
+            leg_role="sell_call",
+            symbol="BTC-260321-100000-C",
+            side="SELL",
+            quantity=0.6,
+            strike=100000.0,
+            option_type="call",
+        )
+        mock_client.get_order_book.return_value = {
+            "bids": [(100.0, 1.0)],
+            "asks": [(110.0, 1.0)],
+        }
+
+        with patch("trader.position_manager._time.monotonic", side_effect=[0.0, 31.0]):
+            snapshots = pos_mgr._wait_until_market_batch_ready(
+                group_id="TEST_RELAX",
+                legs=[leg],
+                batch_qty=0.6,
+            )
+
+        assert snapshots is not None
+        assert float(snapshots[leg.symbol]["spread"]) == pytest.approx(10.0)
+
     def test_market_open_cancels_unresolved_order_and_supplements_gap(self, pos_mgr, mock_client):
         submit_results = [
             _make_order_result(side="SELL", quantity=1.0, symbol="BTC-260321-100000-C"),
