@@ -741,7 +741,8 @@ class TestOrderLookup:
         with patch.object(client.session, "get", return_value=mock_resp) as m:
             client.query_order("ETH-260321-2000-C", client_order_id="CID-XYZ")
             params = m.call_args.kwargs.get("params") or m.call_args[1].get("params", {})
-            assert params.get("origClientOrderId") == "CID-XYZ"
+            assert params.get("clientOrderId") == "CID-XYZ"
+            assert "origClientOrderId" not in params
             assert "orderId" not in params
 
     def test_cancel_order_by_client_order_id(self, client):

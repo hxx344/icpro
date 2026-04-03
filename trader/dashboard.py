@@ -803,7 +803,7 @@ st.sidebar.divider()
 auto_refresh = st.sidebar.checkbox("⏱ 自动刷新", value=True)
 refresh_sec = st.sidebar.selectbox("刷新间隔", [10, 30, 60, 120], index=0)
 _current_nav_page = st.session_state.get("nav_page", "📊 总览")
-_pause_auto_refresh = _current_nav_page == "🔧 策略配置"
+_pause_auto_refresh = _current_nav_page in {"🔧 策略配置", "📋 成交历史"}
 
 if auto_refresh and not _pause_auto_refresh:
     # Fragment-based auto-refresh: triggers full app rerun without hard browser reload,
@@ -819,7 +819,11 @@ if auto_refresh and not _pause_auto_refresh:
     _auto_refresh()
     st.sidebar.caption(f"每 {refresh_sec} 秒自动刷新")
 elif auto_refresh and _pause_auto_refresh:
-    st.sidebar.caption("策略配置页已暂停整页自动刷新，避免表单/下单预览卡顿")
+    _pause_reason = {
+        "🔧 策略配置": "策略配置页已暂停整页自动刷新，避免表单/下单预览卡顿",
+        "📋 成交历史": "成交历史页已暂停整页自动刷新，避免导出 CSV 时媒体文件失效",
+    }
+    st.sidebar.caption(_pause_reason.get(_current_nav_page, "当前页面已暂停整页自动刷新"))
 
 # Manual refresh
 if st.sidebar.button("🔄 立即刷新", use_container_width=True):
@@ -1562,6 +1566,8 @@ elif page == "📋 成交历史":
             data=csv,
             file_name=f"trades_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv",
+            on_click="ignore",
+            key="trade_history_export_csv",
         )
 
 

@@ -246,7 +246,13 @@ class BinanceOptionsClient:
         try:
             return self._request_json("GET", path, params=self._sign(dict(params or {})), retry_get=True)
         except Exception as e:
-            logger.error(f"Binance private GET {path} failed: {self._format_http_error(e)}")
+            code, msg = self._extract_api_error(e)
+            if path == "/eapi/v1/order" and code == -2013:
+                logger.debug(
+                    f"Binance private GET {path} returned order-not-found during lookup: {msg or self._format_http_error(e)}"
+                )
+            else:
+                logger.error(f"Binance private GET {path} failed: {self._format_http_error(e)}")
             raise
 
     def _private_post(self, path: str, params=None):
@@ -717,20 +723,14 @@ class BinanceOptionsClient:
                     try:
                         result = _query({"symbol": symbol, "clientOrderId": client_order_id})
                     except Exception as fallback_exc:
-                        try:
-                            result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
-                        except Exception:
-                            _raise_not_found(fallback_exc)
+                        _raise_not_found(fallback_exc)
                 else:
                     _raise_not_found(e)
         elif client_order_id:
             try:
                 result = _query({"symbol": symbol, "clientOrderId": client_order_id})
             except Exception as e:
-                try:
-                    result = _query({"symbol": symbol, "origClientOrderId": client_order_id})
-                except Exception:
-                    _raise_not_found(e)
+                _raise_not_found(e)
         else:
             raise ValueError("Either order_id or client_order_id is required")
 
