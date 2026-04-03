@@ -1110,6 +1110,23 @@ elif page == "📈 资产曲线":
 
     _EQ_PLOT_MAX_POINTS = 1500
 
+    @st.cache_data(ttl=10, show_spinner=False)
+    def _load_equity_curve_view(
+        db_path: str,
+        db_mtime: float,
+        start_date_value: str | None,
+        end_date_value: str | None,
+        max_points: int,
+    ) -> tuple[dict, list[dict]]:
+        _ = db_mtime
+        cached_storage = Storage(db_path)
+        try:
+            stats = cached_storage.get_equity_curve_stats(start_date_value, end_date_value)
+            rows = cached_storage.get_equity_curve_sampled(start_date_value, end_date_value, max_points=max_points)
+            return stats, rows
+        finally:
+            cached_storage.close()
+
     # 手动刷新实时权益快照；避免每次切页都同步请求交易所导致页面卡顿
     @st.cache_resource
     def _get_client_eq(_exchange_cfg) -> BinanceOptionsClient:
@@ -1158,9 +1175,17 @@ elif page == "📈 资产曲线":
         except Exception as e:
             st.warning(f"刷新实时权益快照失败：{e}")
 
-    equity_curve = storage.get_equity_curve(start_date, end_date)
+    _eq_db_path = str(Path(cfg.storage.db_path).resolve())
+    _eq_db_mtime = Path(_eq_db_path).stat().st_mtime if Path(_eq_db_path).exists() else 0.0
+    equity_stats, equity_curve = _load_equity_curve_view(
+        _eq_db_path,
+        _eq_db_mtime,
+        start_date,
+        end_date,
+        _EQ_PLOT_MAX_POINTS,
+    )
 
-    if not equity_curve:
+    if not equity_curve or int(equity_stats.get("point_count") or 0) <= 0:
         st.info("暂无资产数据。交易程序运行后将自动记录。")
     else:
         df = pd.DataFrame(equity_curve)
@@ -1191,27 +1216,17 @@ elif page == "📈 资产曲线":
 
         # --- Drawdown series (precompute) ---
         peak_series = df["total_equity"].cummax()
-        dd_series = (peak_series - df["total_equity"]) / peak_series * 100
-        dd_series = dd_series.fillna(0)
-
-        plot_df = df
-        plot_dd_series = dd_series
-        if len(df) > _EQ_PLOT_MAX_POINTS:
-            _plot_step = max(1, (len(df) + _EQ_PLOT_MAX_POINTS - 1) // _EQ_PLOT_MAX_POINTS)
-            plot_df = df.iloc[::_plot_step].copy()
-            plot_dd_series = dd_series.iloc[::_plot_step].copy()
-            if plot_df.index[-1] != df.index[-1]:
-                plot_df = pd.concat([plot_df, df.iloc[[-1]].copy()])
-                plot_dd_series = pd.concat([plot_dd_series, dd_series.iloc[[-1]].copy()])
-            plot_df = plot_df.reset_index(drop=True)
-            plot_dd_series = plot_dd_series.reset_index(drop=True)
+        plot_dd_series = ((peak_series - df["total_equity"]) / peak_series * 100).fillna(0)
+        plot_df = df.reset_index(drop=True)
+        plot_dd_series = plot_dd_series.reset_index(drop=True)
 
         # --- KPI summary row ---
-        if len(df) > 1:
-            first_eq = df["total_equity"].iloc[0]
-            last_eq = df["total_equity"].iloc[-1]
+        total_points = int(equity_stats.get("point_count") or len(df))
+        if total_points > 1:
+            first_eq = float(equity_stats.get("first_equity") or 0.0)
+            last_eq = float(equity_stats.get("last_equity") or 0.0)
             total_ret = (last_eq - first_eq) / first_eq * 100 if first_eq > 0 else 0
-            max_dd_val = dd_series.max()
+            max_dd_val = float(equity_stats.get("max_drawdown_pct") or 0.0)
         else:
             first_eq = last_eq = total_ret = max_dd_val = 0
 
@@ -1223,10 +1238,10 @@ elif page == "📈 资产曲线":
         with k3:
             st.metric("最大回撤", f"{max_dd_val:.2f}%")
         with k4:
-            st.metric("数据点数", f"{len(df):,}")
+            st.metric("数据点数", f"{total_points:,}")
 
-        if len(plot_df) < len(df):
-            st.caption(f"为提升加载速度，图表已从 {len(df):,} 个数据点抽样显示为 {len(plot_df):,} 个点。")
+        if len(plot_df) < total_points:
+            st.caption(f"为提升加载速度，图表已从 {total_points:,} 个数据点抽样显示为 {len(plot_df):,} 个点。")
 
         st.divider()
 
@@ -1240,7 +1255,7 @@ elif page == "📈 资产曲线":
 
         # -- Row 1: Equity area + available balance --
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=plot_df["timestamp"], y=plot_df["total_equity"],
                 name="权益",
                 line=dict(color=_EQUITY_COLOR, width=2),
@@ -1251,7 +1266,7 @@ elif page == "📈 资产曲线":
             row=1, col=1,
         )
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=plot_df["timestamp"], y=plot_df["available_balance"],
                 name="可用余额",
                 line=dict(color=_BALANCE_COLOR, width=1.2, dash="dot"),
@@ -1276,7 +1291,7 @@ elif page == "📈 资产曲线":
 
         # -- Row 3: Drawdown area (inverted) --
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=plot_df["timestamp"], y=plot_dd_series,
                 name="回撤 %",
                 line=dict(color=_DD_COLOR, width=1.2),
@@ -1312,14 +1327,21 @@ elif page == "📈 资产曲线":
         st.plotly_chart(fig, width='stretch')
 
         # ======== Position count + underlying overlay ========
+        show_extra_charts = st.toggle(
+            "显示附加图表（标的价格 / 持仓数）",
+            value=False,
+            key="equity_show_extra_charts",
+            help="默认关闭以加快加载速度，需要时再展开。",
+        )
+
         has_ul = "underlying_price" in plot_df.columns and plot_df["underlying_price"].sum() > 0
-        if has_ul:
+        if show_extra_charts and has_ul:
             fig2 = make_subplots(
                 rows=1, cols=1,
                 specs=[[{"secondary_y": True}]],
             )
             fig2.add_trace(
-                go.Scatter(
+                go.Scattergl(
                     x=plot_df["timestamp"], y=plot_df["underlying_price"],
                     name="标的价格 (USD)",
                     line=dict(color="#00b4d8", width=1.5),
@@ -1328,7 +1350,7 @@ elif page == "📈 资产曲线":
                 secondary_y=False,
             )
             fig2.add_trace(
-                go.Scatter(
+                go.Scattergl(
                     x=plot_df["timestamp"], y=plot_df["position_count"],
                     name="持仓数", mode="lines+markers",
                     line=dict(color=_POS_COLOR, width=1.5),
@@ -1350,10 +1372,10 @@ elif page == "📈 资产曲线":
             fig2.update_yaxes(title_text="标的价格 (USD)", secondary_y=False, **_dark_axis)
             fig2.update_yaxes(title_text="持仓数", secondary_y=True, **_dark_axis)
             st.plotly_chart(fig2, width='stretch')
-        else:
+        elif show_extra_charts:
             # Position count only
             fig_pos = go.Figure()
-            fig_pos.add_trace(go.Scatter(
+            fig_pos.add_trace(go.Scattergl(
                 x=plot_df["timestamp"], y=plot_df["position_count"],
                 name="持仓数", mode="lines+markers",
                 line=dict(color=_POS_COLOR, width=2),

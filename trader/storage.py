@@ -330,6 +330,132 @@ class Storage:
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
+    def get_equity_curve_stats(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict[str, float | int]:
+        """Get aggregated equity curve stats without loading all rows into Python."""
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        if start_date:
+            conditions.append("timestamp >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("timestamp <= ?")
+            params.append(end_date)
+
+        where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            WITH filtered AS (
+                SELECT timestamp, total_equity
+                FROM equity_snapshots
+                {where_clause}
+            ),
+            numbered AS (
+                SELECT
+                    timestamp,
+                    total_equity,
+                    ROW_NUMBER() OVER (ORDER BY timestamp ASC) AS rn,
+                    COUNT(*) OVER () AS cnt,
+                    MAX(total_equity) OVER (
+                        ORDER BY timestamp ASC
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS running_peak
+                FROM filtered
+            )
+            SELECT
+                COALESCE(MAX(cnt), 0) AS point_count,
+                COALESCE(MAX(CASE WHEN rn = 1 THEN total_equity END), 0) AS first_equity,
+                COALESCE(MAX(CASE WHEN rn = cnt THEN total_equity END), 0) AS last_equity,
+                COALESCE(
+                    MAX(
+                        CASE
+                            WHEN running_peak > 0 THEN (running_peak - total_equity) * 100.0 / running_peak
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS max_drawdown_pct
+            FROM numbered
+        """
+
+        conn = self._get_conn()
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return {
+                "point_count": 0,
+                "first_equity": 0.0,
+                "last_equity": 0.0,
+                "max_drawdown_pct": 0.0,
+            }
+        return {
+            "point_count": int(row["point_count"] or 0),
+            "first_equity": float(row["first_equity"] or 0.0),
+            "last_equity": float(row["last_equity"] or 0.0),
+            "max_drawdown_pct": float(row["max_drawdown_pct"] or 0.0),
+        }
+
+    def get_equity_curve_sampled(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        max_points: int = 1500,
+    ) -> list[dict]:
+        """Get sampled equity curve rows for fast chart rendering."""
+        stats = self.get_equity_curve_stats(start_date, end_date)
+        point_count = int(stats.get("point_count") or 0)
+        if point_count <= 0:
+            return []
+
+        max_points = max(int(max_points or 0), 1)
+        if point_count <= max_points:
+            return self.get_equity_curve(start_date, end_date)
+
+        step = max(1, (point_count + max_points - 1) // max_points)
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        if start_date:
+            conditions.append("timestamp >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("timestamp <= ?")
+            params.append(end_date)
+
+        where_clause = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+        query = f"""
+            WITH filtered AS (
+                SELECT
+                    id,
+                    timestamp,
+                    total_equity,
+                    available_balance,
+                    unrealized_pnl,
+                    position_count,
+                    underlying_price,
+                    meta
+                FROM equity_snapshots
+                {where_clause}
+            ),
+            numbered AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (ORDER BY timestamp ASC) AS rn,
+                    COUNT(*) OVER () AS cnt
+                FROM filtered
+            )
+            SELECT *
+            FROM numbered
+            WHERE rn = 1 OR rn = cnt OR ((rn - 1) % ?) = 0
+            ORDER BY timestamp ASC
+        """
+
+        conn = self._get_conn()
+        rows = conn.execute(query, [*params, step]).fetchall()
+        return [dict(r) for r in rows]
+
     # ------------------------------------------------------------------
     # Daily PnL
     # ------------------------------------------------------------------
