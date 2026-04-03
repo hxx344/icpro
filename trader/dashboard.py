@@ -1262,10 +1262,10 @@ elif page == "📈 资产曲线":
         )
 
         # -- Row 2: Unrealized PnL bars --
-    upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in plot_df["unrealized_pnl"]]
+        upnl_colors = [_UP_COLOR if v >= 0 else _DN_COLOR for v in plot_df["unrealized_pnl"]]
         fig.add_trace(
             go.Bar(
-        x=plot_df["timestamp"], y=plot_df["unrealized_pnl"],
+                x=plot_df["timestamp"], y=plot_df["unrealized_pnl"],
                 name="未实现 PnL",
                 marker_color=upnl_colors,
                 marker_line_width=0,
