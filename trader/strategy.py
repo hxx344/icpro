@@ -62,6 +62,14 @@ class OptionSellingStrategy:
         self._day_start_equity: float = self.storage.load_state(
             "day_start_equity", 0.0
         )
+        recovery = self.pos_mgr.sync_exchange_positions_to_local(self.cfg.underlying, replace_on_conflict=True)
+        if recovery.get("restored"):
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            self._last_trade_date = today
+            self.storage.save_state("last_trade_date", today)
+            logger.warning(
+                f"[Strategy] Recovered exchange positions into local storage on startup: {recovery.get('symbols') or []}"
+            )
 
     # ------------------------------------------------------------------
     # Main entry: called periodically by the scheduler
@@ -524,6 +532,16 @@ class WeekendVolStrategy:
         self._last_order_exchange_positions_error: str = ""
         self._last_guard_exchange_positions: list[dict[str, Any]] = []
         self._last_guard_exchange_positions_error: str = ""
+        recovery = self.pos_mgr.sync_exchange_positions_to_local(self.cfg.underlying, replace_on_conflict=True)
+        if recovery.get("restored"):
+            week_id = datetime.now(timezone.utc).strftime("%G-W%V")
+            self._last_trade_week = week_id
+            self.storage.save_state("wv_last_trade_week", week_id)
+            self._last_order_status = "recovered"
+            self._last_order_message = f"启动时已从交易所恢复持仓: {', '.join(recovery.get('symbols') or [])}"
+            logger.warning(
+                f"[WeekendVol] Recovered exchange positions into local storage on startup: {recovery.get('symbols') or []}"
+            )
 
     def _get_exchange_position_guard_snapshot(self) -> tuple[list[dict[str, Any]], str]:
         try:

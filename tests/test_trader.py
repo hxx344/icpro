@@ -888,6 +888,58 @@ class TestWeekendVolStrategy:
         assert strategy.cfg.target_delta == 0.40
         assert strategy.cfg.leverage == 3.0
 
+    def test_init_recovers_exchange_positions_into_local_groups(self, storage):
+        client = MockClient()
+        client._positions = [
+            {"symbol": "BTC-260405-67000-C", "side": "SHORT", "quantity": -0.4, "entryPrice": 285.0, "unrealizedPnl": -5.0},
+            {"symbol": "BTC-260405-66500-P", "side": "SHORT", "quantity": -0.4, "entryPrice": 215.0, "unrealizedPnl": 8.0},
+        ]
+        pm = PositionManager(client, storage)
+        cfg = StrategyConfig(
+            mode="weekend_vol",
+            underlying="BTC",
+            entry_day="friday",
+            entry_time_utc="16:00",
+        )
+
+        strategy = WeekendVolStrategy(client, pm, storage, cfg)
+
+        assert strategy._last_trade_week
+        assert pm.open_position_count == 1
+        open_trades = storage.get_open_trades()
+        assert len(open_trades) == 2
+        assert {t["symbol"] for t in open_trades} == {"BTC-260405-67000-C", "BTC-260405-66500-P"}
+        assert all(json.loads(t["meta"]).get("recovered_from_exchange") is True for t in open_trades)
+
+    def test_init_replaces_conflicting_local_open_trades_with_exchange_positions(self, storage):
+        storage.record_trade(
+            trade_group="STALE_GROUP",
+            symbol="BTC-260405-70000-C",
+            side="SELL",
+            quantity=0.2,
+            price=100.0,
+            meta={
+                "leg_role": "sell_call",
+                "option_type": "call",
+                "strike": 70000.0,
+                "underlying_price": 87000.0,
+            },
+        )
+        client = MockClient()
+        client._positions = [
+            {"symbol": "BTC-260405-67000-C", "side": "SHORT", "quantity": -0.4, "entryPrice": 285.0, "unrealizedPnl": -5.0},
+            {"symbol": "BTC-260405-66500-P", "side": "SHORT", "quantity": -0.4, "entryPrice": 215.0, "unrealizedPnl": 8.0},
+        ]
+        pm = PositionManager(client, storage)
+        cfg = StrategyConfig(mode="weekend_vol", underlying="BTC")
+
+        WeekendVolStrategy(client, pm, storage, cfg)
+
+        open_trades = storage.get_open_trades()
+        assert len(open_trades) == 2
+        assert {t["symbol"] for t in open_trades} == {"BTC-260405-67000-C", "BTC-260405-66500-P"}
+        assert all(t["trade_group"].startswith("RECOVERED_BTC_") for t in open_trades)
+
     def test_should_enter_correct_day_and_time(self, storage):
         client = MockClient()
         pm = PositionManager(client, storage)

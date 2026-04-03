@@ -18,6 +18,7 @@ from loguru import logger
 from trader.binance_client import (
     OrderResult,
     OptionTicker,
+    _parse_symbol,
 )
 from trader.limit_chaser import ChaserConfig, LegOrder, LimitChaser
 from trader.storage import Storage
@@ -181,6 +182,7 @@ class PositionManager:
 
     def _load_open_positions(self) -> None:
         """Recover open positions from storage on restart."""
+        self.open_condors = {}
         open_groups = self.storage.get_open_trade_groups()
         for group_id in open_groups:
             trades = self.storage.get_open_trades(group_id)
@@ -201,6 +203,135 @@ class PositionManager:
         self.open_condors[group_id] = condor
         logger.info(f"Recovered open position from storage for manual action: {group_id}")
         return True
+
+    @staticmethod
+    def _leg_role_from_exchange_position(symbol: str, exchange_side: str) -> str:
+        parsed = _parse_symbol(symbol) or {}
+        option_type = str(parsed.get("option_type") or "").lower()
+        exchange_side_norm = str(exchange_side or "").upper()
+        if option_type == "call":
+            return "sell_call" if exchange_side_norm == "SHORT" else "buy_call"
+        return "sell_put" if exchange_side_norm == "SHORT" else "buy_put"
+
+    def sync_exchange_positions_to_local(
+        self,
+        underlying: str,
+        replace_on_conflict: bool = True,
+    ) -> dict[str, Any]:
+        """Restore live exchange positions into local open trade groups.
+
+        When local open trades conflict with exchange positions, exchange state wins.
+        """
+        get_positions = getattr(self.client, "get_positions", None)
+        if not callable(get_positions):
+            return {"restored": False, "reason": "client_has_no_get_positions"}
+
+        underlying_norm = str(underlying or "").upper()
+        positions = list(get_positions(underlying_norm) or [])
+        exchange_symbols = {
+            str(pos.get("symbol") or "").upper()
+            for pos in positions
+            if str(pos.get("symbol") or "").upper().startswith(f"{underlying_norm}-")
+        }
+        local_open_trades = [
+            trade for trade in self.storage.get_open_trades()
+            if str(trade.get("symbol") or "").upper().startswith(f"{underlying_norm}-")
+        ]
+        local_symbols = {str(trade.get("symbol") or "").upper() for trade in local_open_trades}
+
+        if not exchange_symbols:
+            return {
+                "restored": False,
+                "reason": "no_exchange_positions",
+                "local_symbols": sorted(local_symbols),
+            }
+
+        if local_symbols == exchange_symbols and local_symbols:
+            if not self.open_condors:
+                self._load_open_positions()
+            return {
+                "restored": False,
+                "reason": "already_in_sync",
+                "symbols": sorted(exchange_symbols),
+            }
+
+        if local_symbols and local_symbols != exchange_symbols and not replace_on_conflict:
+            return {
+                "restored": False,
+                "reason": "conflict_detected",
+                "local_symbols": sorted(local_symbols),
+                "exchange_symbols": sorted(exchange_symbols),
+            }
+
+        deleted = 0
+        if local_symbols != exchange_symbols:
+            deleted = self.storage.delete_open_trades(symbol_prefix=f"{underlying_norm}-")
+            self._load_open_positions()
+
+        try:
+            spot_price = float(getattr(self.client, "get_spot_price", lambda _u: 0.0)(underlying_norm) or 0.0)
+        except Exception:
+            spot_price = 0.0
+
+        group_ids_by_expiry: dict[str, str] = {}
+        used_roles: dict[str, set[str]] = {}
+        recovered_symbols: list[str] = []
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "").upper()
+            if not symbol.startswith(f"{underlying_norm}-"):
+                continue
+            parsed = _parse_symbol(symbol) or {}
+            expiry = parsed.get("expiry")
+            expiry_key = expiry.strftime("%Y%m%d_%H%M%S") if expiry else symbol.replace("-", "_")
+            base_group_id = group_ids_by_expiry.setdefault(
+                expiry_key,
+                f"RECOVERED_{underlying_norm}_{expiry_key}",
+            )
+            exchange_side = str(pos.get("side") or "").upper()
+            leg_role = self._leg_role_from_exchange_position(symbol, exchange_side)
+            group_id = base_group_id
+            used = used_roles.setdefault(group_id, set())
+            if leg_role in used:
+                group_id = f"{base_group_id}_{symbol.replace('-', '_')}"
+                used = used_roles.setdefault(group_id, set())
+            used.add(leg_role)
+
+            open_side = "SELL" if exchange_side == "SHORT" else "BUY"
+            quantity = abs(float(pos.get("quantity") or 0.0))
+            if quantity <= 1e-9:
+                continue
+            entry_price = float(pos.get("entryPrice") or 0.0)
+            meta = {
+                "leg_role": leg_role,
+                "option_type": parsed.get("option_type", ""),
+                "strike": parsed.get("strike", 0.0),
+                "underlying_price": spot_price,
+                "group_id": group_id,
+                "recovered_from_exchange": True,
+                "exchange_side": exchange_side,
+            }
+            self.storage.record_trade(
+                trade_group=group_id,
+                symbol=symbol,
+                side=open_side,
+                quantity=quantity,
+                price=entry_price,
+                fee=0.0,
+                order_id=str(pos.get("orderId") or ""),
+                meta=meta,
+            )
+            recovered_symbols.append(symbol)
+
+        self._load_open_positions()
+        logger.warning(
+            f"Recovered {len(recovered_symbols)} exchange position leg(s) into local storage for {underlying_norm}: {recovered_symbols}"
+        )
+        return {
+            "restored": bool(recovered_symbols),
+            "symbols": recovered_symbols,
+            "deleted_open_trades": deleted,
+            "group_count": len({trade.get('trade_group') for trade in self.storage.get_open_trades() if str(trade.get('symbol') or '').upper().startswith(f'{underlying_norm}-')}),
+        }
 
     @staticmethod
     def _infer_underlying(symbol: str) -> str:

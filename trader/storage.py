@@ -256,6 +256,18 @@ class Storage:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def delete_open_trades(self, symbol_prefix: str | None = None) -> int:
+        """Delete open trades, optionally filtered by symbol prefix."""
+        with self._cursor() as cur:
+            if symbol_prefix:
+                cur.execute(
+                    "DELETE FROM trades WHERE is_open = 1 AND symbol LIKE ?",
+                    (f"{symbol_prefix}%",),
+                )
+            else:
+                cur.execute("DELETE FROM trades WHERE is_open = 1")
+            return int(cur.rowcount or 0)
+
     def get_all_trades(
         self,
         limit: int = 500,
