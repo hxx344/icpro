@@ -288,6 +288,7 @@ def _start_test_order_task(
     chaser_cfg,
     order_params: dict,
     engine_ref: TradingEngine,
+    attach_to_engine_for_stop_loss: bool = False,
 ) -> None:
     def _runner() -> None:
         last_progress: dict[str, object] = {}
@@ -378,15 +379,20 @@ def _start_test_order_task(
 
             if condor is not None:
                 _group_id = str(getattr(condor, "group_id", ""))
-                if engine_ref.pos_mgr is not None:
+                if attach_to_engine_for_stop_loss and engine_ref.pos_mgr is not None:
                     engine_ref.pos_mgr.open_condors[_group_id] = condor
                 _update_test_order_task(
                     task_id,
                     state="success",
                     status="success",
-                    message=f"测试下单成功：{_group_id}",
+                    message=(
+                        f"测试下单成功：{_group_id}；已接入策略止损管理"
+                        if attach_to_engine_for_stop_loss
+                        else f"测试下单成功：{_group_id}；未接入自动止损"
+                    ),
                     percent=100,
                     result_group_id=_group_id,
+                    attached_to_engine_for_stop_loss=attach_to_engine_for_stop_loss,
                 )
             else:
                 _snapshot = _capture_exchange_positions_on_failure()
@@ -1977,6 +1983,8 @@ elif page == "🔧 策略配置":
                 _active_test_task = _get_test_order_task(_active_test_task_id)
                 _test_task_running = bool(_active_test_task and _active_test_task.get("state") in {"queued", "running"})
                 _test_disabled_reason = None
+                _sl_cfg_pct = float(getattr(cfg.strategy, "stop_loss_pct", 0.0) or 0.0)
+                _sl_supported = _pv_mode == "weekend_vol" and _sl_cfg_pct > 0 and engine.is_running and is_trade_mode
                 if not is_trade_mode:
                     _test_disabled_reason = "当前为只读模式，切换到交易模式后才可发送测试单。"
                 elif _test_task_running:
@@ -1989,6 +1997,13 @@ elif page == "🔧 策略配置":
                 )
                 _tc1, _tc2 = st.columns([1, 2])
                 with _tc1:
+                    _auto_stop_loss = st.checkbox(
+                        "应用策略自动止损",
+                        value=False,
+                        disabled=not _sl_supported,
+                        help="勾选后，测试单成交后会接入当前引擎持仓管理，并按策略里的止损线自动监控平仓。",
+                        key=f"preview_auto_sl_{_pv_mode}_{_test_leg_count}",
+                    )
                     _preview_test_clicked = st.button(
                         _test_button_label,
                         key=(
@@ -2017,6 +2032,43 @@ elif page == "🔧 策略配置":
                             f"Short Call `{_sell_call.symbol}`"
                         )
 
+                if not _sl_supported:
+                    if _pv_mode != "weekend_vol":
+                        st.caption("自动止损接管仅对 `weekend_vol` 策略开放。")
+                    elif _sl_cfg_pct <= 0:
+                        st.caption("当前策略未配置止损线，无法对测试单启用自动止损。")
+                    elif not engine.is_running:
+                        st.caption("引擎未运行，无法接管测试单并执行自动止损。")
+
+                if _sl_cfg_pct > 0:
+                    _stop_loss_trigger_cost_per = _premium_per * (1 + _sl_cfg_pct / 100.0)
+                    _stop_loss_trigger_loss_total = _total_premium * _sl_cfg_pct / 100.0
+                    _sl1, _sl2, _sl3, _sl4 = st.columns(4)
+                    with _sl1:
+                        st.metric("止损线", f"-{_sl_cfg_pct:.0f}%")
+                    with _sl2:
+                        st.metric("预计止损亏损", f"-${_stop_loss_trigger_loss_total:.2f}")
+                    with _sl3:
+                        st.metric("触发回补成本/组", f"${_stop_loss_trigger_cost_per:.2f}")
+                    with _sl4:
+                        if not _is_ic:
+                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_per
+                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_per
+                            st.metric("到期参考点位", f"${_sl_ref_low:,.0f} / ${_sl_ref_high:,.0f}")
+                        else:
+                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_per
+                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_per
+                            st.metric("到期参考点位", f"${_sl_ref_low:,.0f} / ${_sl_ref_high:,.0f}")
+
+                    st.caption(
+                        "止损按实时篮子 PnL% 触发，不是固定现货价止损。上面的点位为到期静态近似参考："
+                        f"当组合回补成本约达到 ${_stop_loss_trigger_cost_per:.2f}/组时，对应策略止损线。"
+                    )
+                    if _auto_stop_loss and _sl_supported:
+                        st.info(
+                            f"本次测试单成交后将接入引擎持仓管理，并按当前策略止损线 -{_sl_cfg_pct:.0f}% 自动监控。"
+                        )
+
                 if _test_disabled_reason:
                     st.info(_test_disabled_reason)
                 elif _preview_test_clicked:
@@ -2037,6 +2089,8 @@ elif page == "🔧 策略配置":
                             "buy_put": _buy_put.symbol if _buy_put else None,
                             "quantity": _test_qty,
                             "execution_mode": "market",
+                            "apply_strategy_stop_loss": bool(_auto_stop_loss and _sl_supported),
+                            "stop_loss_pct": _sl_cfg_pct,
                         },
                     )
                     _start_test_order_task(
@@ -2057,6 +2111,7 @@ elif page == "🔧 策略配置":
                             "underlying_price": _pv_spot,
                         },
                         engine,
+                        attach_to_engine_for_stop_loss=bool(_auto_stop_loss and _sl_supported),
                     )
                     st.rerun()
 
