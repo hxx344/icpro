@@ -1681,248 +1681,142 @@ elif page == "🔧 策略配置":
     _storage = _raw_yaml.get("storage", {})
     _monitor = _raw_yaml.get("monitor", {})
 
-    # ---- Editable form ----
-    with st.form("config_editor", border=True):
-        st.subheader("📄 策略参数")
-        _cur_mode = _strategy.get("mode", "strangle")
-        _mode_options = ["strangle", "iron_condor", "weekend_vol"]
-        _mode_index = _mode_options.index(_cur_mode) if _cur_mode in _mode_options else 0
+    def _render_strategy_form() -> None:
+        with st.form("config_editor", border=True):
+            st.subheader("📄 策略参数")
+            _cur_mode = _strategy.get("mode", "strangle")
+            _mode_options = ["strangle", "iron_condor", "weekend_vol"]
+            _mode_index = _mode_options.index(_cur_mode) if _cur_mode in _mode_options else 0
 
-        s_col1, s_col2, s_col3 = st.columns(3)
+            s_col1, s_col2, s_col3 = st.columns(3)
 
-        with s_col1:
-            ed_mode = st.selectbox(
-                "策略模式", _mode_options,
-                index=_mode_index,
-                help="strangle: 裸卖双卖(2腿)  iron_condor: 铁鹰(4腿)  weekend_vol: 周末波动率(delta选行权价)",
-            )
-            ed_underlying = st.selectbox(
-                "标的", ["ETH", "BTC"],
-                index=0 if _strategy.get("underlying", "ETH") == "ETH" else 1,
-            )
-
-            # --- OTM%-based params (strangle / iron_condor) ---
-            st.markdown("**▸ OTM% 选行权价** *(strangle / iron_condor)*")
-            ed_otm_pct = st.number_input(
-                "短腿 OTM %", min_value=1.0, max_value=50.0,
-                value=_strategy.get("otm_pct", 0.10) * 100,
-                step=1.0, format="%.1f", help="短腿离现货的距离百分比 (strangle/iron_condor)",
-            )
-            ed_wing_width = st.number_input(
-                "翼宽 % (仅铁鹰)", min_value=0.0, max_value=20.0,
-                value=_strategy.get("wing_width_pct", 0.02) * 100,
-                step=0.5, format="%.1f", help="保护翼额外偏移百分比 (strangle模式忽略)",
-            )
-            ed_target_dte = st.number_input(
-                "目标 DTE (天)", min_value=0, max_value=30,
-                value=_strategy.get("target_dte_days", 7),
-                step=1, help="目标到期天数 (0=0DTE当日到期)",
-            )
-            ed_dte_window = st.number_input(
-                "DTE 容差 (小时)", min_value=6, max_value=168,
-                value=_strategy.get("dte_window_hours", 48),
-                step=6, help="目标DTE ± 容差范围内的合约都可选",
-            )
-
-            # --- Delta-based params (weekend_vol) ---
-            st.markdown("**▸ Delta 选行权价** *(weekend_vol)*")
-            ed_target_delta = st.number_input(
-                "短腿目标 |Δ|", min_value=0.05, max_value=0.90,
-                value=float(_strategy.get("target_delta", 0.40)),
-                step=0.05, format="%.2f", help="Short legs 的 |delta| 目标 (weekend_vol)",
-            )
-            ed_wing_delta = st.number_input(
-                "翼 |Δ| (保护腿)", min_value=0.0, max_value=0.50,
-                value=float(_strategy.get("wing_delta", 0.05)),
-                step=0.01, format="%.2f", help="Long legs 的 |delta| 目标 (0=无翼/strangle)",
-            )
-            ed_leverage = st.number_input(
-                "杠杆倍数", min_value=0.5, max_value=10.0,
-                value=float(_strategy.get("leverage", 1.0)),
-                step=0.5, format="%.1f", help="仓位大小的杠杆倍数 (weekend_vol)",
-            )
-            ed_rv_hours = st.number_input(
-                "RV 回看小时数", min_value=0, max_value=168,
-                value=int(_strategy.get("entry_realized_vol_lookback_hours", 24)),
-                step=1, help="入场 RV 过滤的历史小时数；0 表示关闭过滤",
-            )
-            ed_rv_max = st.number_input(
-                "RV 上限", min_value=0.0, max_value=5.0,
-                value=float(_strategy.get("entry_realized_vol_max", 1.20)),
-                step=0.05, format="%.2f", help="仅当年化 RV 不超过该值时允许开仓",
-            )
-            ed_stop_loss_pct = st.number_input(
-                "组合止损 %", min_value=0.0, max_value=1000.0,
-                value=float(_strategy.get("stop_loss_pct", 200.0)),
-                step=10.0, format="%.1f", help="组合 PnL% 低于 -该值时触发止损；0 表示关闭",
-            )
-            _day_options = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-            _cur_day = _strategy.get("entry_day", "friday").lower()
-            _day_index = _day_options.index(_cur_day) if _cur_day in _day_options else 4
-            ed_entry_day = st.selectbox(
-                "开仓日", _day_options, index=_day_index,
-                help="每周开仓的日子 (weekend_vol 通常选 friday)",
-            )
-            ed_default_iv = st.number_input(
-                "默认 IV", min_value=0.1, max_value=3.0,
-                value=float(_strategy.get("default_iv", 0.60)),
-                step=0.05, format="%.2f", help="mark_iv 不可用时的回退 IV (weekend_vol)",
-            )
-
-            import datetime as _dt
-            _entry_str = _strategy.get("entry_time_utc", "08:00")
-            _entry_parts = _entry_str.split(":")
-            _entry_time = _dt.time(int(_entry_parts[0]), int(_entry_parts[1]))
-            ed_entry_time = st.time_input(
-                "开仓时间 (UTC)",
-                value=_entry_time,
-                step=_dt.timedelta(minutes=1),
-                help="每日开仓的 UTC 时间（精确到分钟）",
-            )
-
-        with s_col2:
-            ed_quantity = st.number_input(
-                "基础数量", min_value=0.001, max_value=100.0,
-                value=float(_strategy.get("quantity", 0.01)),
-                step=0.01, format="%.3f", help="每组策略的合约数量",
-            )
-            ed_max_pos = st.number_input(
-                "最大持仓组数", min_value=1, max_value=20,
-                value=_strategy.get("max_positions", 1),
-                step=1,
-            )
-
-        with s_col3:
-            ed_max_cap = st.number_input(
-                "最大资金比例 %", min_value=5.0, max_value=100.0,
-                value=_strategy.get("max_capital_pct", 0.30) * 100,
-                step=5.0, format="%.0f",
-            )
-            ed_compound = st.checkbox(
-                "复利模式", value=_strategy.get("compound", True),
-                help="根据账户权益自动调整下单数量",
-            )
-            ed_wait_midpoint = st.checkbox(
-                "等待中点开仓", value=_strategy.get("wait_for_midpoint", False),
-                help="等现货价格到达两个最近行权价的中点再开仓",
-            )
-
-        st.divider()
-        st.subheader("🔌 API & 运行参数")
-        r_col1, r_col2 = st.columns(2)
-
-        with r_col1:
-            ed_testnet = st.checkbox(
-                "测试网模式", value=_exchange.get("testnet", True),
-                help="开启后使用模拟账户，不真实下单",
-            )
-            ed_timeout = st.number_input(
-                "API 超时 (秒)", min_value=3, max_value=60,
-                value=_exchange.get("timeout", 10), step=1,
-            )
-            ed_check_interval = st.number_input(
-                "策略循环间隔 (秒)", min_value=10, max_value=600,
-                value=_monitor.get("check_interval_sec", 60), step=10,
-            )
-            ed_heartbeat = st.number_input(
-                "心跳间隔 (秒)", min_value=60, max_value=3600,
-                value=_monitor.get("heartbeat_interval_sec", 300), step=60,
-            )
-
-        with r_col2:
-            ed_snapshot = st.number_input(
-                "资产快照间隔 (秒)", min_value=300, max_value=86400,
-                value=_monitor.get("equity_snapshot_interval_sec", 3600), step=300,
-            )
-            ed_db_path = st.text_input(
-                "数据库路径", value=_storage.get("db_path", "./data/trader.db"),
-            )
-            ed_log_dir = st.text_input(
-                "日志目录", value=_storage.get("log_dir", "./logs"),
-            )
-            ed_log_level = st.selectbox(
-                "日志级别", ["DEBUG", "INFO", "WARNING", "ERROR"],
-                index=["DEBUG", "INFO", "WARNING", "ERROR"].index(
-                    _storage.get("log_level", "INFO")
-                ),
-            )
-
-        st.divider()
-        _save_col1, _save_col2 = st.columns([1, 4])
-        with _save_col1:
-            _submitted = st.form_submit_button("💾 保存配置", use_container_width=True, type="primary")
-        with _save_col2:
-            st.caption("保存后需要重启引擎才能生效")
-
-    # ---- Handle save ----
-    if _submitted:
-        _new_cfg = {
-            "name": _raw_yaml.get("name", cfg.name),
-            "exchange": {
-                "api_key": "",
-                "api_secret": "",
-                "testnet": ed_testnet,
-                "timeout": ed_timeout,
-                "account_currency": _exchange.get("account_currency", "USDT"),
-                "simulate_private": _exchange.get("simulate_private", False),
-            },
-            "strategy": {
-                "mode": ed_mode,
-                "underlying": ed_underlying,
-                "otm_pct": round(ed_otm_pct / 100, 4),
-                "wing_width_pct": round(ed_wing_width / 100, 4),
-                "target_dte_days": ed_target_dte,
-                "dte_window_hours": ed_dte_window,
-                "target_delta": round(ed_target_delta, 4),
-                "wing_delta": round(ed_wing_delta, 4),
-                "leverage": round(ed_leverage, 2),
-                "entry_realized_vol_lookback_hours": int(ed_rv_hours),
-                "entry_realized_vol_max": round(ed_rv_max, 4),
-                "stop_loss_pct": round(ed_stop_loss_pct, 4),
-                "entry_day": ed_entry_day,
-                "default_iv": round(ed_default_iv, 4),
-                "entry_time_utc": ed_entry_time.strftime("%H:%M"),
-                "quantity": ed_quantity,
-                "max_positions": ed_max_pos,
-                "max_capital_pct": round(ed_max_cap / 100, 4),
-                "compound": ed_compound,
-                "wait_for_midpoint": ed_wait_midpoint,
-            },
-            "storage": {
-                "db_path": ed_db_path,
-                "log_dir": ed_log_dir,
-                "log_level": ed_log_level,
-                "log_rotation": _storage.get("log_rotation", "1 day"),
-                "log_retention": _storage.get("log_retention", "30 days"),
-            },
-            "monitor": {
-                "check_interval_sec": ed_check_interval,
-                "heartbeat_interval_sec": ed_heartbeat,
-                "equity_snapshot_interval_sec": ed_snapshot,
-            },
-        }
-        try:
-            # Write with comments header
-            _header = (
-                "# ============================================================\n"
-                f"# {_new_cfg['name']}\n"
-                "# ============================================================\n"
-                "# 由交易面板自动保存\n"
-                "# ============================================================\n\n"
-            )
-            with open(config_path, "w", encoding="utf-8") as _wf:
-                _wf.write(_header)
-                _yaml.dump(
-                    _new_cfg, _wf,
-                    default_flow_style=False,
-                    allow_unicode=True,
-                    sort_keys=False,
+            with s_col1:
+                ed_mode = st.selectbox(
+                    "策略模式", _mode_options,
+                    index=_mode_index,
+                    help="strangle: 裸卖双卖(2腿)  iron_condor: 铁鹰(4腿)  weekend_vol: 周末波动率(delta选行权价)",
                 )
-            st.success(f"✅ 配置已保存到 {config_path}")
-            st.caption("出于安全考虑，API Key / Secret 不会由面板写回 YAML，请继续使用环境变量或 .env。")
-            st.info("⚠️ 请重启引擎使新配置生效 (先停止再启动)")
-        except Exception as _ex:
-            st.error(f"保存失败: {_ex}")
+                ed_underlying = st.selectbox(
+                    "标的", ["ETH", "BTC"],
+                    index=0 if _strategy.get("underlying", "ETH") == "ETH" else 1,
+                )
+                st.markdown("**▸ OTM% 选行权价** *(strangle / iron_condor)*")
+                ed_otm_pct = st.number_input("短腿 OTM %", min_value=1.0, max_value=50.0, value=_strategy.get("otm_pct", 0.10) * 100, step=1.0, format="%.1f", help="短腿离现货的距离百分比 (strangle/iron_condor)")
+                ed_wing_width = st.number_input("翼宽 % (仅铁鹰)", min_value=0.0, max_value=20.0, value=_strategy.get("wing_width_pct", 0.02) * 100, step=0.5, format="%.1f", help="保护翼额外偏移百分比 (strangle模式忽略)")
+                ed_target_dte = st.number_input("目标 DTE (天)", min_value=0, max_value=30, value=_strategy.get("target_dte_days", 7), step=1, help="目标到期天数 (0=0DTE当日到期)")
+                ed_dte_window = st.number_input("DTE 容差 (小时)", min_value=6, max_value=168, value=_strategy.get("dte_window_hours", 48), step=6, help="目标DTE ± 容差范围内的合约都可选")
+                st.markdown("**▸ Delta 选行权价** *(weekend_vol)*")
+                ed_target_delta = st.number_input("短腿目标 |Δ|", min_value=0.05, max_value=0.90, value=float(_strategy.get("target_delta", 0.40)), step=0.05, format="%.2f", help="Short legs 的 |delta| 目标 (weekend_vol)")
+                ed_wing_delta = st.number_input("翼 |Δ| (保护腿)", min_value=0.0, max_value=0.50, value=float(_strategy.get("wing_delta", 0.05)), step=0.01, format="%.2f", help="Long legs 的 |delta| 目标 (0=无翼/strangle)")
+                ed_leverage = st.number_input("杠杆倍数", min_value=0.5, max_value=10.0, value=float(_strategy.get("leverage", 1.0)), step=0.5, format="%.1f", help="仓位大小的杠杆倍数 (weekend_vol)")
+                ed_rv_hours = st.number_input("RV 回看小时数", min_value=0, max_value=168, value=int(_strategy.get("entry_realized_vol_lookback_hours", 24)), step=1, help="入场 RV 过滤的历史小时数；0 表示关闭过滤")
+                ed_rv_max = st.number_input("RV 上限", min_value=0.0, max_value=5.0, value=float(_strategy.get("entry_realized_vol_max", 1.20)), step=0.05, format="%.2f", help="仅当年化 RV 不超过该值时允许开仓")
+                ed_stop_loss_pct = st.number_input("组合止损 %", min_value=0.0, max_value=1000.0, value=float(_strategy.get("stop_loss_pct", 200.0)), step=10.0, format="%.1f", help="组合 PnL% 低于 -该值时触发止损；0 表示关闭")
+                _day_options = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+                _cur_day = _strategy.get("entry_day", "friday").lower()
+                _day_index = _day_options.index(_cur_day) if _cur_day in _day_options else 4
+                ed_entry_day = st.selectbox("开仓日", _day_options, index=_day_index, help="每周开仓的日子 (weekend_vol 通常选 friday)")
+                ed_default_iv = st.number_input("默认 IV", min_value=0.1, max_value=3.0, value=float(_strategy.get("default_iv", 0.60)), step=0.05, format="%.2f", help="mark_iv 不可用时的回退 IV (weekend_vol)")
+                import datetime as _dt
+                _entry_str = _strategy.get("entry_time_utc", "08:00")
+                _entry_parts = _entry_str.split(":")
+                _entry_time = _dt.time(int(_entry_parts[0]), int(_entry_parts[1]))
+                ed_entry_time = st.time_input("开仓时间 (UTC)", value=_entry_time, step=_dt.timedelta(minutes=1), help="每日开仓的 UTC 时间（精确到分钟）")
+
+            with s_col2:
+                ed_quantity = st.number_input("基础数量", min_value=0.001, max_value=100.0, value=float(_strategy.get("quantity", 0.01)), step=0.01, format="%.3f", help="每组策略的合约数量")
+                ed_max_pos = st.number_input("最大持仓组数", min_value=1, max_value=20, value=_strategy.get("max_positions", 1), step=1)
+
+            with s_col3:
+                ed_max_cap = st.number_input("最大资金比例 %", min_value=5.0, max_value=100.0, value=_strategy.get("max_capital_pct", 0.30) * 100, step=5.0, format="%.0f")
+                ed_compound = st.checkbox("复利模式", value=_strategy.get("compound", True), help="根据账户权益自动调整下单数量")
+                ed_wait_midpoint = st.checkbox("等待中点开仓", value=_strategy.get("wait_for_midpoint", False), help="等现货价格到达两个最近行权价的中点再开仓")
+
+            st.divider()
+            st.subheader("🔌 API & 运行参数")
+            r_col1, r_col2 = st.columns(2)
+
+            with r_col1:
+                ed_testnet = st.checkbox("测试网模式", value=_exchange.get("testnet", True), help="开启后使用模拟账户，不真实下单")
+                ed_timeout = st.number_input("API 超时 (秒)", min_value=3, max_value=60, value=_exchange.get("timeout", 10), step=1)
+                ed_check_interval = st.number_input("策略循环间隔 (秒)", min_value=10, max_value=600, value=_monitor.get("check_interval_sec", 60), step=10)
+                ed_heartbeat = st.number_input("心跳间隔 (秒)", min_value=60, max_value=3600, value=_monitor.get("heartbeat_interval_sec", 300), step=60)
+
+            with r_col2:
+                ed_snapshot = st.number_input("资产快照间隔 (秒)", min_value=300, max_value=86400, value=_monitor.get("equity_snapshot_interval_sec", 3600), step=300)
+                ed_db_path = st.text_input("数据库路径", value=_storage.get("db_path", "./data/trader.db"))
+                ed_log_dir = st.text_input("日志目录", value=_storage.get("log_dir", "./logs"))
+                ed_log_level = st.selectbox("日志级别", ["DEBUG", "INFO", "WARNING", "ERROR"], index=["DEBUG", "INFO", "WARNING", "ERROR"].index(_storage.get("log_level", "INFO")))
+
+            st.divider()
+            _save_col1, _save_col2 = st.columns([1, 4])
+            with _save_col1:
+                _submitted = st.form_submit_button("💾 保存配置", use_container_width=True, type="primary")
+            with _save_col2:
+                st.caption("保存后需要重启引擎才能生效")
+
+        if _submitted:
+            _new_cfg = {
+                "name": _raw_yaml.get("name", cfg.name),
+                "exchange": {
+                    "api_key": "",
+                    "api_secret": "",
+                    "testnet": ed_testnet,
+                    "timeout": ed_timeout,
+                    "account_currency": _exchange.get("account_currency", "USDT"),
+                    "simulate_private": _exchange.get("simulate_private", False),
+                },
+                "strategy": {
+                    "mode": ed_mode,
+                    "underlying": ed_underlying,
+                    "otm_pct": round(ed_otm_pct / 100, 4),
+                    "wing_width_pct": round(ed_wing_width / 100, 4),
+                    "target_dte_days": ed_target_dte,
+                    "dte_window_hours": ed_dte_window,
+                    "target_delta": round(ed_target_delta, 4),
+                    "wing_delta": round(ed_wing_delta, 4),
+                    "leverage": round(ed_leverage, 2),
+                    "entry_realized_vol_lookback_hours": int(ed_rv_hours),
+                    "entry_realized_vol_max": round(ed_rv_max, 4),
+                    "stop_loss_pct": round(ed_stop_loss_pct, 4),
+                    "entry_day": ed_entry_day,
+                    "default_iv": round(ed_default_iv, 4),
+                    "entry_time_utc": ed_entry_time.strftime("%H:%M"),
+                    "quantity": ed_quantity,
+                    "max_positions": ed_max_pos,
+                    "max_capital_pct": round(ed_max_cap / 100, 4),
+                    "compound": ed_compound,
+                    "wait_for_midpoint": ed_wait_midpoint,
+                },
+                "storage": {
+                    "db_path": ed_db_path,
+                    "log_dir": ed_log_dir,
+                    "log_level": ed_log_level,
+                    "log_rotation": _storage.get("log_rotation", "1 day"),
+                    "log_retention": _storage.get("log_retention", "30 days"),
+                },
+                "monitor": {
+                    "check_interval_sec": ed_check_interval,
+                    "heartbeat_interval_sec": ed_heartbeat,
+                    "equity_snapshot_interval_sec": ed_snapshot,
+                },
+            }
+            try:
+                _header = (
+                    "# ============================================================\n"
+                    f"# {_new_cfg['name']}\n"
+                    "# ============================================================\n"
+                    "# 由交易面板自动保存\n"
+                    "# ============================================================\n\n"
+                )
+                with open(config_path, "w", encoding="utf-8") as _wf:
+                    _wf.write(_header)
+                    _yaml.dump(_new_cfg, _wf, default_flow_style=False, allow_unicode=True, sort_keys=False)
+                st.success(f"✅ 配置已保存到 {config_path}")
+                st.caption("出于安全考虑，API Key / Secret 不会由面板写回 YAML，请继续使用环境变量或 .env。")
+                st.info("⚠️ 请重启引擎使新配置生效 (先停止再启动)")
+            except Exception as _ex:
+                st.error(f"保存失败: {_ex}")
 
     st.divider()
 
@@ -2828,6 +2722,10 @@ elif page == "🔧 策略配置":
 
     if not _pv_ok:
         st.info(f"💡 下单预览需要实时行情数据，请确保网络连通且有可匹配合约")
+
+    st.divider()
+
+    _render_strategy_form()
 
     st.divider()
 
