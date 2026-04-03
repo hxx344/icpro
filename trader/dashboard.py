@@ -915,7 +915,8 @@ if page == "📊 总览":
         _data_source = "无数据"
 
     # --- Auto-record equity snapshot when live data is available ---
-    if live_account is not None:
+    _skip_auto_snapshot_once = bool(st.session_state.pop("_skip_overview_auto_snapshot_once", False))
+    if live_account is not None and not _skip_auto_snapshot_once:
         try:
             _spot = client.get_spot_price(cfg.strategy.underlying)
             storage.record_equity_snapshot(
@@ -947,6 +948,32 @@ if page == "📊 总览":
         st.metric("累计手续费", f"${total_fees:,.2f}")
 
     st.caption(f"📡 数据来源: **{_data_source}**")
+
+    st.session_state.setdefault("overview_clear_history_confirm", False)
+    with st.expander("🗑 数据清理", expanded=bool(st.session_state.get("overview_clear_history_confirm"))):
+        st.caption("仅清空本地数据库中的历史记录，不会影响交易所真实持仓。")
+        if not st.session_state.get("overview_clear_history_confirm"):
+            if st.button("清除历史", type="secondary", key="overview_clear_history_prepare"):
+                st.session_state["overview_clear_history_confirm"] = True
+                st.rerun()
+        else:
+            st.warning("确认后将删除本地数据库中的成交历史、资产快照、每日损益和策略状态，且不可恢复。")
+            _clear_col1, _clear_col2 = st.columns(2)
+            with _clear_col1:
+                if st.button("确认清除数据库", type="primary", key="overview_clear_history_confirm_btn"):
+                    with st.spinner("正在清除数据库历史..."):
+                        storage.clear_all_data()
+                    st.cache_data.clear()
+                    st.session_state["overview_clear_history_confirm"] = False
+                    st.session_state["_skip_overview_auto_snapshot_once"] = True
+                    st.session_state.pop("preview_test_order_task_id", None)
+                    st.session_state.pop("test_order_apply_strategy_stop_loss", None)
+                    st.success("数据库历史已清除。")
+                    st.rerun()
+            with _clear_col2:
+                if st.button("取消", key="overview_clear_history_cancel_btn"):
+                    st.session_state["overview_clear_history_confirm"] = False
+                    st.rerun()
 
     st.divider()
 

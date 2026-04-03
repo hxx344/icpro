@@ -67,6 +67,19 @@ class Storage:
             conn.close()
             self._local.conn = None
 
+    def clear_all_data(self) -> None:
+        """Delete all persisted historical data from the SQLite database."""
+        conn = self._get_conn()
+        logger.warning(f"Clearing all persisted storage data: {self.db_path}")
+        conn.executescript("""
+            DELETE FROM trades;
+            DELETE FROM equity_snapshots;
+            DELETE FROM daily_pnl;
+            DELETE FROM strategy_state;
+            DELETE FROM sqlite_sequence WHERE name IN ('trades', 'equity_snapshots', 'daily_pnl');
+        """)
+        conn.commit()
+
     # ------------------------------------------------------------------
     # Schema
     # ------------------------------------------------------------------
