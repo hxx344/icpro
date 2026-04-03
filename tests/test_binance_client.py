@@ -767,6 +767,23 @@ class TestClosePosition:
         assert result.side == "BUY"
 
 
+class TestOrderBook:
+    def test_get_order_book_normalizes_small_limit(self, client):
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "bids": [["100.0", "3.0"]],
+            "asks": [["105.0", "4.0"]],
+        }
+        mock_resp.raise_for_status = MagicMock()
+        with patch.object(client.session, "get", return_value=mock_resp) as m:
+            book = client.get_order_book("BTC-260405-67000-P", limit=5)
+
+        params = m.call_args.kwargs.get("params") or m.call_args[1].get("params", {})
+        assert params.get("limit") == 10
+        assert book["bids"] == [(100.0, 3.0)]
+        assert book["asks"] == [(105.0, 4.0)]
+
+
 # ======================================================================
 # 8. Binance API 错误码处理
 # ======================================================================

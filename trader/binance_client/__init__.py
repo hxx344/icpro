@@ -515,7 +515,7 @@ class BinanceOptionsClient:
             })
         return out
 
-    def get_order_book(self, symbol: str, limit: int = 5) -> dict[str, list[tuple[float, float]]]:
+    def get_order_book(self, symbol: str, limit: int = 10) -> dict[str, list[tuple[float, float]]]:
         if self.cfg.simulate_private:
             ticker = self.get_ticker(symbol)
             if ticker is None:
@@ -527,7 +527,14 @@ class BinanceOptionsClient:
             }
 
         try:
-            result = self._public_get("/eapi/v1/depth", {"symbol": symbol, "limit": max(int(limit), 1)})
+            requested_limit = int(limit)
+        except Exception:
+            requested_limit = 10
+        valid_limits = (10, 20, 50, 100, 500, 1000)
+        normalized_limit = next((value for value in valid_limits if requested_limit <= value), valid_limits[-1])
+
+        try:
+            result = self._public_get("/eapi/v1/depth", {"symbol": symbol, "limit": normalized_limit})
         except Exception as e:
             logger.error(f"Failed to fetch order book for {symbol}: {e}")
             return {"bids": [], "asks": []}
