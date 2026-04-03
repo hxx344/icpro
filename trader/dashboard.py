@@ -736,6 +736,11 @@ st.sidebar.divider()
 engine = get_engine(cfg)
 engine_status = engine.status()
 
+
+def _rerun_preserve_nav_page(current_page: str | None = None) -> None:
+    st.session_state["nav_page"] = current_page or st.session_state.get("nav_page", "📊 总览")
+    st.rerun()
+
 if not is_trade_mode:
     # Readonly mode: show status only, no engine controls
     if engine.is_running:
@@ -756,12 +761,12 @@ elif engine.is_running:
     with col_stop:
         if st.button("⏹ 停止引擎", use_container_width=True, type="secondary"):
             engine.stop()
-            st.rerun()
+            _rerun_preserve_nav_page()
     with col_close:
         if st.button("🚨 全部平仓", use_container_width=True, type="primary"):
             pnl = engine.close_all_positions()
             st.sidebar.info(f"已平仓, PnL: ${pnl:,.4f}")
-            st.rerun()
+            _rerun_preserve_nav_page()
 else:
     if is_trade_mode:
         st.sidebar.error("🔴 引擎未运行")
@@ -771,7 +776,7 @@ else:
                 st.sidebar.success("引擎已启动!")
             else:
                 st.sidebar.error(f"启动失败: {engine.status().get('last_error', '未知错误')}")
-            st.rerun()
+            _rerun_preserve_nav_page()
 
 st.sidebar.divider()
 
@@ -829,6 +834,7 @@ page = st.sidebar.radio(
     ["📊 总览", "📈 资产曲线", "💰 损益记录", "📋 成交历史", "📡 期权行情", "🔧 策略配置", "🖥 引擎状态"],
     key="nav_page",
 )
+st.session_state["nav_page"] = page
 
 # ==========================================================================
 # PAGE: 总览 (Overview)
@@ -2947,28 +2953,28 @@ elif page == "🖥 引擎状态":
             if st.button("⏹ 停止引擎", use_container_width=True, type="secondary",
                           disabled=not is_trade_mode):
                 engine.stop()
-                st.rerun()
+                _rerun_preserve_nav_page("🔧 策略配置")
         else:
             if st.button("🚀 启动引擎", use_container_width=True, type="primary",
                           disabled=not is_trade_mode):
                 ok = engine.start()
                 if not ok:
                     st.error(f"启动失败: {engine.status().get('last_error')}")
-                st.rerun()
+                _rerun_preserve_nav_page("🔧 策略配置")
 
     with col_a2:
         if st.button("🚨 紧急全部平仓", use_container_width=True, type="primary",
                       disabled=(not es["running"] or not is_trade_mode)):
             pnl = engine.close_all_positions()
             st.success(f"已平仓, PnL: ${pnl:,.4f}")
-            st.rerun()
+            _rerun_preserve_nav_page("🔧 策略配置")
 
     with col_a3:
         if st.button("🔄 重置引擎", use_container_width=True,
                       disabled=(es["running"] or not is_trade_mode),
                       help="停止并释放引擎实例，下次启动将重新初始化"):
             reset_engine()
-            st.rerun()
+            _rerun_preserve_nav_page("🔧 策略配置")
 
     st.divider()
 
