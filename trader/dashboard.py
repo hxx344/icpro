@@ -2043,6 +2043,7 @@ elif page == "🔧 策略配置":
                 if _sl_cfg_pct > 0:
                     _test_total_premium = _premium_per * _test_qty
                     _stop_loss_trigger_cost_per = _premium_per * (1 + _sl_cfg_pct / 100.0)
+                    _stop_loss_trigger_cost_total = _stop_loss_trigger_cost_per * _test_qty
                     _stop_loss_trigger_loss_total = _test_total_premium * _sl_cfg_pct / 100.0
                     _sl1, _sl2, _sl3, _sl4 = st.columns(4)
                     with _sl1:
@@ -2050,21 +2051,21 @@ elif page == "🔧 策略配置":
                     with _sl2:
                         st.metric("预计止损亏损(0.01)", f"-${_stop_loss_trigger_loss_total:.2f}")
                     with _sl3:
-                        st.metric("止损触发平仓成本/组", f"${_stop_loss_trigger_cost_per:.2f}")
+                        st.metric("止损触发平仓成本(0.01)", f"${_stop_loss_trigger_cost_total:.2f}")
                     with _sl4:
                         if not _is_ic:
-                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_per
-                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_per
+                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_total
+                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_total
                             st.metric("到期参考点位", f"${_sl_ref_low:,.0f} / ${_sl_ref_high:,.0f}")
                         else:
-                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_per
-                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_per
+                            _sl_ref_low = _sell_put.strike - _stop_loss_trigger_cost_total
+                            _sl_ref_high = _sell_call.strike + _stop_loss_trigger_cost_total
                             st.metric("到期参考点位", f"${_sl_ref_low:,.0f} / ${_sl_ref_high:,.0f}")
 
                     st.caption(
                         "止损按实时篮子 PnL% 触发，不是固定现货价止损。上面的点位为到期静态近似参考："
-                        f"当组合回补成本约达到 ${_stop_loss_trigger_cost_per:.2f}/组时，对应策略止损线。"
-                        f" 当前‘预计止损亏损’已按测试数量 {_test_qty:.2f} 计算。"
+                        f"当前展示均按测试数量 {_test_qty:.2f} 计算：当本次测试单组合回补成本约达到 ${_stop_loss_trigger_cost_total:.2f} 时，"
+                        f"对应策略止损线；折算到 1.00 组约为 ${_stop_loss_trigger_cost_per:.2f}/组。"
                     )
                     if _auto_stop_loss and _sl_supported:
                         st.info(
