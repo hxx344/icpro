@@ -590,7 +590,7 @@ class BinanceOptionsClient:
 
     def close_position(self, symbol: str, side: str, quantity: float) -> OrderResult:
         close_side = "SELL" if side == "LONG" else "BUY"
-        return self.place_order(symbol, close_side, quantity, order_type="MARKET", reduce_only=True)
+        return self.place_order(symbol, close_side, abs(float(quantity)), order_type="MARKET", reduce_only=True)
 
     def query_order(
         self,

@@ -120,58 +120,77 @@ class PositionManager:
         self.open_condors: dict[str, IronCondorPosition] = {}  # group_id -> position
         self._load_open_positions()
 
+    def _build_position_from_trades(
+        self,
+        group_id: str,
+        trades: list[dict[str, Any]],
+    ) -> IronCondorPosition | None:
+        if not trades:
+            return None
+
+        condor = IronCondorPosition(
+            group_id=group_id,
+            entry_time=datetime.fromisoformat(trades[0]["timestamp"]),
+            underlying_price=0.0,
+            is_open=True,
+        )
+
+        total_premium = 0.0
+        for t in trades:
+            import json
+            meta = json.loads(t.get("meta", "{}"))
+            leg = CondorLeg(
+                symbol=t["symbol"],
+                side=t["side"],
+                option_type=meta.get("option_type", ""),
+                strike=meta.get("strike", 0),
+                quantity=t["quantity"],
+                entry_price=t["price"],
+                trade_id=t["id"],
+                order_id=t.get("order_id", ""),
+            )
+
+            leg_role = meta.get("leg_role", "")
+            if leg_role == "sell_put":
+                condor.sell_put = leg
+                total_premium += leg.entry_price * leg.quantity
+            elif leg_role == "buy_put":
+                condor.buy_put = leg
+                total_premium -= leg.entry_price * leg.quantity
+            elif leg_role == "sell_call":
+                condor.sell_call = leg
+                total_premium += leg.entry_price * leg.quantity
+            elif leg_role == "buy_call":
+                condor.buy_call = leg
+                total_premium -= leg.entry_price * leg.quantity
+
+            condor.underlying_price = meta.get("underlying_price", condor.underlying_price)
+
+        condor.total_premium = total_premium
+        return condor
+
     def _load_open_positions(self) -> None:
         """Recover open positions from storage on restart."""
         open_groups = self.storage.get_open_trade_groups()
         for group_id in open_groups:
             trades = self.storage.get_open_trades(group_id)
-            if not trades:
-                continue
-
-            condor = IronCondorPosition(
-                group_id=group_id,
-                entry_time=datetime.fromisoformat(trades[0]["timestamp"]),
-                underlying_price=0.0,
-                is_open=True,
-            )
-
-            total_premium = 0.0
-            for t in trades:
-                import json
-                meta = json.loads(t.get("meta", "{}"))
-                leg = CondorLeg(
-                    symbol=t["symbol"],
-                    side=t["side"],
-                    option_type=meta.get("option_type", ""),
-                    strike=meta.get("strike", 0),
-                    quantity=t["quantity"],
-                    entry_price=t["price"],
-                    trade_id=t["id"],
-                    order_id=t.get("order_id", ""),
-                )
-
-                leg_role = meta.get("leg_role", "")
-                if leg_role == "sell_put":
-                    condor.sell_put = leg
-                    total_premium += leg.entry_price * leg.quantity
-                elif leg_role == "buy_put":
-                    condor.buy_put = leg
-                    total_premium -= leg.entry_price * leg.quantity
-                elif leg_role == "sell_call":
-                    condor.sell_call = leg
-                    total_premium += leg.entry_price * leg.quantity
-                elif leg_role == "buy_call":
-                    condor.buy_call = leg
-                    total_premium -= leg.entry_price * leg.quantity
-
-                condor.underlying_price = meta.get("underlying_price",
-                                                    condor.underlying_price)
-
-            condor.total_premium = total_premium
-            self.open_condors[group_id] = condor
+            condor = self._build_position_from_trades(group_id, trades)
+            if condor is not None:
+                self.open_condors[group_id] = condor
 
         if self.open_condors:
             logger.info(f"Recovered {len(self.open_condors)} open condor position(s)")
+
+    def _ensure_group_loaded(self, group_id: str) -> bool:
+        if group_id in self.open_condors:
+            return True
+        trades = self.storage.get_open_trades(group_id)
+        condor = self._build_position_from_trades(group_id, trades)
+        if condor is None:
+            return False
+        self.open_condors[group_id] = condor
+        logger.info(f"Recovered open position from storage for manual action: {group_id}")
+        return True
 
     @staticmethod
     def _infer_underlying(symbol: str) -> str:
@@ -984,9 +1003,96 @@ class PositionManager:
     def close_all(self, reason: str = "close_all", execution_mode: str = "chaser") -> float:
         """Close all open iron condors."""
         total = 0.0
-        for gid in list(self.open_condors.keys()):
+        group_ids = list(dict.fromkeys([
+            *self.open_condors.keys(),
+            *self.storage.get_open_trade_groups(),
+        ]))
+        for gid in group_ids:
+            self._ensure_group_loaded(gid)
             total += self.close_iron_condor(gid, reason=reason, execution_mode=execution_mode)
         return total
+
+    def close_all_exchange_positions(self, underlying: str = "", reason: str = "close_all_exchange") -> float:
+        """Emergency close using live exchange positions only.
+
+        This path ignores local tracking for order discovery and closes whatever
+        Binance currently reports as open option positions for the target underlying.
+        After exchange close, local storage and in-memory groups are best-effort synced.
+        """
+        if not getattr(self.client, "get_positions", None):
+            logger.warning("Exchange-driven close-all unavailable: client has no get_positions()")
+            return 0.0
+
+        positions = self.client.get_positions(underlying) if underlying else self.client.get_positions()
+        if not positions:
+            logger.info(
+                f"Exchange-driven close-all skipped: no live option positions for {underlying or 'ALL'}"
+            )
+            return 0.0
+
+        open_trades = self.storage.get_open_trades()
+        open_trades_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for trade in open_trades:
+            open_trades_by_symbol.setdefault(str(trade.get("symbol") or ""), []).append(trade)
+
+        total_pnl = 0.0
+        affected_groups: set[str] = set()
+
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "")
+            side = str(pos.get("side") or "").upper()
+            qty = abs(float(pos.get("quantity") or 0.0))
+            if not symbol or qty <= 0:
+                continue
+
+            logger.warning(
+                f"Exchange-driven close-all: closing {symbol} side={side} qty={qty:.4f} reason={reason}"
+            )
+            try:
+                order_result = self.client.close_position(symbol, side, qty)
+                order_result = self._refresh_order_result(symbol, order_result)
+            except Exception as e:
+                logger.error(f"Exchange-driven close failed for {symbol}: {e}")
+                continue
+
+            close_price = float(order_result.avg_price or order_result.price or 0.0)
+            if close_price <= 0:
+                logger.warning(
+                    f"Exchange-driven close for {symbol} returned no usable close price; local pnl sync skipped"
+                )
+                continue
+
+            symbol_pnl = 0.0
+            for trade in open_trades_by_symbol.get(symbol, []):
+                trade_qty = float(trade.get("quantity") or 0.0)
+                trade_side = str(trade.get("side") or "").upper()
+                entry_price = float(trade.get("price") or 0.0)
+                fee = float(trade.get("fee") or 0.0)
+                if trade_side == "SELL":
+                    leg_pnl = (entry_price - close_price) * trade_qty
+                else:
+                    leg_pnl = (close_price - entry_price) * trade_qty
+                leg_pnl -= fee
+                self.storage.close_trade(
+                    trade_id=int(trade["id"]),
+                    close_price=close_price,
+                    pnl=leg_pnl,
+                )
+                symbol_pnl += leg_pnl
+                affected_groups.add(str(trade.get("trade_group") or ""))
+
+            total_pnl += symbol_pnl
+            logger.info(
+                f"Exchange-driven close completed for {symbol}: close={close_price:.4f}, synced_pnl={symbol_pnl:.4f}"
+            )
+
+        for gid in list(affected_groups):
+            condor = self.open_condors.get(gid)
+            if condor is not None:
+                condor.is_open = False
+                del self.open_condors[gid]
+
+        return total_pnl
 
     # ------------------------------------------------------------------
     # Position monitoring
