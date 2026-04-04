@@ -204,6 +204,7 @@ class TestOpenIronCondor:
                 buy_put_strike=2250,
                 quantity=1.0,
                 underlying_price=2500.0,
+                execution_mode="chaser",
             )
 
         assert condor is not None
@@ -430,7 +431,7 @@ class TestOpenIronCondor:
                 sell_put_symbol="SP", buy_put_symbol="BP",
                 sell_call_strike=2700, buy_call_strike=2750,
                 sell_put_strike=2300, buy_put_strike=2250,
-                quantity=1.0, underlying_price=2500.0,
+                quantity=1.0, underlying_price=2500.0, execution_mode="chaser",
             )
 
         assert condor is None
@@ -463,7 +464,7 @@ class TestOpenIronCondor:
                 sell_put_symbol="SP", buy_put_symbol="BP",
                 sell_call_strike=2700, buy_call_strike=2750,
                 sell_put_strike=2300, buy_put_strike=2250,
-                quantity=1.0, underlying_price=2500.0,
+                quantity=1.0, underlying_price=2500.0, execution_mode="chaser",
             )
 
         assert condor is None
@@ -493,6 +494,7 @@ class TestOpenIronCondor:
                 buy_put_strike=2250,
                 quantity=1.0,
                 underlying_price=2500.0,
+                execution_mode="chaser",
             )
 
         assert condor is not None
@@ -509,7 +511,7 @@ class TestOpenIronCondor:
                 sell_put_symbol="SP", buy_put_symbol="BP",
                 sell_call_strike=2700, buy_call_strike=2750,
                 sell_put_strike=2300, buy_put_strike=2250,
-                quantity=1.0, underlying_price=2500.0,
+                quantity=1.0, underlying_price=2500.0, execution_mode="chaser",
             )
 
         assert condor is None
@@ -557,7 +559,7 @@ class TestCloseIronCondor:
             return legs
 
         with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_fill_close_legs):
-            pnl = pos_mgr.close_iron_condor(gid, reason="test")
+            pnl = pos_mgr.close_iron_condor(gid, reason="test", execution_mode="chaser")
         assert gid not in pos_mgr.open_condors
 
     def test_close_nonexistent(self, pos_mgr):
@@ -577,7 +579,7 @@ class TestCloseIronCondor:
             return legs
 
         with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_fill_close_legs):
-            total = pos_mgr.close_all(reason="emergency")
+            total = pos_mgr.close_all(reason="emergency", execution_mode="chaser")
         assert len(pos_mgr.open_condors) == 0
 
     def test_market_close_splits_into_one_btc_batches(self, pos_mgr, mock_client, storage):
@@ -618,7 +620,7 @@ class TestCloseIronCondor:
             OrderResult("ORD_BP_1", "BP", "SELL", 0.0, 0.0, 0.0, "NEW", 0.0, {}),
             _make_order_result(side="BUY", quantity=1.0, symbol="SC"),
             _make_order_result(side="SELL", quantity=1.0, symbol="BC"),
-            _make_order_result(side="SELL", quantity=0.6, symbol="BP"),
+            _make_order_result(side="SELL", quantity=0.4, symbol="BP"),
         ]
         mock_client.submit_order.side_effect = submit_results
         mock_client.query_order.side_effect = [
@@ -644,7 +646,7 @@ class TestCloseIronCondor:
 
         assert gid not in pos_mgr.open_condors
         assert [call.kwargs["symbol"] for call in mock_client.submit_order.call_args_list].count("BP") == 2
-        assert any(float(call.kwargs["quantity"]) == 0.6 for call in mock_client.submit_order.call_args_list)
+        assert any(float(call.kwargs["quantity"]) == 0.4 for call in mock_client.submit_order.call_args_list)
         assert mock_client.cancel_order.call_count >= 1
 
     def test_emergency_close_all_exchange_positions_splits_batches(self, pos_mgr, mock_client, storage):

@@ -108,6 +108,10 @@ class WeekendVolStrategy(BaseStrategy):
         self._equity_peak: float = 0.0
         self._last_loss_close_time: pd.Timestamp | None = None
         self._had_positions_prev: bool = False
+        self._entry_diagnostics: list[dict[str, Any]] = []
+        self._exit_diagnostics: list[dict[str, Any]] = []
+        self._pending_exit_diagnostic: dict[str, Any] | None = None
+        self._active_entry_time: pd.Timestamp | None = None
 
         hh, mm = self.entry_time_utc.split(":", 1)
         self.entry_hour = int(hh)
@@ -162,6 +166,65 @@ class WeekendVolStrategy(BaseStrategy):
         self.expire_hour = int(expire_cfg[1])
         self.target_hold_hours = float(expire_cfg[2])
 
+    def _normalize_iv(self, value: Any) -> float:
+        try:
+            iv = float(value)
+        except Exception:
+            iv = self.default_iv
+        if not np.isfinite(iv) or iv <= 0:
+            iv = self.default_iv
+        if iv > 3.0:
+            iv /= 100.0
+        return float(iv)
+
+    def _quote_reference_price(self, row: pd.Series) -> float:
+        bid = pd.to_numeric(pd.Series([row.get("bid_price")]), errors="coerce").iloc[0]
+        ask = pd.to_numeric(pd.Series([row.get("ask_price")]), errors="coerce").iloc[0]
+        mark = pd.to_numeric(pd.Series([row.get("mark_price")]), errors="coerce").iloc[0]
+        if np.isfinite(bid) and np.isfinite(ask) and float(bid) > 0 and float(ask) > 0:
+            return float((float(bid) + float(ask)) / 2.0)
+        if np.isfinite(mark) and float(mark) > 0:
+            return float(mark)
+        return 0.0
+
+    def get_diagnostics(self) -> dict[str, Any]:
+        return {
+            "weekend_vol_entries": list(self._entry_diagnostics),
+            "weekend_vol_exits": list(self._exit_diagnostics),
+        }
+
+    def on_fill(self, context, fill) -> None:
+        if self._pending_exit_diagnostic is None:
+            return
+        if context.positions:
+            return
+        exit_diag = dict(self._pending_exit_diagnostic)
+        exit_diag["exit_time"] = pd.Timestamp(fill.timestamp)
+        self._exit_diagnostics.append(exit_diag)
+        self._pending_exit_diagnostic = None
+        self._active_entry_time = None
+
+    def _queue_exit_diagnostic(
+        self,
+        reason: str,
+        now: pd.Timestamp,
+        basket_pnl_pct: float | None,
+        context,
+        total_unrealized: float | None = None,
+    ) -> None:
+        self._pending_exit_diagnostic = {
+            "entry_time": None if self._active_entry_time is None else pd.Timestamp(self._active_entry_time),
+            "trigger_time": pd.Timestamp(now),
+            "reason": str(reason),
+            "basket_pnl_pct": None if basket_pnl_pct is None else float(basket_pnl_pct),
+            "spot": float(context.underlying_price),
+            "position_count": int(len(context.positions)),
+            "entry_spot": None if self._active_entry_spot is None else float(self._active_entry_spot),
+            "account_balance": float(context.account.balance),
+            "account_equity": float(context.account.equity(0.0 if total_unrealized is None else total_unrealized)),
+            "stop_loss_pct": float(self.stop_loss_pct),
+        }
+
     def on_step(self, context) -> None:
         now = pd.Timestamp(context.current_time)
         if now.tzinfo is None:
@@ -194,6 +257,7 @@ class WeekendVolStrategy(BaseStrategy):
 
         if context.positions and self._should_exit(now):
             self.log(f"Close weekend basket at scheduled time {now.isoformat()}")
+            self._queue_exit_diagnostic("scheduled_close", now, None, context)
             context.close_all()
             self._had_positions_prev = bool(context.positions)
             return
@@ -259,20 +323,21 @@ class WeekendVolStrategy(BaseStrategy):
         if len(exp_arr) == 0:
             return pd.DataFrame()
 
-        valid_mask = exp_arr.notna() & (exp_arr.view("int64") > now.value)
+        exp_arr_ns = exp_arr.astype("int64", copy=False)
+        valid_mask = exp_arr.notna() & (exp_arr_ns > now.value)
         if not np.any(valid_mask):
             return pd.DataFrame()
 
         target_close = self._target_close_ts(now)
         if self.expiry_selection == "first_after_close":
-            after_close = valid_mask & (exp_arr.view("int64") >= target_close.value)
+            after_close = valid_mask & (exp_arr_ns >= target_close.value)
             if not np.any(after_close):
                 return pd.DataFrame()
             future_expiries = exp_arr[after_close]
             best_expiry = future_expiries.min()
             return chain[exp_arr == best_expiry].copy()
 
-        diff_hours = (exp_arr.view("int64") - target_close.value) / 3_600_000_000_000.0
+        diff_hours = (exp_arr_ns - target_close.value) / 3_600_000_000_000.0
         mask = valid_mask & (np.abs(diff_hours) <= self.expiry_tolerance_hours)
         if not np.any(mask):
             return pd.DataFrame()
@@ -282,7 +347,8 @@ class WeekendVolStrategy(BaseStrategy):
             return df
 
         expiry_col = pd.to_datetime(df["expiration_date"], utc=True, errors="coerce")
-        diff_hours = (expiry_col.view("int64") - target_close.value) / 3_600_000_000_000.0
+        expiry_col_ns = expiry_col.astype("int64", copy=False)
+        diff_hours = (expiry_col_ns - target_close.value) / 3_600_000_000_000.0
         best_expiry = expiry_col.iloc[int(np.argmin(np.abs(diff_hours)))]
         return df.loc[expiry_col == best_expiry].copy()
 
@@ -473,6 +539,34 @@ class WeekendVolStrategy(BaseStrategy):
         short_call_name = str(short_call["instrument_name"])
         short_put_name = str(short_put["instrument_name"])
         tranche_idx = self._entry_tranches_done + 1
+        realized_vol = None
+        if self.entry_realized_vol_lookback_hours > 1:
+            realized_vol = self._recent_realized_vol(context, now, self.entry_realized_vol_lookback_hours)
+
+        short_call_iv = self._normalize_iv(short_call.get("mark_iv", self.default_iv))
+        short_put_iv = self._normalize_iv(short_put.get("mark_iv", self.default_iv))
+        short_call_premium = self._quote_reference_price(short_call)
+        short_put_premium = self._quote_reference_price(short_put)
+
+        self._entry_diagnostics.append(
+            {
+                "entry_time": pd.Timestamp(now),
+                "tranche_index": tranche_idx,
+                "fraction": float(fraction),
+                "spot": spot,
+                "rv_24h": None if realized_vol is None else float(realized_vol),
+                "short_call_symbol": short_call_name,
+                "short_call_delta": float(short_call.get("delta", np.nan)),
+                "short_call_iv": short_call_iv,
+                "short_call_premium": short_call_premium,
+                "short_put_symbol": short_put_name,
+                "short_put_delta": float(short_put.get("delta", np.nan)),
+                "short_put_iv": short_put_iv,
+                "short_put_premium": short_put_premium,
+                "combined_short_premium_per_btc": short_call_premium + short_put_premium,
+                "avg_short_iv": (short_call_iv + short_put_iv) / 2.0,
+            }
+        )
 
         if active_wing_delta > 0 and wing_call is not None and wing_put is not None:
             wing_call_name = str(wing_call["instrument_name"])
@@ -500,6 +594,7 @@ class WeekendVolStrategy(BaseStrategy):
             context.sell(short_put_name, qty)
 
         if self._entry_tranches_done == 0:
+            self._active_entry_time = pd.Timestamp(now)
             self._active_entry_spot = spot
             self._active_trade_entry_equity = float(context.account.balance)
             self._active_basket_pnl_peak_pct = 0.0
@@ -629,6 +724,7 @@ class WeekendVolStrategy(BaseStrategy):
                     f"Close weekend basket: spot move {spot_move:.2%} "
                     f">= {self.underlying_move_stop_pct:.2%} from entry"
                 )
+                self._queue_exit_diagnostic("underlying_move_stop", now, basket_pnl_pct, context, total_unrealized)
                 context.close_all()
                 return True
 
@@ -639,6 +735,7 @@ class WeekendVolStrategy(BaseStrategy):
                     f"Close weekend basket: unrealized loss/equity {loss_ratio:.2%} "
                     f">= {self.max_loss_equity_pct:.2%}"
                 )
+                self._queue_exit_diagnostic("max_loss_equity", now, basket_pnl_pct, context, total_unrealized)
                 context.close_all()
                 return True
 
@@ -649,6 +746,7 @@ class WeekendVolStrategy(BaseStrategy):
             self.log(
                 f"Take profit on weekend basket: {basket_pnl_pct:.1f}% >= {self.take_profit_pct:.1f}%"
             )
+            self._queue_exit_diagnostic("take_profit", now, basket_pnl_pct, context, total_unrealized)
             context.close_all()
             return True
 
@@ -656,6 +754,7 @@ class WeekendVolStrategy(BaseStrategy):
             self.log(
                 f"Stop loss on weekend basket: {basket_pnl_pct:.1f}% <= -{self.stop_loss_pct:.1f}%"
             )
+            self._queue_exit_diagnostic("stop_loss", now, basket_pnl_pct, context, total_unrealized)
             context.close_all()
             return True
 

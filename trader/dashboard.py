@@ -68,7 +68,7 @@ from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.binance_client import BinanceOptionsClient
 from trader.position_manager import PositionManager, IronCondorPosition, CondorLeg
 from trader.limit_chaser import ChaserConfig as DashboardChaserConfig
-from trader.strategy import estimate_binance_combo_open_margin_per_unit
+from trader.order_preview import compute_option_order_preview
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -1728,7 +1728,11 @@ elif page == "🔧 策略配置":
                 ed_entry_time = st.time_input("开仓时间 (UTC)", value=_entry_time, step=_dt.timedelta(minutes=1), help="每日开仓的 UTC 时间（精确到分钟）")
 
             with s_col2:
-                ed_quantity = st.number_input("基础数量", min_value=0.001, max_value=100.0, value=float(_strategy.get("quantity", 0.01)), step=0.01, format="%.3f", help="每组策略的合约数量")
+                if ed_mode == "weekend_vol":
+                    ed_quantity = float(_strategy.get("quantity", 0.0) or 0.0)
+                    st.caption("基础数量：weekend_vol 实盘复利模式下不使用该参数")
+                else:
+                    ed_quantity = st.number_input("基础数量", min_value=0.001, max_value=100.0, value=float(_strategy.get("quantity", 0.01)), step=0.01, format="%.3f", help="每组策略的合约数量")
                 ed_max_pos = st.number_input("最大持仓组数", min_value=1, max_value=20, value=_strategy.get("max_positions", 1), step=1)
 
             with s_col3:
@@ -1786,7 +1790,6 @@ elif page == "🔧 策略配置":
                     "entry_day": ed_entry_day,
                     "default_iv": round(ed_default_iv, 4),
                     "entry_time_utc": ed_entry_time.strftime("%H:%M"),
-                    "quantity": ed_quantity,
                     "max_positions": ed_max_pos,
                     "max_capital_pct": round(ed_max_cap / 100, 4),
                     "compound": ed_compound,
@@ -1805,6 +1808,8 @@ elif page == "🔧 策略配置":
                     "equity_snapshot_interval_sec": ed_snapshot,
                 },
             }
+            if ed_mode != "weekend_vol":
+                _new_cfg["strategy"]["quantity"] = ed_quantity
             try:
                 _header = (
                     "# ============================================================\n"
@@ -2000,54 +2005,37 @@ elif page == "🔧 策略配置":
             )
 
             if _has_all_legs:
-                # Compute quantity
-                import math as _math
-                _base_qty = cfg.strategy.quantity
-                _pv_qty = _base_qty
+                _base_qty = 0.0 if _pv_mode == "weekend_vol" else cfg.strategy.quantity
                 _pv_equity = 0.0
                 _pv_available = 0.0
-                _pv_equity_src = "配置基础数量"
-                _margin_per = estimate_binance_combo_open_margin_per_unit(
-                    index_price=_pv_spot,
-                    sell_call=_sell_call,
-                    sell_put=_sell_put,
-                    buy_call=_buy_call,
-                    buy_put=_buy_put,
-                )
+                _pv_equity_src = "自动仓位" if _pv_mode == "weekend_vol" else "配置基础数量"
                 if cfg.strategy.compound:
                     try:
                         _pv_acct = _pv_client.get_account()
                         _pv_equity = _pv_acct.total_balance
                         _pv_available = max(float(getattr(_pv_acct, "available_balance", 0.0) or 0.0), 0.0)
-                        if _pv_equity > 0 and _pv_spot > 0:
-                            if _pv_mode == "weekend_vol":
-                                # Weekend vol: leverage-based sizing
-                                _lev_cfg = getattr(cfg.strategy, "leverage", 1.0)
-                                _pv_qty_raw = (_pv_equity * _lev_cfg) / _pv_spot
-                                _pv_qty = _math.floor(_pv_qty_raw * 10) / 10
-                                if _margin_per > 0:
-                                    _budget = _pv_available if _pv_available > 0 else _pv_equity
-                                    _qty_by_margin = _math.floor(_budget / _margin_per * 10) / 10
-                                    _pv_qty = min(_pv_qty, _qty_by_margin)
-                                if _pv_qty >= _base_qty:
-                                    _pv_qty = max(_base_qty, _pv_qty)
-                                _pv_equity_src = f"实时权益(复利 {_lev_cfg:.0f}x)"
-                            else:
-                                _max_notional = _pv_equity * cfg.strategy.max_capital_pct
-                                if _pv_available > 0:
-                                    _max_notional = min(_max_notional, _pv_available)
-                                if _margin_per <= 0:
-                                    if _pv_mode == "strangle":
-                                        _margin_per = _otm * _pv_spot * 2
-                                    else:
-                                        _ww = _wing * _pv_spot
-                                        _margin_per = _ww * 2 if _ww > 0 else _otm * _pv_spot * 2
-                                if _margin_per > 0:
-                                    _scaled = _math.floor(_max_notional / _margin_per * 100) / 100
-                                    _pv_qty = _scaled if 0 < _scaled < _base_qty else max(_base_qty, _scaled)
-                                _pv_equity_src = "实时权益(复利)"
                     except Exception:
                         _pv_equity_src = "权益获取失败, 用基础数量"
+
+                _preview = compute_option_order_preview(
+                    mode=_pv_mode,
+                    spot=_pv_spot,
+                    base_quantity=_base_qty,
+                    compound=cfg.strategy.compound,
+                    equity=_pv_equity,
+                    available_balance=_pv_available,
+                    leverage=getattr(cfg.strategy, "leverage", 1.0),
+                    max_capital_pct=getattr(cfg.strategy, "max_capital_pct", 0.0),
+                    otm_pct=_otm,
+                    wing_width_pct=_wing,
+                    sell_call=_sell_call,
+                    sell_put=_sell_put,
+                    buy_call=_buy_call,
+                    buy_put=_buy_put,
+                )
+                _pv_qty = float(_preview["quantity"])
+                _pv_equity_src = _preview["equity_source"] if _pv_equity_src != "权益获取失败, 用基础数量" else _pv_equity_src
+                _margin_per = float(_preview["margin_per_unit"])
 
                 # Prices in USD (Binance option native quote unit)
                 _preview_fallback_iv = getattr(cfg.strategy, "default_iv", 0.60)
@@ -2058,27 +2046,27 @@ elif page == "🔧 策略配置":
 
                 if not _is_ic:
                     # ---- Strangle / weekend_vol without wings P&L ----
-                    _premium_per = _sc_bid + _sp_bid
-                    _total_premium = _premium_per * _pv_qty
-                    _margin_used = _margin_per * _pv_qty if _margin_per > 0 else _otm * _pv_spot * 2 * _pv_qty
-                    _be_upper = _sell_call.strike + _premium_per
-                    _be_lower = _sell_put.strike - _premium_per
+                    _premium_per = float(_preview["premium_per_unit"])
+                    _total_premium = float(_preview["total_premium"])
+                    _margin_used = float(_preview["margin_used"])
+                    _be_upper = float(_preview["break_even_upper"])
+                    _be_lower = float(_preview["break_even_lower"])
                 else:
                     # ---- Iron Condor P&L ----
                     _lc_bid = _buy_call.bid_price
                     _lc_ask = _buy_call.ask_price
                     _lp_bid = _buy_put.bid_price
                     _lp_ask = _buy_put.ask_price
-                    _premium_per = (_sc_bid + _sp_bid) - (_lc_ask + _lp_ask)
+                    _premium_per = float(_preview["premium_per_unit"])
                     _call_width = _buy_call.strike - _sell_call.strike
                     _put_width = _sell_put.strike - _buy_put.strike
                     _max_wing = max(_call_width, _put_width)
                     _max_loss_per = _max_wing - _premium_per
-                    _total_premium = _premium_per * _pv_qty
-                    _total_max_loss = _max_loss_per * _pv_qty
-                    _margin_used = _margin_per * _pv_qty if _margin_per > 0 else _max_wing * 2 * _pv_qty
-                    _be_upper = _sell_call.strike + _premium_per
-                    _be_lower = _sell_put.strike - _premium_per
+                    _total_premium = float(_preview["total_premium"])
+                    _total_max_loss = float(_preview["total_max_loss"] or (_max_loss_per * _pv_qty))
+                    _margin_used = float(_preview["margin_used"])
+                    _be_upper = float(_preview["break_even_upper"])
+                    _be_lower = float(_preview["break_even_lower"])
 
                 _pv_ok = True
 
@@ -3017,7 +3005,7 @@ elif page == "🖥 引擎状态":
                     if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0
                     else "关闭"
                 ),
-                str(cfg.strategy.quantity),
+                "自动" if _cs_mode == "weekend_vol" else str(cfg.strategy.quantity),
                 "✅" if cfg.strategy.compound else "❌",
                 "测试网" if cfg.exchange.testnet else "正式环境",
             ],

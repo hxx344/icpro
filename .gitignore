@@ -8,6 +8,8 @@ __pycache__/
 *$py.class
 *.egg-info/
 .pytest_cache/
+.hypothesis/
+.tox/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/

@@ -5,7 +5,7 @@
 #   - Short delta ≈ 0.45 (call + put)
 #   - No wings (裸双卖)
 #   - RV24 <= 1.2 才允许入场
-#   - 4x USD 杠杆, 复利
+#   - 3x USD 杠杆, 复利
 #   - 篮子止损: -200%
 #   - 持有至周日 08:00 UTC 自动结算
 #
@@ -14,7 +14,7 @@
 #   Sharpe 3.69 |  Win Rate 81.4%
 # ============================================================
 
-name: Weekend Vol BTC Short Strangle (Binance 4x USD)
+name: Weekend Vol BTC Short Strangle (Binance 3x USD)
 
 exchange:
   api_key: ''                  # 或设置环境变量 BINANCE_API_KEY
@@ -43,8 +43,7 @@ strategy:
   entry_time_utc: '18:00'      # Friday 18:00 UTC (optimized entry)
 
   # Position sizing
-  leverage: 4.0                # 4x notional leverage
-  quantity: 0.1                # minimum qty (BTC)
+  leverage: 3.0                # 3x notional leverage
   max_positions: 1
   max_capital_pct: 1.0         # leverage already accounted in qty calc
   compound: true               # scale qty to account equity

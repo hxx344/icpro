@@ -615,7 +615,7 @@ class WeekendVolStrategy:
     - target_delta : 0.40 (|δ| for short legs)
     - wing_delta   : 0.05 (|δ| for protection legs, 0 → strangle)
     - max_delta_diff : 0.20 (actual |δ| vs target |δ| max deviation)
-    - leverage     : 4.0
+    - leverage     : 3.0
     - entry_day    : "friday"
     - entry_time_utc : "18:00"
     - underlying   : "BTC"
@@ -1177,7 +1177,7 @@ class WeekendVolStrategy:
           qty_asset = (account_equity_usd × leverage) / spot
           Rounded down to 0.1 underlying increments.
         """
-        base_qty = self.cfg.quantity
+        base_qty = 0.0
         ul = self.cfg.underlying.upper()
 
         if self.cfg.compound:
@@ -1204,9 +1204,7 @@ class WeekendVolStrategy:
 
                     # Round down to 0.1 underlying units
                     qty = math.floor(qty * 10) / 10
-                    base_qty = max(self.cfg.quantity, qty)
-                    if 0 < qty < self.cfg.quantity:
-                        base_qty = qty
+                    base_qty = max(qty, 0.0)
                     logger.info(
                         f"[WeekendVol] qty: equity={equity:.2f} USD, "
                         f"available_balance={available_balance:.2f} USD, "
@@ -1218,6 +1216,8 @@ class WeekendVolStrategy:
                     )
             except Exception as e:
                 logger.warning(f"[WeekendVol] Could not compute compound qty: {e}")
+        else:
+            base_qty = self.cfg.quantity
 
         return base_qty
 

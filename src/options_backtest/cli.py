@@ -123,6 +123,7 @@ STRATEGY_MAP = {
 STRATEGY_MAP.update({
     "nakedcall": "options_backtest.strategy.naked_call.NakedCallStrategy",
     "weekendvol": "options_backtest.strategy.weekend_vol.WeekendVolStrategy",
+    "weekendvolbacktest": "options_backtest.strategy.weekend_vol_backtest.WeekendVolBacktestStrategy",
     "longstrangle": "options_backtest.strategy.long_strangle.LongStrangleStrategy",
 })
 

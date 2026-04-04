@@ -187,7 +187,7 @@ class MockClient:
         for t in self._tickers:
             if t.symbol == symbol:
                 return t
-        return _make_ticker(symbol=symbol)
+        return _make_ticker(symbol=symbol, bid_price=100.0, ask_price=104.0, mark_price=102.0)
 
     def query_order(self, symbol, order_id):
         return OrderResult(
@@ -596,6 +596,7 @@ class TestPositionManager:
             sell_put_strike=85000,
             quantity=0.1,
             underlying_price=87000,
+            execution_mode="chaser",
         )
         assert condor is not None
         assert condor.is_open
@@ -617,6 +618,7 @@ class TestPositionManager:
             buy_put_strike=80000,
             quantity=0.1,
             underlying_price=87000,
+            execution_mode="chaser",
         )
         assert condor is not None
         assert condor.is_open
@@ -638,10 +640,11 @@ class TestPositionManager:
             buy_put_strike=80000,
             quantity=0.1,
             underlying_price=87000,
+            execution_mode="chaser",
         )
         assert condor is not None
 
-        pnl = pm.close_iron_condor(condor.group_id, reason="test")
+        pnl = pm.close_iron_condor(condor.group_id, reason="test", execution_mode="chaser")
         assert pm.open_position_count == 0
         # PnL is some value (depends on mock fills)
         assert isinstance(pnl, float)
@@ -652,13 +655,15 @@ class TestPositionManager:
 
         pm.open_short_strangle(
             "SYM1", "SYM2", 90000, 85000, 0.1, 87000,
+            execution_mode="chaser",
         )
         pm.open_short_strangle(
             "SYM3", "SYM4", 91000, 84000, 0.1, 87000,
+            execution_mode="chaser",
         )
         assert pm.open_position_count == 2
 
-        total = pm.close_all("test_close")
+        total = pm.close_all("test_close", execution_mode="chaser")
         assert pm.open_position_count == 0
         assert isinstance(total, float)
 
@@ -669,6 +674,7 @@ class TestPositionManager:
         condor = pm.open_short_strangle(
             "BTC-260328-90000-C", "BTC-260328-85000-P",
             90000, 85000, 1.0, 87000,
+            execution_mode="chaser",
         )
         assert condor is not None
 
@@ -684,7 +690,7 @@ class TestPositionManager:
         client = MockClient()
         pm = PositionManager(client, storage)
 
-        pm.open_short_strangle("S1", "S2", 90000, 85000, 0.1, 87000)
+        pm.open_short_strangle("S1", "S2", 90000, 85000, 0.1, 87000, execution_mode="chaser")
         summary = pm.summary()
         assert summary["open_condors"] == 1
         assert "condors" in summary
@@ -696,6 +702,7 @@ class TestPositionManager:
 
         condor = pm.open_short_strangle(
             "SYM1", "SYM2", 90000, 85000, 0.1, 87000,
+            execution_mode="chaser",
         )
         assert condor is not None
         gid = condor.group_id
@@ -812,7 +819,7 @@ class TestOptionSellingStrategy:
         strategy = OptionSellingStrategy(client, pm, storage, cfg)
 
         # Open a position
-        pm.open_short_strangle("S1", "S2", 90000, 85000, 0.1, 87000)
+        pm.open_short_strangle("S1", "S2", 90000, 85000, 0.1, 87000, execution_mode="chaser")
 
         now = datetime(2026, 3, 24, 9, 0, 0, tzinfo=timezone.utc)
         today = "2026-03-24"
@@ -899,6 +906,87 @@ class TestOptionSellingStrategy:
         status = strategy.status()
         assert status["mode"] == "iron_condor"
         assert status["underlying"] == "BTC"
+
+    def test_market_open_flow_persists_position_end_to_end(self, storage):
+        client = MockClient(spot=90000.0, equity=20000.0)
+        now = datetime.now(timezone.utc)
+        expiry = now + timedelta(days=7)
+        expiry_code = expiry.strftime("%y%m%d")
+        client._tickers = [
+            _make_ticker(
+                symbol=f"BTC-{expiry_code}-99000-C",
+                underlying="BTC",
+                strike=99000.0,
+                option_type="call",
+                expiry=expiry,
+                bid_price=110.0,
+                ask_price=114.0,
+                mark_price=112.0,
+                underlying_price=90000.0,
+            ),
+            _make_ticker(
+                symbol=f"BTC-{expiry_code}-81000-P",
+                underlying="BTC",
+                strike=81000.0,
+                option_type="put",
+                expiry=expiry,
+                bid_price=108.0,
+                ask_price=112.0,
+                mark_price=110.0,
+                underlying_price=90000.0,
+            ),
+        ]
+
+        def _submit_and_track_position(symbol, side, quantity, order_type="MARKET",
+                                       price=None, time_in_force=None, reduce_only=False, client_order_id=None):
+            result = client.place_order(
+                symbol=symbol,
+                side=side,
+                quantity=quantity,
+                order_type=order_type,
+                price=price,
+                reduce_only=reduce_only,
+                client_order_id=client_order_id,
+            )
+            if not reduce_only:
+                client._positions.append(
+                    {
+                        "symbol": symbol,
+                        "side": "SHORT" if str(side).upper() == "SELL" else "LONG",
+                        "quantity": float(quantity),
+                        "entryPrice": float(result.avg_price or result.price or 0.0),
+                        "unrealizedPnl": 0.0,
+                    }
+                )
+            return result
+
+        client.submit_order = _submit_and_track_position
+        pm = PositionManager(client, storage)
+        cfg = StrategyConfig(
+            mode="strangle",
+            underlying="BTC",
+            quantity=0.1,
+            compound=False,
+            target_dte_days=7,
+            dte_window_hours=48,
+            entry_time_utc="00:00",
+            otm_pct=0.10,
+            wait_for_midpoint=False,
+        )
+
+        strategy = OptionSellingStrategy(client, pm, storage, cfg)
+        today = now.strftime("%Y-%m-%d")
+
+        strategy._try_open_condor(now, today)
+
+        assert strategy._last_trade_date == today
+        assert pm.open_position_count == 1
+        open_trades = storage.get_open_trades()
+        assert len(open_trades) == 2
+        assert {t["symbol"] for t in open_trades} == {
+            f"BTC-{expiry_code}-99000-C",
+            f"BTC-{expiry_code}-81000-P",
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1134,6 +1222,7 @@ class TestWeekendVolStrategy:
         condor = pm.open_short_strangle(
             "BTC-260322-90000-C", "BTC-260322-85000-P",
             90000, 85000, 0.1, 87000,
+            execution_mode="chaser",
         )
         assert condor is not None
         assert pm.open_position_count == 1
@@ -1154,6 +1243,7 @@ class TestWeekendVolStrategy:
         condor = pm.open_short_strangle(
             "BTC-260329-90000-C", "BTC-260329-85000-P",
             90000, 85000, 0.1, 87000,
+            execution_mode="chaser",
         )
         assert pm.open_position_count == 1
 

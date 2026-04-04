@@ -767,7 +767,7 @@ class BinanceOptionsClient:
         if order_id:
             params["orderId"] = order_id
         elif client_order_id:
-            params["clientOrderId"] = client_order_id
+            params["origClientOrderId"] = client_order_id
         else:
             raise ValueError("Either order_id or client_order_id is required")
         try:

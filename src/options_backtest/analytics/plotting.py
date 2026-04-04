@@ -10,6 +10,40 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
+def _build_weekend_vol_entry_df(results: dict) -> pd.DataFrame:
+    diagnostics = (results.get("strategy_diagnostics") or {}).get("weekend_vol_entries") or []
+    if not diagnostics:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(diagnostics).copy()
+    if df.empty or "entry_time" not in df.columns:
+        return pd.DataFrame()
+
+    df["entry_time"] = pd.to_datetime(df["entry_time"], utc=True, errors="coerce")
+    df = df.dropna(subset=["entry_time"]).sort_values("entry_time").reset_index(drop=True)
+
+    trades = pd.DataFrame(results.get("closed_trades", []) or [])
+    if not trades.empty and {"entry_time", "direction", "entry_price"}.issubset(trades.columns):
+        trades["entry_time"] = pd.to_datetime(trades["entry_time"], utc=True, errors="coerce")
+        short_premium = (
+            trades.loc[trades["direction"].astype(str).str.lower() == "short"]
+            .groupby("entry_time", as_index=False)["entry_price"]
+            .sum()
+            .rename(columns={"entry_price": "combined_short_premium_actual"})
+        )
+        df = df.merge(short_premium, on="entry_time", how="left")
+    else:
+        df["combined_short_premium_actual"] = np.nan
+
+    df["combined_short_premium"] = df["combined_short_premium_actual"].where(
+        df["combined_short_premium_actual"].notna(),
+        pd.to_numeric(df.get("combined_short_premium_per_btc"), errors="coerce"),
+    )
+    df["rv_24h"] = pd.to_numeric(df.get("rv_24h"), errors="coerce")
+    df["avg_short_iv"] = pd.to_numeric(df.get("avg_short_iv"), errors="coerce")
+    return df
+
+
 def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
     """Plot equity curve and drawdown, save as HTML. Returns the file path."""
     equity_history = results.get("equity_history", [])
@@ -28,6 +62,8 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
         df = pd.DataFrame(equity_history, columns=["timestamp", "equity", "balance", "unrealized_pnl"])
         df["underlying_price"] = 0.0
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+    entry_df = _build_weekend_vol_entry_df(results)
+    has_entry_diag = not entry_df.empty
 
     # Drawdown
     running_max = np.maximum.accumulate(df["equity"].values)
@@ -37,15 +73,36 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
     # For USD margin, the primary equity series is already USD and should not
     # be labelled as BTC or duplicated in a second USD panel.
     has_usd_panel = (not is_usd_margin) and (df["underlying_price"].iloc[0] > 0)
-    n_rows = 3 if has_usd_panel else 2
-    row_heights = [0.45, 0.25, 0.30] if has_usd_panel else [0.7, 0.3]
-    if is_usd_margin:
-        subtitles = ("Equity Curve (USD)", "Drawdown")
+    if has_usd_panel:
+        n_rows = 4 if has_entry_diag else 3
+        row_heights = [0.40, 0.22, 0.16, 0.22] if has_entry_diag else [0.45, 0.25, 0.30]
     else:
-        subtitles = ("Equity Curve ({})".format(underlying), "Equity Curve (USD)", "Drawdown ({})".format(underlying)) if has_usd_panel else ("Equity Curve ({})".format(underlying), "Drawdown")
+        n_rows = 3 if has_entry_diag else 2
+        row_heights = [0.58, 0.17, 0.25] if has_entry_diag else [0.7, 0.3]
+
+    if is_usd_margin:
+        subtitles = ("Equity Curve (USD)", "Entry Diagnostics", "Drawdown") if has_entry_diag else ("Equity Curve (USD)", "Drawdown")
+    else:
+        subtitles = (
+            ("Equity Curve ({})".format(underlying), "Equity Curve (USD)", "Entry Diagnostics", "Drawdown ({})".format(underlying))
+            if has_usd_panel and has_entry_diag
+            else ("Equity Curve ({})".format(underlying), "Equity Curve (USD)", "Drawdown ({})".format(underlying))
+            if has_usd_panel
+            else ("Equity Curve ({})".format(underlying), "Entry Diagnostics", "Drawdown")
+            if has_entry_diag
+            else ("Equity Curve ({})".format(underlying), "Drawdown")
+        )
+
+    specs = [[{}] for _ in range(n_rows)]
+    if has_entry_diag:
+        diag_row = 3 if has_usd_panel else 2
+        specs[diag_row - 1] = [{"secondary_y": True}]
+    else:
+        diag_row = -1
 
     fig = make_subplots(
         rows=n_rows, cols=1, shared_xaxes=True,
+        specs=specs,
         row_heights=row_heights,
         subplot_titles=subtitles,
         vertical_spacing=0.06,
@@ -113,8 +170,69 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
         )
         fig.update_yaxes(title_text="USD", row=2, col=1)
 
+    if has_entry_diag:
+        hover_text = np.column_stack(
+            [
+                entry_df.get("short_call_symbol", pd.Series([""] * len(entry_df))).fillna(""),
+                pd.to_numeric(entry_df.get("short_call_delta"), errors="coerce").fillna(np.nan),
+                pd.to_numeric(entry_df.get("short_call_iv"), errors="coerce").fillna(np.nan) * 100.0,
+                entry_df.get("short_put_symbol", pd.Series([""] * len(entry_df))).fillna(""),
+                pd.to_numeric(entry_df.get("short_put_delta"), errors="coerce").fillna(np.nan),
+                pd.to_numeric(entry_df.get("short_put_iv"), errors="coerce").fillna(np.nan) * 100.0,
+            ]
+        )
+
+        fig.add_trace(
+            go.Bar(
+                x=entry_df["entry_time"],
+                y=entry_df["combined_short_premium"],
+                name="Short Call+Put Premium (1 BTC)",
+                marker_color="rgba(255, 152, 0, 0.55)",
+                customdata=hover_text,
+                hovertemplate=(
+                    "Time: %{x}<br>"
+                    "Combined premium: %{y:,.2f}<br>"
+                    "Call: %{customdata[0]} Δ=%{customdata[1]:.3f} IV=%{customdata[2]:.1f}%<br>"
+                    "Put: %{customdata[3]} Δ=%{customdata[4]:.3f} IV=%{customdata[5]:.1f}%<extra></extra>"
+                ),
+            ),
+            row=diag_row,
+            col=1,
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=entry_df["entry_time"],
+                y=entry_df["rv_24h"] * 100.0,
+                mode="lines+markers",
+                name="RV 24h",
+                line=dict(color="#8E24AA", width=1.4),
+                marker=dict(size=6),
+                hovertemplate="Time: %{x}<br>RV 24h: %{y:.2f}%<extra></extra>",
+            ),
+            row=diag_row,
+            col=1,
+            secondary_y=True,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=entry_df["entry_time"],
+                y=entry_df["avg_short_iv"] * 100.0,
+                mode="lines+markers",
+                name="Avg Short IV",
+                line=dict(color="#00897B", width=1.4),
+                marker=dict(size=6),
+                hovertemplate="Time: %{x}<br>Avg short IV: %{y:.2f}%<extra></extra>",
+            ),
+            row=diag_row,
+            col=1,
+            secondary_y=True,
+        )
+        fig.update_yaxes(title_text="Premium (USD)", row=diag_row, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="RV / IV %", row=diag_row, col=1, secondary_y=True)
+
     # Drawdown
-    dd_row = 3 if has_usd_panel else 2
+    dd_row = n_rows
     fig.add_trace(
         go.Scatter(
             x=df["timestamp"], y=drawdown,
@@ -127,7 +245,7 @@ def plot_equity_curve(results: dict, output_dir: str = "reports") -> str:
 
     fig.update_layout(
         title="Backtest: Equity & Drawdown",
-        height=750 if has_usd_panel else 600,
+        height=900 if has_usd_panel and has_entry_diag else 750 if has_usd_panel else 760 if has_entry_diag else 600,
         template="plotly_white",
         legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"),
     )

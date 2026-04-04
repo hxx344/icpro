@@ -48,7 +48,7 @@ class TestAccount:
 
 
 class TestMatcher:
-    def test_fill_mid_price(self):
+    def test_fill_touch_price(self):
         matcher = Matcher(ExecutionConfig(slippage=0.0))
         order = OrderRequest(
             instrument_name="BTC-CALL",
@@ -57,19 +57,19 @@ class TestMatcher:
         )
         fill = matcher.execute(order, NOW, bid_price=0.05, ask_price=0.06, mark_price=0.055, underlying_price=80000)
         assert fill is not None
-        assert fill.fill_price == pytest.approx(0.055)  # mid price, no slippage
+        assert fill.fill_price == pytest.approx(0.06)  # top-of-book ask for buys
         assert fill.fee > 0
 
-    def test_slippage_buy(self):
+    def test_slippage_buy_on_mark_fallback(self):
         matcher = Matcher(ExecutionConfig(slippage=0.001))
         order = OrderRequest(instrument_name="X", direction=Direction.LONG, quantity=1)
-        fill = matcher.execute(order, NOW, 0.05, 0.06, 0.055, 80000)
+        fill = matcher.execute(order, NOW, None, None, 0.055, 80000)
         assert fill.fill_price == pytest.approx(0.055 + 0.001)
 
-    def test_slippage_sell(self):
+    def test_slippage_sell_on_mark_fallback(self):
         matcher = Matcher(ExecutionConfig(slippage=0.001))
         order = OrderRequest(instrument_name="X", direction=Direction.SHORT, quantity=1)
-        fill = matcher.execute(order, NOW, 0.05, 0.06, 0.055, 80000)
+        fill = matcher.execute(order, NOW, None, None, 0.055, 80000)
         assert fill.fill_price == pytest.approx(0.055 - 0.001)
 
     def test_fee_cap(self):

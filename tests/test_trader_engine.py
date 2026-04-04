@@ -361,3 +361,39 @@ class TestEngineEquityIntegration:
         assert engine.strategy is not None
 
         engine.stop(timeout=5.0)
+
+    def test_engine_start_recovers_exchange_positions_into_status(self, sim_config, tmp_path):
+        """引擎启动应把交易所已有仓位恢复到本地并反映到状态里。"""
+        sim_config.storage.db_path = str(tmp_path / "recover.db")
+        sim_config.strategy.underlying = "ETH"
+
+        client = MagicMock(spec=BinanceOptionsClient)
+        client.get_account.return_value = AccountInfo(
+            total_balance=10.0,
+            available_balance=8.0,
+            unrealized_pnl=0.0,
+            raw={"simulated": True},
+        )
+        client.get_spot_price.return_value = 2500.0
+        client.get_tickers.return_value = []
+        client.get_mark_prices.return_value = {}
+        client.get_positions.return_value = [
+            {"symbol": "ETH-260405-2700-C", "side": "SHORT", "quantity": -0.5, "entryPrice": 55.0, "unrealizedPnl": -2.0},
+            {"symbol": "ETH-260405-2300-P", "side": "SHORT", "quantity": -0.5, "entryPrice": 50.0, "unrealizedPnl": 1.0},
+        ]
+
+        with patch("trader.engine.BinanceOptionsClient", return_value=client):
+            engine = TradingEngine(sim_config)
+            assert engine.start() is True
+            time.sleep(0.5)
+
+            status = engine.status()
+            assert status["open_positions"] == 1
+            assert engine.pos_mgr is not None
+            assert engine.pos_mgr.open_position_count == 1
+            assert engine.storage is not None
+            open_trades = engine.storage.get_open_trades()
+            assert len(open_trades) == 2
+            assert {t["symbol"] for t in open_trades} == {"ETH-260405-2700-C", "ETH-260405-2300-P"}
+
+            engine.stop(timeout=5.0)

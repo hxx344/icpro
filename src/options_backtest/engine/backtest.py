@@ -292,6 +292,7 @@ class BacktestEngine:
                     matcher, instrument_dict, settlements_df,
                     margin_usd=self._margin_usd,
                     settlement_index=self._settlement_index,
+                    current_underlying_price=close_price,
                 )
 
             # 4c. Build context (lazy chain) and call strategy
@@ -1047,6 +1048,13 @@ class BacktestEngine:
         mark_total = self._mark_source_market + self._mark_source_synth
         quote_total = self._quote_source_market + self._quote_source_synth
         chain_total = self._chain_source_market + self._chain_source_synth
+        strategy_diagnostics = {}
+        get_diagnostics = getattr(self.strategy, "get_diagnostics", None)
+        if callable(get_diagnostics):
+            try:
+                strategy_diagnostics = get_diagnostics() or {}
+            except Exception:
+                strategy_diagnostics = {}
 
         return {
             "underlying": self.config.backtest.underlying,
@@ -1061,6 +1069,7 @@ class BacktestEngine:
             "total_trades": len(self.position_mgr.closed_trades),
             "equity_history": equity,
             "closed_trades": self.position_mgr.closed_trades,
+            "strategy_diagnostics": strategy_diagnostics,
             "data_source": {
                 "mark_market": self._mark_source_market,
                 "mark_synth": self._mark_source_synth,

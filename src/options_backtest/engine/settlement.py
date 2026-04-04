@@ -11,6 +11,7 @@ from datetime import datetime
 import pandas as pd
 from loguru import logger
 
+from options_backtest.data.fetcher import parse_instrument_name
 from options_backtest.engine.account import Account
 from options_backtest.engine.matcher import Matcher
 from options_backtest.engine.position import PositionManager
@@ -27,6 +28,7 @@ def check_and_settle(
     *,
     margin_usd: bool = False,
     settlement_index: dict[str, float] | None = None,
+    current_underlying_price: float | None = None,
 ) -> list[str]:
     """Check for expired positions and settle them.
 
@@ -59,7 +61,9 @@ def check_and_settle(
         if inst_dict is not None:
             inst_data = inst_dict.get(name)
             if inst_data is None:
-                continue
+                inst_data = parse_instrument_name(name)
+                if inst_data is None:
+                    continue
             # inst_data is a dict
             # Fast path: use pre-computed _expiry_ns (nanoseconds)
             exp_ns = inst_data.get("_expiry_ns")
@@ -75,12 +79,18 @@ def check_and_settle(
         else:
             inst_rows = instruments[instruments["instrument_name"] == name]
             if inst_rows.empty:
-                continue
-            inst = inst_rows.iloc[0]
-            exp_col = "expiration_timestamp" if "expiration_timestamp" in inst.index else "expiration_date"
-            expiry = to_utc_timestamp(inst[exp_col])
-            strike = inst.get("strike", inst.get("strike_price", 0))
-            opt_type_raw = inst.get("option_type", "call")
+                parsed = parse_instrument_name(name)
+                if parsed is None:
+                    continue
+                expiry = to_utc_timestamp(parsed["expiration_date"])
+                strike = parsed.get("strike_price", 0)
+                opt_type_raw = parsed.get("option_type", "call")
+            else:
+                inst = inst_rows.iloc[0]
+                exp_col = "expiration_timestamp" if "expiration_timestamp" in inst.index else "expiration_date"
+                expiry = to_utc_timestamp(inst[exp_col])
+                strike = inst.get("strike", inst.get("strike_price", 0))
+                opt_type_raw = inst.get("option_type", "call")
 
         # Deribit settles at UTC 08:00 on expiry date
         settlement_time = expiry.replace(hour=8, minute=0, second=0, microsecond=0)
@@ -95,6 +105,8 @@ def check_and_settle(
         # Fallback to DataFrame scan if not found
         if settlement_price is None:
             settlement_price = _find_settlement_price(settlements_df, expiry, name)
+        if settlement_price is None and current_underlying_price is not None and current_underlying_price > 0:
+            settlement_price = float(current_underlying_price)
         if settlement_price is None:
             logger.warning(f"No settlement price found for {name}, skipping")
             continue

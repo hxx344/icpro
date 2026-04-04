@@ -143,7 +143,7 @@ class StrategyConfig:
 
     # --- Common ---
     entry_time_utc: str = "08:00"         # entry at HH:MM UTC
-    quantity: float = 0.01               # base order quantity (in contracts)
+    quantity: float = 0.01               # base order quantity (non-weekend_vol or weekend_vol非复利)
     max_positions: int = 1               # max concurrent positions
     max_capital_pct: float = 0.30        # max 30% of account for positions
     compound: bool = True                # scale quantity to equity
@@ -226,7 +226,7 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("strategy.max_delta_diff must be within [0, 0.95]")
     if cfg.strategy.leverage <= 0:
         raise ValueError("strategy.leverage must be > 0")
-    if cfg.strategy.quantity <= 0:
+    if cfg.strategy.mode != "weekend_vol" and cfg.strategy.quantity <= 0:
         raise ValueError("strategy.quantity must be > 0")
     if cfg.strategy.max_positions < 1:
         raise ValueError("strategy.max_positions must be >= 1")

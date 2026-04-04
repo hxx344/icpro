@@ -1,0 +1,54 @@
+backtest:
+  name: "BTC Weekend Vol Backtest 3x Fixed-Notional ($10k initial)"
+  start_date: "2023-03-20"
+  end_date: "2026-03-24"
+  time_step: "1h"
+  underlying: "BTC"
+  margin_mode: "USD"
+  use_bs_only: false
+  option_data_source: "options_hourly"
+  option_snapshot_pick: "close"
+  iv_mode: "fixed"
+  fixed_iv: 0.60
+  show_progress: false
+
+account:
+  initial_balance: 1.0
+
+execution:
+  slippage: 0.0001
+  taker_fee: 0.00024
+  maker_fee: 0.00024
+  min_fee: 0.00024
+  max_fee_pct: 0.10
+  delivery_fee: 0.00015
+  delivery_fee_max_pct: 0.10
+
+strategy:
+  name: "WeekendVolBacktest"
+  params:
+    backtest_initial_usd: 10000.0
+    fixed_notional_usd: 10000.0
+    target_delta: 0.45
+    wing_delta: 0.0
+    default_iv: 0.60
+    entry_day: "friday"
+    entry_time_utc: "18:00"
+    close_day: "sunday"
+    close_time_utc: "08:00"
+    expire_day: "sunday"
+    expiry_selection: "exact"
+    leverage: 3.0
+    quantity: 0.1
+    quantity_step: 0.1
+    max_positions: 1
+    compound: false
+    max_delta_diff: 0.15
+    expiry_tolerance_hours: 2.0
+    entry_realized_vol_lookback_hours: 24
+    entry_realized_vol_max: 1.2
+    stop_loss_pct: 200.0
+
+report:
+  output_dir: "./reports/weekend_vol_btc_10000usd_3x_fixed_notional_bt"
+  generate_plots: false

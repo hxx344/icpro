@@ -1,6 +1,7 @@
 """Order matching / execution simulator.
 
-MVP: mid‑price fill with fixed slippage.
+Uses top-of-book bid/ask fills when available.
+Falls back to mark-price fill with fixed slippage when the book is unavailable.
 Supports both coin-margined (Deribit) and USD-margined (Binance) fee models.
 """
 
@@ -32,20 +33,30 @@ class Matcher:
 
         Prices are in coin (Deribit) or USD (Binance) depending on margin mode.
         """
-        # Determine execution price
+        # Determine execution price.
+        # When a valid top-of-book exists, use the touch price directly:
+        #   - LONG  -> ask
+        #   - SHORT -> bid
+        # This is more conservative than midpoint execution and better matches
+        # immediate marketable fills in the hourly snapshot backtest.
         if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0:
-            mid = (bid_price + ask_price) / 2
+            if order.direction == Direction.LONG:
+                fill_price = ask_price
+            else:
+                fill_price = bid_price
         else:
             mid = mark_price
+            if mid <= 0:
+                return None
 
-        if mid <= 0:
+            # Apply slippage only when we have to fall back to mark pricing.
+            if order.direction == Direction.LONG:
+                fill_price = mid + self.cfg.slippage
+            else:
+                fill_price = max(mid - self.cfg.slippage, 0.0001)
+
+        if fill_price <= 0:
             return None
-
-        # Apply slippage
-        if order.direction == Direction.LONG:
-            fill_price = mid + self.cfg.slippage
-        else:
-            fill_price = max(mid - self.cfg.slippage, 0.0001)
 
         # Compute fee (Deribit model)
         fee = self._compute_fee(fill_price, order.quantity, underlying_price)

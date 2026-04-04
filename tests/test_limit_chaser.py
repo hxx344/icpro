@@ -17,6 +17,12 @@ from trader.config import ExchangeConfig
 from trader.limit_chaser import ChaserConfig, LegOrder, LimitChaser
 
 
+def _wire_submit_to_place(client: MagicMock) -> MagicMock:
+    """Keep legacy tests working after chaser switched to submit_order()."""
+    client.submit_order = client.place_order
+    return client
+
+
 def _make_ticker(
     symbol: str = "ETH-260321-2000-C",
     bid: float = 50.0,
@@ -224,7 +230,7 @@ class TestMarketFallback(unittest.TestCase):
     """Test market order fallback logic."""
 
     def setUp(self):
-        self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client = _wire_submit_to_place(MagicMock(spec=BinanceOptionsClient))
         self.client.get_ticker.return_value = _make_ticker(bid=50.0, ask=55.0)
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
@@ -280,7 +286,7 @@ class TestPlaceOrAmend(unittest.TestCase):
     """Test initial limit order placement."""
 
     def setUp(self):
-        self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client = _wire_submit_to_place(MagicMock(spec=BinanceOptionsClient))
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
     def test_immediate_fill(self):
@@ -340,7 +346,7 @@ class TestCheckFill(unittest.TestCase):
     """Test order status polling."""
 
     def setUp(self):
-        self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client = _wire_submit_to_place(MagicMock(spec=BinanceOptionsClient))
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
     def test_filled_order(self):
@@ -417,7 +423,7 @@ class TestCancelAndReplace(unittest.TestCase):
     """Test cancel-and-replace flow."""
 
     def setUp(self):
-        self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client = _wire_submit_to_place(MagicMock(spec=BinanceOptionsClient))
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
     def test_cancel_then_new_order(self):
@@ -484,7 +490,7 @@ class TestExecuteLegsSimulated(unittest.TestCase):
     """Test full execute_legs with simulated immediate fills."""
 
     def setUp(self):
-        self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client = _wire_submit_to_place(MagicMock(spec=BinanceOptionsClient))
         # All orders fill immediately
         self.client.place_order.return_value = _make_fill(
             status="FILLED", price=50.0, fee=0.01
@@ -522,7 +528,7 @@ class TestCancelAndMarket(unittest.TestCase):
     """Test the cancel-and-market-fallback flow."""
 
     def setUp(self):
-        self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client = _wire_submit_to_place(MagicMock(spec=BinanceOptionsClient))
         self.client.get_ticker.return_value = _make_ticker(bid=50.0, ask=55.0)
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
@@ -603,7 +609,7 @@ class TestGetQuotes(unittest.TestCase):
     """Test quote fetching helper."""
 
     def setUp(self):
-        self.client = MagicMock(spec=BinanceOptionsClient)
+        self.client = _wire_submit_to_place(MagicMock(spec=BinanceOptionsClient))
         self.chaser = LimitChaser(self.client, ChaserConfig())
 
     def test_fetches_unique_symbols(self):
