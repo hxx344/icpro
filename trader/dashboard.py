@@ -68,6 +68,7 @@ from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.binance_client import BinanceOptionsClient
 from trader.position_manager import PositionManager, IronCondorPosition, CondorLeg
 from trader.limit_chaser import ChaserConfig as DashboardChaserConfig
+from trader.strategy import estimate_binance_combo_open_margin_per_unit
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -2004,28 +2005,46 @@ elif page == "🔧 策略配置":
                 _base_qty = cfg.strategy.quantity
                 _pv_qty = _base_qty
                 _pv_equity = 0.0
+                _pv_available = 0.0
                 _pv_equity_src = "配置基础数量"
+                _margin_per = estimate_binance_combo_open_margin_per_unit(
+                    index_price=_pv_spot,
+                    sell_call=_sell_call,
+                    sell_put=_sell_put,
+                    buy_call=_buy_call,
+                    buy_put=_buy_put,
+                )
                 if cfg.strategy.compound:
                     try:
                         _pv_acct = _pv_client.get_account()
                         _pv_equity = _pv_acct.total_balance
+                        _pv_available = max(float(getattr(_pv_acct, "available_balance", 0.0) or 0.0), 0.0)
                         if _pv_equity > 0 and _pv_spot > 0:
                             if _pv_mode == "weekend_vol":
                                 # Weekend vol: leverage-based sizing
                                 _lev_cfg = getattr(cfg.strategy, "leverage", 1.0)
                                 _pv_qty_raw = (_pv_equity * _lev_cfg) / _pv_spot
-                                _pv_qty = max(_base_qty, _math.floor(_pv_qty_raw * 10) / 10)
+                                _pv_qty = _math.floor(_pv_qty_raw * 10) / 10
+                                if _margin_per > 0:
+                                    _budget = _pv_available if _pv_available > 0 else _pv_equity
+                                    _qty_by_margin = _math.floor(_budget / _margin_per * 10) / 10
+                                    _pv_qty = min(_pv_qty, _qty_by_margin)
+                                if _pv_qty >= _base_qty:
+                                    _pv_qty = max(_base_qty, _pv_qty)
                                 _pv_equity_src = f"实时权益(复利 {_lev_cfg:.0f}x)"
                             else:
                                 _max_notional = _pv_equity * cfg.strategy.max_capital_pct
-                                if _pv_mode == "strangle":
-                                    _margin_per = _otm * _pv_spot * 2
-                                else:
-                                    _ww = _wing * _pv_spot
-                                    _margin_per = _ww * 2 if _ww > 0 else _otm * _pv_spot * 2
+                                if _pv_available > 0:
+                                    _max_notional = min(_max_notional, _pv_available)
+                                if _margin_per <= 0:
+                                    if _pv_mode == "strangle":
+                                        _margin_per = _otm * _pv_spot * 2
+                                    else:
+                                        _ww = _wing * _pv_spot
+                                        _margin_per = _ww * 2 if _ww > 0 else _otm * _pv_spot * 2
                                 if _margin_per > 0:
                                     _scaled = _math.floor(_max_notional / _margin_per * 100) / 100
-                                    _pv_qty = max(_base_qty, _scaled)
+                                    _pv_qty = _scaled if 0 < _scaled < _base_qty else max(_base_qty, _scaled)
                                 _pv_equity_src = "实时权益(复利)"
                     except Exception:
                         _pv_equity_src = "权益获取失败, 用基础数量"
@@ -2041,10 +2060,7 @@ elif page == "🔧 策略配置":
                     # ---- Strangle / weekend_vol without wings P&L ----
                     _premium_per = _sc_bid + _sp_bid
                     _total_premium = _premium_per * _pv_qty
-                    if _pv_mode == "weekend_vol":
-                        _margin_used = _pv_spot * _pv_qty  # notional
-                    else:
-                        _margin_used = _otm * _pv_spot * 2 * _pv_qty
+                    _margin_used = _margin_per * _pv_qty if _margin_per > 0 else _otm * _pv_spot * 2 * _pv_qty
                     _be_upper = _sell_call.strike + _premium_per
                     _be_lower = _sell_put.strike - _premium_per
                 else:
@@ -2060,7 +2076,7 @@ elif page == "🔧 策略配置":
                     _max_loss_per = _max_wing - _premium_per
                     _total_premium = _premium_per * _pv_qty
                     _total_max_loss = _max_loss_per * _pv_qty
-                    _margin_used = _max_wing * 2 * _pv_qty
+                    _margin_used = _margin_per * _pv_qty if _margin_per > 0 else _max_wing * 2 * _pv_qty
                     _be_upper = _sell_call.strike + _premium_per
                     _be_lower = _sell_put.strike - _premium_per
 

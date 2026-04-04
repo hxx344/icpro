@@ -28,6 +28,100 @@ from trader.position_manager import PositionManager
 from trader.storage import Storage
 
 
+BINANCE_OPTION_DEFAULT_CONTRACT_UNIT = 1.0
+BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE = 0.0003
+
+
+def _binance_option_otm_amount(index_price: float, strike: float, option_type: str) -> float:
+    option_type_norm = str(option_type or "").lower()
+    if option_type_norm == "call":
+        return max(float(strike or 0.0) - float(index_price or 0.0), 0.0)
+    return max(float(index_price or 0.0) - float(strike or 0.0), 0.0)
+
+
+def estimate_binance_option_fee(
+    index_price: float,
+    order_price: float,
+    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
+    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+) -> float:
+    index_component = max(float(index_price or 0.0), 0.0) * max(float(contract_unit or 0.0), 0.0) * max(float(transaction_fee_rate or 0.0), 0.0)
+    order_component = 0.10 * max(float(order_price or 0.0), 0.0)
+    if index_component <= 0:
+        return order_component
+    if order_component <= 0:
+        return index_component
+    return min(index_component, order_component)
+
+
+def estimate_binance_short_open_margin_per_unit(
+    index_price: float,
+    strike: float,
+    option_type: str,
+    mark_price: float,
+    order_price: float,
+    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
+    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+) -> float:
+    index_price = max(float(index_price or 0.0), 0.0)
+    contract_unit = max(float(contract_unit or 0.0), 0.0)
+    mark_price = max(float(mark_price or 0.0), 0.0)
+    order_price = max(float(order_price or 0.0), 0.0)
+    otm_amount = _binance_option_otm_amount(index_price, strike, option_type)
+    base_margin = max(0.10 * index_price, 0.15 * index_price - otm_amount) * contract_unit
+    fee = estimate_binance_option_fee(index_price, order_price, contract_unit, transaction_fee_rate)
+    return max(0.0, base_margin + mark_price - order_price) + fee
+
+
+def estimate_binance_long_open_margin_per_unit(
+    index_price: float,
+    order_price: float,
+    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
+    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+) -> float:
+    order_price = max(float(order_price or 0.0), 0.0)
+    fee = estimate_binance_option_fee(index_price, order_price, contract_unit, transaction_fee_rate)
+    return order_price + fee
+
+
+def estimate_binance_combo_open_margin_per_unit(
+    index_price: float,
+    sell_call: OptionTicker | None = None,
+    sell_put: OptionTicker | None = None,
+    buy_call: OptionTicker | None = None,
+    buy_put: OptionTicker | None = None,
+    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
+    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+) -> float:
+    total = 0.0
+    for short_leg in (sell_call, sell_put):
+        if short_leg is None:
+            continue
+        mark_price = float(short_leg.mark_price or short_leg.bid_price or short_leg.ask_price or 0.0)
+        order_price = float(short_leg.bid_price or short_leg.mark_price or 0.0)
+        total += estimate_binance_short_open_margin_per_unit(
+            index_price=index_price,
+            strike=float(short_leg.strike or 0.0),
+            option_type=str(short_leg.option_type or ""),
+            mark_price=mark_price,
+            order_price=order_price,
+            contract_unit=contract_unit,
+            transaction_fee_rate=transaction_fee_rate,
+        )
+
+    for long_leg in (buy_call, buy_put):
+        if long_leg is None:
+            continue
+        order_price = float(long_leg.ask_price or long_leg.mark_price or 0.0)
+        total += estimate_binance_long_open_margin_per_unit(
+            index_price=index_price,
+            order_price=order_price,
+            contract_unit=contract_unit,
+            transaction_fee_rate=transaction_fee_rate,
+        )
+    return total
+
+
 class OptionSellingStrategy:
     """Options selling strategy for Binance options.
 
@@ -228,7 +322,11 @@ class OptionSellingStrategy:
         # ---- Mode: Strangle (2-leg naked sell) ----
         if mode == "strangle":
             # Determine quantity
-            quantity = self._compute_quantity(spot)
+            quantity = self._compute_quantity(
+                spot,
+                sell_call=sell_call,
+                sell_put=sell_put,
+            )
             if quantity <= 0:
                 logger.warning("Computed quantity <= 0, skipping")
                 return
@@ -304,7 +402,13 @@ class OptionSellingStrategy:
             return
 
         # Determine quantity
-        quantity = self._compute_quantity(spot)
+        quantity = self._compute_quantity(
+            spot,
+            sell_call=sell_call,
+            sell_put=sell_put,
+            buy_call=buy_call,
+            buy_put=buy_put,
+        )
         if quantity <= 0:
             logger.warning("Computed quantity <= 0, skipping")
             return
@@ -371,15 +475,18 @@ class OptionSellingStrategy:
         candidates.sort(key=lambda t: abs(t.strike - target_strike))
         return candidates[0]
 
-    def _compute_quantity(self, spot: float) -> float:
+    def _compute_quantity(
+        self,
+        spot: float,
+        sell_call: OptionTicker | None = None,
+        sell_put: OptionTicker | None = None,
+        buy_call: OptionTicker | None = None,
+        buy_put: OptionTicker | None = None,
+    ) -> float:
         """Compute order quantity based on account equity and config.
 
         compound=False → 直接用 quantity (base)
         compound=True  → 按权益放大, quantity 是下限, max_capital_pct 是上限
-
-        保证金估算:
-        - strangle (裸卖): margin ≈ otm_pct × spot × qty × 2
-        - iron_condor: margin ≈ wing_width × spot × qty × 2
         """
         quantity = self.cfg.quantity
         mode = getattr(self.cfg, "mode", "iron_condor")
@@ -388,28 +495,42 @@ class OptionSellingStrategy:
             try:
                 account = self.client.get_account()
                 equity = account.total_balance
+                available_balance = max(float(getattr(account, "available_balance", 0.0) or 0.0), 0.0)
                 if equity > 0 and spot > 0:
-                    max_notional = equity * self.cfg.max_capital_pct
+                    margin_budget = equity * self.cfg.max_capital_pct
+                    if available_balance > 0:
+                        margin_budget = min(margin_budget, available_balance)
 
-                    if mode == "strangle":
-                        # 裸卖: 保守用 otm_pct 作为保证金估算基础
-                        margin_per_unit = self.cfg.otm_pct * spot * 2
-                    else:
-                        # 铁鹰: 用翼宽
-                        wing_width = self.cfg.wing_width_pct * spot
-                        margin_per_unit = wing_width * 2 if wing_width > 0 else self.cfg.otm_pct * spot * 2
+                    scaled_qty = 0.0
+                    margin_per_unit = estimate_binance_combo_open_margin_per_unit(
+                        index_price=spot,
+                        sell_call=sell_call,
+                        sell_put=sell_put,
+                        buy_call=buy_call,
+                        buy_put=buy_put,
+                    )
+
+                    if margin_per_unit <= 0:
+                        if mode == "strangle":
+                            margin_per_unit = self.cfg.otm_pct * spot * 2
+                        else:
+                            wing_width = self.cfg.wing_width_pct * spot
+                            margin_per_unit = wing_width * 2 if wing_width > 0 else self.cfg.otm_pct * spot * 2
 
                     if margin_per_unit > 0:
                         scaled_qty = math.floor(
-                            max_notional / margin_per_unit * 100
+                            margin_budget / margin_per_unit * 100
                         ) / 100
                         quantity = max(self.cfg.quantity, scaled_qty)
+                        if 0 < scaled_qty < self.cfg.quantity:
+                            quantity = scaled_qty
 
                     logger.info(
                         f"[Quantity] equity={equity:.2f}, spot={spot:.2f}, "
+                        f"available_balance={available_balance:.2f}, "
                         f"mode={mode}, "
                         f"margin_per_unit={margin_per_unit:.2f}, "
-                        f"max_notional={max_notional:.2f}, "
+                        f"margin_budget={margin_budget:.2f}, "
                         f"scaled_qty={scaled_qty:.2f}, "
                         f"final_qty={quantity:.2f}"
                     )
@@ -729,7 +850,13 @@ class WeekendVolStrategy:
                 return
 
         # --- Compute quantity ---
-        quantity = self._compute_quantity(spot)
+        quantity = self._compute_quantity(
+            spot,
+            sell_call=sell_call,
+            sell_put=sell_put,
+            buy_call=buy_call,
+            buy_put=buy_put,
+        )
         if quantity <= 0:
             logger.warning("[WeekendVol] Computed quantity <= 0, skipping")
             return
@@ -1036,7 +1163,14 @@ class WeekendVolStrategy:
     # Quantity computation (3x leverage, compounding)
     # ------------------------------------------------------------------
 
-    def _compute_quantity(self, spot: float) -> float:
+    def _compute_quantity(
+        self,
+        spot: float,
+        sell_call: OptionTicker | None = None,
+        sell_put: OptionTicker | None = None,
+        buy_call: OptionTicker | None = None,
+        buy_put: OptionTicker | None = None,
+    ) -> float:
         """Compute position size with leverage + compounding.
 
         USD margin mode:
@@ -1050,15 +1184,36 @@ class WeekendVolStrategy:
             try:
                 account = self.client.get_account()
                 equity = account.total_balance
+                available_balance = max(float(getattr(account, "available_balance", 0.0) or 0.0), 0.0)
                 if equity > 0 and spot > 0:
-                    qty = (equity * self.cfg.leverage) / spot
+                    raw_qty = (equity * self.cfg.leverage) / spot
+                    qty = raw_qty
+                    margin_per_unit = estimate_binance_combo_open_margin_per_unit(
+                        index_price=spot,
+                        sell_call=sell_call,
+                        sell_put=sell_put,
+                        buy_call=buy_call,
+                        buy_put=buy_put,
+                    )
+                    if margin_per_unit > 0:
+                        budget = available_balance if available_balance > 0 else equity
+                        qty_by_margin = math.floor(budget / margin_per_unit * 10) / 10
+                        qty = min(qty, qty_by_margin)
+                    else:
+                        qty_by_margin = 0.0
+
                     # Round down to 0.1 underlying units
                     qty = math.floor(qty * 10) / 10
                     base_qty = max(self.cfg.quantity, qty)
+                    if 0 < qty < self.cfg.quantity:
+                        base_qty = qty
                     logger.info(
                         f"[WeekendVol] qty: equity={equity:.2f} USD, "
+                        f"available_balance={available_balance:.2f} USD, "
                         f"leverage={self.cfg.leverage}x, spot={spot:.2f}, "
-                        f"raw={equity * self.cfg.leverage / spot:.4f}, "
+                        f"raw={raw_qty:.4f}, "
+                        f"margin_per_unit={margin_per_unit:.2f}, "
+                        f"qty_by_margin={qty_by_margin:.4f}, "
                         f"final={base_qty:.1f} {ul}"
                     )
             except Exception as e:

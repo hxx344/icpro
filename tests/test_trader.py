@@ -856,6 +856,40 @@ class TestOptionSellingStrategy:
         qty = strategy._compute_quantity(87000)
         assert qty == 0.01
 
+    def test_compute_quantity_compound_uses_official_margin_formula(self, storage):
+        client = MockClient(spot=90000, equity=10000)
+        pm = PositionManager(client, storage)
+        cfg = StrategyConfig(
+            mode="strangle",
+            quantity=0.01,
+            compound=True,
+            max_capital_pct=0.30,
+            otm_pct=0.10,
+        )
+
+        sell_call = _make_ticker(
+            symbol="BTC-260328-100000-C",
+            strike=100000,
+            option_type="call",
+            bid_price=100,
+            ask_price=120,
+            mark_price=110,
+            underlying_price=90000,
+        )
+        sell_put = _make_ticker(
+            symbol="BTC-260328-80000-P",
+            strike=80000,
+            option_type="put",
+            bid_price=100,
+            ask_price=120,
+            mark_price=110,
+            underlying_price=90000,
+        )
+
+        strategy = OptionSellingStrategy(client, pm, storage, cfg)
+        qty = strategy._compute_quantity(90000, sell_call=sell_call, sell_put=sell_put)
+        assert qty == pytest.approx(0.16, abs=0.01)
+
     def test_status(self, storage):
         client = MockClient()
         pm = PositionManager(client, storage)
@@ -1039,6 +1073,41 @@ class TestWeekendVolStrategy:
         # (50000 * 3) / 87000 ≈ 1.72, floor to 1.7
         assert qty >= 1.0
         assert qty == pytest.approx(1.7, abs=0.2)
+
+    def test_compute_quantity_compound_caps_by_official_margin_formula(self, storage):
+        client = MockClient(spot=87000, equity=10000)
+        pm = PositionManager(client, storage)
+        cfg = StrategyConfig(
+            mode="weekend_vol",
+            quantity=0.1,
+            leverage=10.0,
+            compound=True,
+            target_delta=0.40,
+            wing_delta=0.0,
+        )
+
+        sell_call = _make_ticker(
+            symbol="BTC-260329-95000-C",
+            strike=95000,
+            option_type="call",
+            bid_price=90,
+            ask_price=100,
+            mark_price=95,
+            underlying_price=87000,
+        )
+        sell_put = _make_ticker(
+            symbol="BTC-260329-79000-P",
+            strike=79000,
+            option_type="put",
+            bid_price=90,
+            ask_price=100,
+            mark_price=95,
+            underlying_price=87000,
+        )
+
+        strategy = WeekendVolStrategy(client, pm, storage, cfg)
+        qty = strategy._compute_quantity(87000, sell_call=sell_call, sell_put=sell_put)
+        assert qty == pytest.approx(0.4, abs=0.11)
 
     def test_compute_quantity_no_compound(self, storage):
         client = MockClient()
