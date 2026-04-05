@@ -1020,9 +1020,32 @@ class WeekendVolStrategy:
             return
 
         if basket_pnl_pct <= -float(self.cfg.stop_loss_pct):
+            move_filter_state = self._get_underlying_move_filter_state()
+            move_filter_pct = float(getattr(self.cfg, "stop_loss_underlying_move_pct", 0.0) or 0.0)
+            if move_filter_pct > 0:
+                move_filter_error = str(move_filter_state.get("error") or "")
+                if move_filter_error:
+                    logger.warning(
+                        f"[WeekendVol] Stop loss blocked: basket pnl {basket_pnl_pct:.1f}% hit threshold, "
+                        f"but underlying move filter could not be evaluated ({move_filter_error})"
+                    )
+                    return
+                if not bool(move_filter_state.get("passes_filter")):
+                    logger.warning(
+                        f"[WeekendVol] Stop loss blocked by underlying move filter: "
+                        f"basket pnl {basket_pnl_pct:.1f}% <= -{self.cfg.stop_loss_pct:.1f}% but "
+                        f"spot move={float(move_filter_state.get('max_abs_move_pct') or 0.0):.2f}% "
+                        f"< required {move_filter_pct:.2f}%"
+                    )
+                    return
             logger.warning(
                 f"[WeekendVol] Stop loss triggered: basket pnl {basket_pnl_pct:.1f}% "
                 f"<= -{self.cfg.stop_loss_pct:.1f}%"
+                + (
+                    f", spot move={float(move_filter_state.get('max_abs_move_pct') or 0.0):.2f}%"
+                    if move_filter_pct > 0
+                    else ""
+                )
             )
             self.pos_mgr.close_all(
                 reason=f"weekend_vol_stop_loss_{self.cfg.stop_loss_pct:.0f}",
@@ -1088,6 +1111,67 @@ class WeekendVolStrategy:
             logger.warning(f"[WeekendVol] Failed to fetch mark prices for status: {e}")
             return None
         return self._basket_pnl_pct(mark_prices)
+
+    def _get_underlying_move_filter_state(self, current_spot: float | None = None) -> dict[str, Any]:
+        threshold_pct = float(getattr(self.cfg, "stop_loss_underlying_move_pct", 0.0) or 0.0)
+        state: dict[str, Any] = {
+            "enabled": threshold_pct > 0,
+            "threshold_pct": threshold_pct,
+            "current_spot": None,
+            "max_abs_move_pct": 0.0,
+            "max_up_move_pct": 0.0,
+            "max_down_move_pct": 0.0,
+            "passes_filter": threshold_pct <= 0,
+            "positions_checked": 0,
+            "positions_with_entry_spot": 0,
+            "reference_group_id": "",
+            "reference_entry_spot": None,
+            "error": "",
+        }
+
+        if self.pos_mgr.open_position_count <= 0:
+            return state
+
+        if current_spot is None:
+            try:
+                current_spot = float(self.client.get_spot_price(self.cfg.underlying.upper()) or 0.0)
+            except Exception as e:
+                state["error"] = str(e)
+                return state
+
+        current_spot = float(current_spot or 0.0)
+        if current_spot <= 0:
+            state["error"] = "invalid_current_spot"
+            return state
+
+        state["current_spot"] = current_spot
+
+        for group_id, condor in self.pos_mgr.open_condors.items():
+            if not condor.is_open:
+                continue
+            state["positions_checked"] += 1
+            entry_spot = float(condor.underlying_price or 0.0)
+            if entry_spot <= 0:
+                continue
+            state["positions_with_entry_spot"] += 1
+            move_pct = (current_spot / entry_spot - 1.0) * 100.0
+            up_move_pct = max(move_pct, 0.0)
+            down_move_pct = max(-move_pct, 0.0)
+            abs_move_pct = abs(move_pct)
+            if abs_move_pct >= float(state["max_abs_move_pct"]):
+                state["max_abs_move_pct"] = abs_move_pct
+                state["max_up_move_pct"] = up_move_pct
+                state["max_down_move_pct"] = down_move_pct
+                state["reference_group_id"] = group_id
+                state["reference_entry_spot"] = entry_spot
+
+        if state["positions_with_entry_spot"] <= 0:
+            state["error"] = "missing_entry_spot"
+            state["passes_filter"] = False if threshold_pct > 0 else True
+            return state
+
+        state["passes_filter"] = threshold_pct <= 0 or float(state["max_abs_move_pct"]) >= threshold_pct
+        return state
 
     # ------------------------------------------------------------------
     # Delta-based strike selection
@@ -1305,6 +1389,20 @@ class WeekendVolStrategy:
         rv24 = self._compute_realized_vol(self.cfg.underlying.upper(), log_result=False)
         basket_pnl_pct = self._current_basket_pnl_pct()
         local_open_positions = self.pos_mgr.open_position_count
+        move_filter_state = self._get_underlying_move_filter_state() if local_open_positions > 0 else {
+            "enabled": float(getattr(self.cfg, "stop_loss_underlying_move_pct", 0.0) or 0.0) > 0,
+            "threshold_pct": float(getattr(self.cfg, "stop_loss_underlying_move_pct", 0.0) or 0.0),
+            "current_spot": None,
+            "max_abs_move_pct": 0.0,
+            "max_up_move_pct": 0.0,
+            "max_down_move_pct": 0.0,
+            "passes_filter": False,
+            "positions_checked": 0,
+            "positions_with_entry_spot": 0,
+            "reference_group_id": "",
+            "reference_entry_spot": None,
+            "error": "",
+        }
         exchange_positions = list(self._last_guard_exchange_positions or [])
         exchange_position_count = len(exchange_positions)
         effective_open_positions = local_open_positions
@@ -1326,7 +1424,16 @@ class WeekendVolStrategy:
             "entry_realized_vol_max": self.cfg.entry_realized_vol_max,
             "entry_realized_vol_current": rv24,
             "stop_loss_pct": self.cfg.stop_loss_pct,
+            "stop_loss_underlying_move_pct": self.cfg.stop_loss_underlying_move_pct,
             "basket_pnl_pct": basket_pnl_pct,
+            "current_spot": move_filter_state.get("current_spot"),
+            "stop_loss_underlying_move_abs_pct": move_filter_state.get("max_abs_move_pct"),
+            "stop_loss_underlying_move_up_pct": move_filter_state.get("max_up_move_pct"),
+            "stop_loss_underlying_move_down_pct": move_filter_state.get("max_down_move_pct"),
+            "stop_loss_underlying_move_filter_passed": move_filter_state.get("passes_filter"),
+            "stop_loss_underlying_move_reference_group_id": move_filter_state.get("reference_group_id"),
+            "stop_loss_underlying_move_reference_entry_spot": move_filter_state.get("reference_entry_spot"),
+            "stop_loss_underlying_move_error": move_filter_state.get("error"),
             "last_order_attempt_at": self._last_order_attempt_at,
             "last_order_status": self._last_order_status,
             "last_order_message": self._last_order_message,

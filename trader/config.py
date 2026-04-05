@@ -140,6 +140,7 @@ class StrategyConfig:
     entry_realized_vol_lookback_hours: int = 0  # realized vol lookback in hours (0=off)
     entry_realized_vol_max: float = 0.0   # max allowed annualized RV for entry (0=off)
     stop_loss_pct: float = 0.0            # close all when basket pnl% <= -stop_loss_pct
+    stop_loss_underlying_move_pct: float = 0.0  # require one-way underlying move >= pct before stop loss can fire
 
     # --- Common ---
     entry_time_utc: str = "08:00"         # entry at HH:MM UTC
@@ -242,6 +243,8 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("strategy.entry_realized_vol_max must be >= 0")
     if cfg.strategy.stop_loss_pct < 0:
         raise ValueError("strategy.stop_loss_pct must be >= 0")
+    if cfg.strategy.stop_loss_underlying_move_pct < 0:
+        raise ValueError("strategy.stop_loss_underlying_move_pct must be >= 0")
     if cfg.strategy.target_dte_days < 0:
         raise ValueError("strategy.target_dte_days must be >= 0")
     if cfg.strategy.dte_window_hours <= 0:

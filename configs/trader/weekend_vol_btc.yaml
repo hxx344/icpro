@@ -7,6 +7,7 @@
 #   - RV24 <= 1.2 才允许入场
 #   - 3x USD 杠杆, 复利
 #   - 篮子止损: -200%
+#   - 仅当 BTC 较开仓价单边波动 >= 5% 时才允许触发止损
 #   - 持有至周日 08:00 UTC 自动结算
 #
 # 回测绩效 (2022-01 ~ 2024-12, $16,821 起始):
@@ -37,6 +38,7 @@ strategy:
   entry_realized_vol_lookback_hours: 24
   entry_realized_vol_max: 1.2  # annualized RV threshold
   stop_loss_pct: 200.0         # basket pnl% stop
+  stop_loss_underlying_move_pct: 5.0  # 标的相对开仓价单边波动达到该百分比后，止损才允许触发
 
   # Entry timing
   entry_day: friday

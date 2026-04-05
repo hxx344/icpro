@@ -161,11 +161,13 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
     group_id = str(task.get("result_group_id") or "")
     attached = bool(task.get("attached_to_engine_for_stop_loss"))
     stop_loss_pct = float(order_summary.get("stop_loss_pct") or 0.0)
+    stop_loss_underlying_move_pct = float(order_summary.get("stop_loss_underlying_move_pct") or 0.0)
 
     runtime: dict[str, object] = {
         "attached": attached,
         "group_id": group_id,
         "stop_loss_pct": stop_loss_pct,
+        "stop_loss_underlying_move_pct": stop_loss_underlying_move_pct,
         "quantity": float(order_summary.get("quantity") or 0.0),
         "state": "not_attached" if not attached else "unknown",
     }
@@ -186,6 +188,7 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
     runtime["state"] = "active"
     runtime["legs"] = len(condor.legs)
     runtime["entry_credit"] = float(condor.total_premium or 0.0)
+    runtime["entry_underlying_price"] = float(condor.underlying_price or 0.0)
     runtime["sell_put_strike"] = float(condor.sell_put.strike) if condor.sell_put else None
     runtime["sell_call_strike"] = float(condor.sell_call.strike) if condor.sell_call else None
 
@@ -194,6 +197,24 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
     if not underlying:
         runtime["state"] = "active_no_underlying"
         return runtime
+
+    try:
+        current_spot = float(engine_ref.client.get_spot_price(underlying) or 0.0)
+    except Exception as exc:
+        runtime["spot_price_error"] = str(exc)
+        current_spot = 0.0
+    if current_spot > 0:
+        runtime["current_spot"] = current_spot
+        entry_underlying_price = float(condor.underlying_price or 0.0)
+        if entry_underlying_price > 0:
+            underlying_move_pct = abs((current_spot / entry_underlying_price - 1.0) * 100.0)
+            runtime["underlying_move_pct"] = abs(
+                (current_spot / entry_underlying_price - 1.0) * 100.0
+            )
+            runtime["underlying_move_filter_passed"] = (
+                stop_loss_underlying_move_pct <= 0
+                or underlying_move_pct >= stop_loss_underlying_move_pct
+            )
 
     try:
         mark_prices = engine_ref.client.get_mark_prices(underlying)
@@ -215,17 +236,22 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
     runtime["basket_pnl"] = basket_pnl
     runtime["basket_pnl_pct"] = (basket_pnl / entry_credit * 100.0) if entry_credit > 0 else None
     if stop_loss_pct > 0 and entry_credit > 0:
-        runtime["stop_loss_trigger_close_cost"] = entry_credit * (1 + stop_loss_pct / 100.0)
-        runtime["stop_loss_trigger_price_boundary"] = (
-            runtime["stop_loss_trigger_close_cost"] / runtime["quantity"]
-            if float(runtime.get("quantity") or 0.0) > 0
+        quantity = float(order_summary.get("quantity") or 0.0)
+        stop_loss_trigger_close_cost = entry_credit * (1 + stop_loss_pct / 100.0)
+        stop_loss_trigger_price_boundary = (
+            stop_loss_trigger_close_cost / quantity
+            if quantity > 0
             else None
         )
+        runtime["stop_loss_trigger_close_cost"] = stop_loss_trigger_close_cost
+        runtime["stop_loss_trigger_price_boundary"] = stop_loss_trigger_price_boundary
         runtime["stop_loss_trigger_pnl"] = -(entry_credit * stop_loss_pct / 100.0)
-        if runtime.get("sell_put_strike") is not None:
-            runtime["stop_loss_trigger_spot_low"] = float(runtime["sell_put_strike"]) - float(runtime["stop_loss_trigger_price_boundary"] or 0.0)
-        if runtime.get("sell_call_strike") is not None:
-            runtime["stop_loss_trigger_spot_high"] = float(runtime["sell_call_strike"]) + float(runtime["stop_loss_trigger_price_boundary"] or 0.0)
+        sell_put_strike = float(condor.sell_put.strike) if condor.sell_put else None
+        sell_call_strike = float(condor.sell_call.strike) if condor.sell_call else None
+        if sell_put_strike is not None:
+            runtime["stop_loss_trigger_spot_low"] = sell_put_strike - float(stop_loss_trigger_price_boundary or 0.0)
+        if sell_call_strike is not None:
+            runtime["stop_loss_trigger_spot_high"] = sell_call_strike + float(stop_loss_trigger_price_boundary or 0.0)
     return runtime
 
 
@@ -1716,6 +1742,7 @@ elif page == "🔧 策略配置":
                 ed_rv_hours = st.number_input("RV 回看小时数", min_value=0, max_value=168, value=int(_strategy.get("entry_realized_vol_lookback_hours", 24)), step=1, help="入场 RV 过滤的历史小时数；0 表示关闭过滤")
                 ed_rv_max = st.number_input("RV 上限", min_value=0.0, max_value=5.0, value=float(_strategy.get("entry_realized_vol_max", 1.20)), step=0.05, format="%.2f", help="仅当年化 RV 不超过该值时允许开仓")
                 ed_stop_loss_pct = st.number_input("组合止损 %", min_value=0.0, max_value=1000.0, value=float(_strategy.get("stop_loss_pct", 200.0)), step=10.0, format="%.1f", help="组合 PnL% 低于 -该值时触发止损；0 表示关闭")
+                ed_stop_loss_underlying_move_pct = st.number_input("标的单边止损过滤 %", min_value=0.0, max_value=50.0, value=float(_strategy.get("stop_loss_underlying_move_pct", 0.0)), step=0.5, format="%.1f", help="仅当标的价格相对开仓价单方向波动达到该百分比时，组合止损才允许触发；0 表示关闭")
                 _day_options = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
                 _cur_day = _strategy.get("entry_day", "friday").lower()
                 _day_index = _day_options.index(_cur_day) if _cur_day in _day_options else 4
@@ -1787,6 +1814,7 @@ elif page == "🔧 策略配置":
                     "entry_realized_vol_lookback_hours": int(ed_rv_hours),
                     "entry_realized_vol_max": round(ed_rv_max, 4),
                     "stop_loss_pct": round(ed_stop_loss_pct, 4),
+                    "stop_loss_underlying_move_pct": round(ed_stop_loss_underlying_move_pct, 4),
                     "entry_day": ed_entry_day,
                     "default_iv": round(ed_default_iv, 4),
                     "entry_time_utc": ed_entry_time.strftime("%H:%M"),
@@ -2314,6 +2342,7 @@ elif page == "🔧 策略配置":
                             "execution_mode": "market",
                             "apply_strategy_stop_loss": bool(_auto_stop_loss and _sl_supported),
                             "stop_loss_pct": _sl_cfg_pct,
+                            "stop_loss_underlying_move_pct": float(getattr(cfg.strategy, "stop_loss_underlying_move_pct", 0.0) or 0.0),
                         },
                     )
                     _start_test_order_task(
@@ -2877,9 +2906,14 @@ elif page == "🖥 引擎状态":
             )
         with col12:
             sl_pct = strategy_status.get("stop_loss_pct")
+            sl_move_pct = strategy_status.get("stop_loss_underlying_move_pct")
             st.metric(
                 "止损线",
-                f"-{sl_pct:.0f}%" if isinstance(sl_pct, (int, float)) and sl_pct > 0 else "关闭",
+                (
+                    f"-{sl_pct:.0f}% / {sl_move_pct:.1f}%"
+                    if isinstance(sl_pct, (int, float)) and sl_pct > 0 and isinstance(sl_move_pct, (int, float)) and sl_move_pct > 0
+                    else (f"-{sl_pct:.0f}%" if isinstance(sl_pct, (int, float)) and sl_pct > 0 else "关闭")
+                ),
             )
 
         _last_order_status = str(strategy_status.get("last_order_status") or "")
@@ -3001,7 +3035,11 @@ elif page == "🖥 引擎状态":
                     else "关闭"
                 ),
                 (
-                    f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}%"
+                    (
+                        f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}% + 标的单边{getattr(cfg.strategy, 'stop_loss_underlying_move_pct', 0.0):.1f}%"
+                        if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0 and getattr(cfg.strategy, 'stop_loss_underlying_move_pct', 0.0) > 0
+                        else f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}%"
+                    )
                     if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0
                     else "关闭"
                 ),
