@@ -95,9 +95,9 @@ class ExchangeConfig:
     """Exchange API connection settings (Binance USD margin)."""
     api_key: str = ""
     api_secret: str = ""
-    testnet: bool = True
+    testnet: bool = False
     base_url: str = ""
-    timeout: int = 10
+    timeout: int = 15
     account_currency: str = "USDT"
     simulate_private: bool = False
 
@@ -114,47 +114,36 @@ class ExchangeConfig:
 
 @dataclass
 class StrategyConfig:
-    """Options selling strategy parameters.
+    """Weekend vol strategy parameters.
 
-    Modes:
-      - strangle      : 2-leg naked sell (OTM%-based strikes)
-      - iron_condor   : 4-leg IC  (OTM%-based strikes)
-      - weekend_vol   : Weekend vol selling IC (delta-based, Friday→Sunday)
+    Defaults are aligned with `configs/trader/weekend_vol_btc.yaml`.
+    This live trader only supports `weekend_vol`.
+    Structure is still configurable through `wing_delta`:
+        - `wing_delta > 0`: winged structure
+        - `wing_delta = 0`: wingless short strangle
     """
-    mode: str = "strangle"               # "strangle" / "iron_condor" / "weekend_vol"
-    underlying: str = "ETH"
-
-    # --- OTM%-based strike selection (strangle / iron_condor) ---
-    otm_pct: float = 0.10                # 10% OTM for short legs
-    wing_width_pct: float = 0.02         # additional 2% for long legs
-    target_dte_days: int = 7             # target DTE in days (0 = 0DTE)
-    dte_window_hours: int = 48           # accept options within ±window of target DTE
-
-    # --- Delta-based strike selection (weekend_vol) ---
-    target_delta: float = 0.40           # |delta| for short legs
-    wing_delta: float = 0.05             # |delta| for protection legs (0 = no wings)
-    max_delta_diff: float = 0.20         # max allowed |actual_delta-target_delta|
-    leverage: float = 1.0                # notional leverage multiplier
-    entry_day: str = "friday"            # day of week to enter (lowercase)
+    mode: str = "weekend_vol"           # fixed live strategy mode
+    underlying: str = "BTC"
+    target_delta: float = 0.45           # |delta| for short legs
+    wing_delta: float = 0.0              # |delta| for protection legs (0 = no wings)
+    max_delta_diff: float = 0.15         # max allowed |actual_delta-target_delta|
+    leverage: float = 3.0                # notional leverage multiplier
+    entry_day: str = "friday"           # day of week to enter (lowercase)
     default_iv: float = 0.60             # fallback IV if mark_iv unavailable
-    entry_realized_vol_lookback_hours: int = 0  # realized vol lookback in hours (0=off)
-    entry_realized_vol_max: float = 0.0   # max allowed annualized RV for entry (0=off)
-    stop_loss_pct: float = 0.0            # close all when basket pnl% <= -stop_loss_pct
-    stop_loss_underlying_move_pct: float = 0.0  # require one-way underlying move >= pct before stop loss can fire
-
-    # --- Common ---
-    entry_time_utc: str = "08:00"         # entry at HH:MM UTC
-    quantity: float = 0.01               # base order quantity (non-weekend_vol or weekend_vol非复利)
+    entry_realized_vol_lookback_hours: int = 24  # realized vol lookback in hours (0=off)
+    entry_realized_vol_max: float = 1.2  # max allowed annualized RV for entry (0=off)
+    stop_loss_pct: float = 200.0         # close all when basket pnl% <= -stop_loss_pct
+    stop_loss_underlying_move_pct: float = 5.0  # require one-way underlying move >= pct before stop loss can fire
+    entry_time_utc: str = "18:00"       # entry at HH:MM UTC
+    quantity: float = 0.01               # used when compound=False
     max_positions: int = 1               # max concurrent positions
-    max_capital_pct: float = 0.30        # max 30% of account for positions
     compound: bool = True                # scale quantity to equity
-    wait_for_midpoint: bool = False      # wait for spot to reach strike midpoint before entry
 
 
 @dataclass
 class StorageConfig:
     """Persistence settings."""
-    db_path: str = "./data/trader.db"
+    db_path: str = "./data/trader_weekend_vol.db"
     log_dir: str = "./logs"
     log_level: str = "INFO"
     log_rotation: str = "1 day"
@@ -164,26 +153,26 @@ class StorageConfig:
 @dataclass
 class MonitorConfig:
     """Runtime monitoring."""
-    check_interval_sec: int = 60         # position check loop interval
+    check_interval_sec: int = 5          # position check loop interval
     heartbeat_interval_sec: int = 300    # log heartbeat every 5 min
-    equity_snapshot_interval_sec: int = 3600  # hourly equity snapshot
+    equity_snapshot_interval_sec: int = 1800  # equity snapshot interval
 
 
 @dataclass
 class ChaserConfig:
     """Spread-gated market execution settings."""
-    window_seconds: int = 1800          # 30 minutes total window
-    poll_interval_sec: int = 60         # check / amend every 60 seconds
+    window_seconds: int = 600           # 10 minutes total window
+    poll_interval_sec: int = 30         # check / amend every 30 seconds
     tick_size_usdt: float = 5.0         # min price increment in USD
     market_fallback_sec: int = 60       # switch to market order last N seconds
     market_trigger_spread_ticks: int = 1  # trigger market when all legs spread <= N ticks
-    max_amend_attempts: int = 180       # safety cap on re-pricing loops
+    max_amend_attempts: int = 30        # safety cap on re-pricing loops
 
 
 @dataclass
 class TraderConfig:
     """Top-level trader configuration."""
-    name: str = "Short Strangle 7DTE ±10%"
+    name: str = "Weekend Vol BTC (Binance 3x USD)"
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
@@ -209,9 +198,8 @@ def _merge_section(dc_instance: Any, section: dict | None) -> None:
 
 def _validate_config(cfg: TraderConfig) -> None:
     """Validate critical config fields early so startup fails fast."""
-    allowed_modes = {"strangle", "iron_condor", "weekend_vol"}
-    if cfg.strategy.mode not in allowed_modes:
-        raise ValueError(f"strategy.mode must be one of {sorted(allowed_modes)}, got {cfg.strategy.mode!r}")
+    if cfg.strategy.mode != "weekend_vol":
+        raise ValueError(f"strategy.mode must be 'weekend_vol', got {cfg.strategy.mode!r}")
 
     if not re.match(r"^\d{2}:\d{2}$", cfg.strategy.entry_time_utc):
         raise ValueError("strategy.entry_time_utc must be in HH:MM format")
@@ -227,12 +215,12 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("strategy.max_delta_diff must be within [0, 0.95]")
     if cfg.strategy.leverage <= 0:
         raise ValueError("strategy.leverage must be > 0")
-    if cfg.strategy.mode != "weekend_vol" and cfg.strategy.quantity <= 0:
-        raise ValueError("strategy.quantity must be > 0")
+    if cfg.strategy.quantity < 0:
+        raise ValueError("strategy.quantity must be >= 0")
+    if not cfg.strategy.compound and cfg.strategy.quantity <= 0:
+        raise ValueError("strategy.quantity must be > 0 when strategy.compound is false")
     if cfg.strategy.max_positions < 1:
         raise ValueError("strategy.max_positions must be >= 1")
-    if not (0 < cfg.strategy.max_capital_pct <= 1.0):
-        raise ValueError("strategy.max_capital_pct must be within (0, 1]")
     if cfg.strategy.default_iv <= 0:
         raise ValueError("strategy.default_iv must be > 0")
     if cfg.strategy.entry_realized_vol_lookback_hours < 0:
@@ -245,10 +233,6 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("strategy.stop_loss_pct must be >= 0")
     if cfg.strategy.stop_loss_underlying_move_pct < 0:
         raise ValueError("strategy.stop_loss_underlying_move_pct must be >= 0")
-    if cfg.strategy.target_dte_days < 0:
-        raise ValueError("strategy.target_dte_days must be >= 0")
-    if cfg.strategy.dte_window_hours <= 0:
-        raise ValueError("strategy.dte_window_hours must be > 0")
 
     if cfg.exchange.timeout < 1:
         raise ValueError("exchange.timeout must be >= 1")

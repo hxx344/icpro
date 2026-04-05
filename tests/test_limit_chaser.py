@@ -101,11 +101,11 @@ class TestChaserConfig(unittest.TestCase):
 
     def test_defaults(self):
         cfg = ChaserConfig()
-        self.assertEqual(cfg.window_seconds, 1800)
-        self.assertEqual(cfg.poll_interval_sec, 60)
+        self.assertEqual(cfg.window_seconds, 600)
+        self.assertEqual(cfg.poll_interval_sec, 30)
         self.assertEqual(cfg.tick_size_usdt, 5.0)
         self.assertEqual(cfg.market_fallback_sec, 60)
-        self.assertEqual(cfg.max_amend_attempts, 180)
+        self.assertEqual(cfg.max_amend_attempts, 30)
 
     def test_custom_values(self):
         cfg = ChaserConfig(window_seconds=900, poll_interval_sec=5)

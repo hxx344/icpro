@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 from trader.config import load_config
 from trader.storage import Storage
 
-cfg = load_config("configs/trader/iron_condor_0dte.yaml")
+cfg = load_config("configs/trader/weekend_vol_btc.yaml")
 s = Storage(cfg.storage.db_path)
 
 base = datetime(2026, 3, 15, 8, 0, 0, tzinfo=timezone.utc)

@@ -28,7 +28,7 @@ from trader.config import TraderConfig, load_config
 from trader.equity import EquityTracker
 from trader.position_manager import PositionManager
 from trader.storage import Storage
-from trader.strategy import IronCondor0DTEStrategy, WeekendVolStrategy
+from trader.strategy import WeekendVolStrategy
 
 
 DEFAULT_CONFIG_PATH = os.environ.get(
@@ -104,9 +104,6 @@ class TraderApp:
 
         self.storage = Storage(config.storage.db_path)
 
-        # Binance USD margin client
-        strategy_mode = getattr(config.strategy, "mode", "strangle")
-
         self.client = BinanceOptionsClient(config.exchange)
         logger.info(
             f"Binance client: {'TESTNET' if config.exchange.testnet else 'PRODUCTION'} "
@@ -115,21 +112,12 @@ class TraderApp:
 
         self.pos_mgr = PositionManager(self.client, self.storage)
 
-        # Select strategy based on mode
-        if strategy_mode == "weekend_vol":
-            self.strategy = WeekendVolStrategy(
-                client=self.client,
-                position_mgr=self.pos_mgr,
-                storage=self.storage,
-                config=config.strategy,
-            )
-        else:
-            self.strategy = IronCondor0DTEStrategy(
-                client=self.client,
-                position_mgr=self.pos_mgr,
-                storage=self.storage,
-                config=config.strategy,
-            )
+        self.strategy = WeekendVolStrategy(
+            client=self.client,
+            position_mgr=self.pos_mgr,
+            storage=self.storage,
+            config=config.strategy,
+        )
 
         self.equity_tracker = EquityTracker(
             client=self.client,
@@ -138,7 +126,7 @@ class TraderApp:
             underlying=config.strategy.underlying,
         )
 
-        logger.info(f"Strategy: {strategy_mode} | Exchange: Binance")
+        logger.info("Strategy: weekend_vol | Exchange: Binance")
         logger.info("All modules initialized")
 
     # ------------------------------------------------------------------
@@ -155,17 +143,11 @@ class TraderApp:
         logger.info(f"  {self.cfg.name}")
         logger.info(f"  Underlying:    {self.cfg.strategy.underlying}")
 
-        mode = getattr(self.cfg.strategy, "mode", "strangle")
-        if mode == "weekend_vol":
-            logger.info(f"  Mode:          Weekend Vol Selling")
-            logger.info(f"  Target delta:  {self.cfg.strategy.target_delta}")
-            logger.info(f"  Wing delta:    {self.cfg.strategy.wing_delta}")
-            logger.info(f"  Leverage:      {self.cfg.strategy.leverage}x")
-            logger.info(f"  Entry:         {self.cfg.strategy.entry_day} {self.cfg.strategy.entry_time_utc} UTC")
-        else:
-            logger.info(f"  OTM:           ±{self.cfg.strategy.otm_pct*100:.0f}%")
-            logger.info(f"  Wing width:    {self.cfg.strategy.wing_width_pct*100:.0f}%")
-            logger.info(f"  Entry time:    {self.cfg.strategy.entry_time_utc} UTC")
+        logger.info("  Mode:          Weekend Vol Selling")
+        logger.info(f"  Target delta:  {self.cfg.strategy.target_delta}")
+        logger.info(f"  Wing delta:    {self.cfg.strategy.wing_delta}")
+        logger.info(f"  Leverage:      {self.cfg.strategy.leverage}x")
+        logger.info(f"  Entry:         {self.cfg.strategy.entry_day} {self.cfg.strategy.entry_time_utc} UTC")
 
         logger.info(f"  DB:            {self.cfg.storage.db_path}")
         logger.info(f"  Check interval:{self.cfg.monitor.check_interval_sec}s")
@@ -418,7 +400,7 @@ def cmd_close_all(args) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="期权交易程序 – Weekend Vol / Iron Condor",
+    description="期权交易程序 – Weekend Vol",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:

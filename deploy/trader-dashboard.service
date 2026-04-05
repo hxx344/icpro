@@ -1,5 +1,5 @@
 [Unit]
-Description=Iron Condor Trading Dashboard (Streamlit)
+Description=Weekend Vol Trading Dashboard (Streamlit)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=simple
 User=trader
 Group=trader
 WorkingDirectory=/opt/project_Options
-ExecStart=/opt/project_Options/.venv/bin/python -m streamlit run trader/dashboard.py -- --config configs/trader/iron_condor_0dte.yaml
+ExecStart=/opt/project_Options/.venv/bin/python -m streamlit run trader/dashboard.py -- --config configs/trader/weekend_vol_btc.yaml
 Restart=always
 RestartSec=5
 StandardOutput=journal

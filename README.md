@@ -5,7 +5,7 @@
 ## 交易程序概览
 
 - 默认实盘配置：`configs/trader/weekend_vol_btc.yaml`
-- 支持策略：`weekend_vol`、`iron_condor`、`strangle`
+- 当前实盘策略：`weekend_vol`（可通过 `wing_delta` 在带翼/无翼结构之间切换）
 - Dashboard 页面：总览、资产曲线、成交历史、策略配置、引擎状态
 - 当前已接入执行事件日志、执行健康指标与“执行风控锁”
 
@@ -60,12 +60,12 @@ python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 
 ### Weekend Vol BTC（推荐）
 
-当前推荐配置是 BTC 周末波动率卖方策略，默认是**裸双卖**而不是铁鹰：
+当前推荐配置是 BTC 周末波动率卖方策略；默认结构是**无翼结构**，但也可通过 `wing_delta > 0` 切到带翼结构：
 
 - `mode: weekend_vol`
 - `underlying: BTC`
 - `target_delta: 0.45`
-- `wing_delta: 0.0`（即无保护翼，short strangle）
+- `wing_delta: 0.0`（即无保护翼、无翼结构）
 - `entry_day: friday`
 - `entry_time_utc: 18:00`
 - `check_interval_sec: 5`
@@ -78,9 +78,7 @@ python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 
 | 配置文件 | 说明 |
 |---|---|
-| `configs/trader/weekend_vol_btc.yaml` | Weekend Vol BTC Short Strangle |
-| `configs/trader/iron_condor_0dte.yaml` | ETH 0DTE Iron Condor |
-| `configs/trader/short_strangle_7dte.yaml` | ETH 7DTE Short Strangle |
+| `configs/trader/weekend_vol_btc.yaml` | Weekend Vol BTC |
 
 ## 当前实盘特性
 
@@ -230,17 +228,17 @@ options-bt run --config configs/backtest/iron_condor.yaml
 ```
 src/options_backtest/    # 回测引擎（策略、撮合、定价、分析）
 trader/                  # 自动交易系统
-  ├── binance_client.py  #   Binance API 客户端 + Greeks 获取
+  ├── binance_client/    #   Binance API 客户端 + Greeks 获取
   ├── limit_chaser.py    #   限价追单引擎
   ├── position_manager.py#   仓位管理
-  ├── strategy.py        #   WeekendVol / IronCondor0DTE / Strangle 策略
+  ├── strategy.py        #   WeekendVolStrategy（支持带翼/无翼结构）
   ├── engine.py          #   交易引擎（后台线程）
   ├── dashboard.py       #   Streamlit 管理面板
   ├── config.py          #   YAML 配置加载
   └── storage.py         #   SQLite 持久化
 configs/                 # YAML 配置（回测 + 交易）
 monitor/                 # 行情监控面板
-tests/                   # 299 个单元测试
+tests/                   # 单元测试与回归测试
 ```
 
 ## 测试

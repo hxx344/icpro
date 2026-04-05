@@ -20,7 +20,7 @@ from trader.equity import EquityTracker
 from trader.limit_chaser import ChaserConfig as _ChaserConfig
 from trader.position_manager import PositionManager
 from trader.storage import Storage
-from trader.strategy import OptionSellingStrategy, WeekendVolStrategy
+from trader.strategy import WeekendVolStrategy
 
 
 class TradingEngine:
@@ -61,7 +61,7 @@ class TradingEngine:
         # Exchange client (Binance USD margin)
         self.client: Optional[BinanceOptionsClient] = None
         self.pos_mgr: Optional[PositionManager] = None
-        self.strategy: Optional[Any] = None                   # OptionSelling or WeekendVol
+        self.strategy: Optional[Any] = None
         self.equity_tracker: Optional[EquityTracker] = None
         self.storage: Optional[Storage] = None
 
@@ -211,9 +211,6 @@ class TradingEngine:
 
         self.storage = Storage(self.cfg.storage.db_path)
 
-        # Binance USD margin client
-        strategy_mode = getattr(self.cfg.strategy, "mode", "strangle")
-
         self.client = BinanceOptionsClient(self.cfg.exchange)
         logger.info(
             f"Binance client: "
@@ -232,21 +229,12 @@ class TradingEngine:
             ),
         )
 
-        # Select strategy
-        if strategy_mode == "weekend_vol":
-            self.strategy = WeekendVolStrategy(
-                client=self.client,
-                position_mgr=self.pos_mgr,
-                storage=self.storage,
-                config=self.cfg.strategy,
-            )
-        else:
-            self.strategy = OptionSellingStrategy(
-                client=self.client,
-                position_mgr=self.pos_mgr,
-                storage=self.storage,
-                config=self.cfg.strategy,
-            )
+        self.strategy = WeekendVolStrategy(
+            client=self.client,
+            position_mgr=self.pos_mgr,
+            storage=self.storage,
+            config=self.cfg.strategy,
+        )
 
         self.equity_tracker = EquityTracker(
             client=self.client,
@@ -255,7 +243,7 @@ class TradingEngine:
             underlying=self.cfg.strategy.underlying,
         )
 
-        logger.info(f"Strategy: {strategy_mode} | All modules initialized")
+        logger.info("Strategy: weekend_vol | All modules initialized")
 
     def _setup_logging(self) -> None:
         """Configure loguru for the engine."""

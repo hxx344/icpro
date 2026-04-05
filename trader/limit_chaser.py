@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -56,12 +56,12 @@ class LegOrder:
 @dataclass
 class ChaserConfig:
     """Configuration for the limit-order chaser."""
-    window_seconds: int = 1800          # 30 minutes total window
-    poll_interval_sec: int = 60         # check / amend every 60 seconds
+    window_seconds: int = 600           # 10 minutes total window
+    poll_interval_sec: int = 30         # check / amend every 30 seconds
     tick_size_usdt: float = 5.0         # min price increment in USD
     market_fallback_sec: int = 60       # switch to market order last N seconds
     market_trigger_spread_ticks: int = 1  # trigger market when all legs spread <= N ticks
-    max_amend_attempts: int = 180       # safety cap on re-pricing loops
+    max_amend_attempts: int = 30        # safety cap on re-pricing loops
 
 
 # ---------------------------------------------------------------------------

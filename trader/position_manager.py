@@ -27,7 +27,7 @@ from trader.storage import Storage
 # ---------------------------------------------------------------------------
 
 @dataclass
-class CondorLeg:
+class PositionLeg:
     """Single option leg inside a grouped position."""
     symbol: str
     side: str              # "SELL" or "BUY"
@@ -40,7 +40,7 @@ class CondorLeg:
 
 
 @dataclass
-class IronCondorPosition:
+class OptionPosition:
     """Multi-leg option position.
 
     Legs:
@@ -54,15 +54,15 @@ class IronCondorPosition:
     group_id: str               # unique group identifier
     entry_time: datetime
     underlying_price: float     # spot at entry
-    sell_put: CondorLeg | None = None
-    buy_put: CondorLeg | None = None
-    sell_call: CondorLeg | None = None
-    buy_call: CondorLeg | None = None
+    sell_put: PositionLeg | None = None
+    buy_put: PositionLeg | None = None
+    sell_call: PositionLeg | None = None
+    buy_call: PositionLeg | None = None
     is_open: bool = True
     total_premium: float = 0.0  # net premium collected
 
     @property
-    def legs(self) -> list[CondorLeg]:
+    def legs(self) -> list[PositionLeg]:
         return [l for l in [self.sell_put, self.buy_put,
                             self.sell_call, self.buy_call] if l is not None]
 
@@ -93,18 +93,22 @@ class IronCondorPosition:
         return width - self.total_premium
 
 
+CondorLeg = PositionLeg
+IronCondorPosition = OptionPosition
+
+
 # ---------------------------------------------------------------------------
 # Position Manager
 # ---------------------------------------------------------------------------
 
 class PositionManager:
-    """Manages iron condor positions with exchange integration.
+    """Manages grouped option positions with exchange integration.
 
     Responsibilities:
-    - Open new iron condor positions (4-leg order)
+    - Open new grouped option positions (2-leg / 4-leg)
     - Track all open positions
     - Monitor PnL and trigger TP/SL
-    - Close positions (4-leg close)
+    - Close positions
     - Sync with exchange positions
     - Record all trades to persistent storage
     """
@@ -129,18 +133,23 @@ class PositionManager:
         self.client = client
         self.storage = storage
         self.chaser = LimitChaser(client, chaser_config)
-        self.open_condors: dict[str, IronCondorPosition] = {}  # group_id -> position
+        self.open_condors: dict[str, OptionPosition] = {}  # group_id -> position
         self._load_open_positions()
+
+    @property
+    def open_positions(self) -> dict[str, OptionPosition]:
+        """Neutral alias for live grouped positions."""
+        return self.open_condors
 
     def _build_position_from_trades(
         self,
         group_id: str,
         trades: list[dict[str, Any]],
-    ) -> IronCondorPosition | None:
+    ) -> OptionPosition | None:
         if not trades:
             return None
 
-        condor = IronCondorPosition(
+        condor = OptionPosition(
             group_id=group_id,
             entry_time=datetime.fromisoformat(trades[0]["timestamp"]),
             underlying_price=0.0,
@@ -151,7 +160,7 @@ class PositionManager:
         for t in trades:
             import json
             meta = json.loads(t.get("meta", "{}"))
-            leg = CondorLeg(
+            leg = PositionLeg(
                 symbol=t["symbol"],
                 side=t["side"],
                 option_type=meta.get("option_type", ""),
@@ -192,7 +201,7 @@ class PositionManager:
                 self.open_condors[group_id] = condor
 
         if self.open_condors:
-            logger.info(f"Recovered {len(self.open_condors)} open condor position(s)")
+            logger.info(f"Recovered {len(self.open_condors)} open position(s)")
 
     def _ensure_group_loaded(self, group_id: str) -> bool:
         if group_id in self.open_condors:
@@ -443,12 +452,12 @@ class PositionManager:
         underlying_price: float,
         results: list[LegOrder],
         requested_quantity: float,
-    ) -> tuple[IronCondorPosition | None, float]:
+    ) -> tuple[OptionPosition | None, float]:
         filled_results = self._filled_leg_orders(results)
         if not filled_results:
             return None, 0.0
 
-        condor = IronCondorPosition(
+        condor = OptionPosition(
             group_id=group_id,
             entry_time=datetime.now(timezone.utc),
             underlying_price=underlying_price,
@@ -475,7 +484,7 @@ class PositionManager:
                 meta=meta,
             )
 
-            leg = CondorLeg(
+            leg = PositionLeg(
                 symbol=leg_order.symbol,
                 side=leg_order.side,
                 option_type=leg_order.option_type,
@@ -1004,10 +1013,10 @@ class PositionManager:
         underlying_price: float,
         execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> IronCondorPosition | None:
+    ) -> OptionPosition | None:
         """Open a naked short strangle (2 legs).
 
-        Returns the IronCondorPosition (with buy legs = None) if all legs
+        Returns the OptionPosition (with buy legs = None) if all legs
         fill, or None on failure.
         """
         group_id = f"SS_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -1199,7 +1208,7 @@ class PositionManager:
         return condor
 
     # ------------------------------------------------------------------
-    # Open a new iron condor
+    # Open a new winged position
     # ------------------------------------------------------------------
 
     def open_iron_condor(
@@ -1216,8 +1225,8 @@ class PositionManager:
         underlying_price: float,
         execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> IronCondorPosition | None:
-        """Open a full iron condor.
+    ) -> OptionPosition | None:
+        """Open a full winged position.
 
         Default `execution_mode="market"` submits each leg as a market order.
         `execution_mode="chaser"` remains available as an optional adaptive limit chaser.
@@ -1228,7 +1237,7 @@ class PositionManager:
             raise ValueError(f"Unsupported execution_mode: {execution_mode}")
 
         logger.info(
-            f"Opening Iron Condor {group_id} ({execution_mode_norm}): "
+            f"Opening winged position {group_id} ({execution_mode_norm}): "
             f"sell_put={sell_put_strike} buy_put={buy_put_strike} "
             f"sell_call={sell_call_strike} buy_call={buy_call_strike} "
             f"qty={quantity} spot={underlying_price}"
@@ -1261,7 +1270,7 @@ class PositionManager:
         underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
         self._emit_execution_event(
             event_type="position_open_start",
-            message=f"开始提交 Iron Condor {group_id}（{execution_mode_norm}）",
+            message=f"开始提交带翼组合 {group_id}（{execution_mode_norm}）",
             group_id=group_id,
             execution_mode=execution_mode_norm,
             execution_state="opening",
@@ -1289,7 +1298,7 @@ class PositionManager:
                     status_callback=status_callback,
                 )
             except Exception as e:
-                logger.error(f"Iron Condor {group_id}: execute_legs exception: {e}")
+                logger.error(f"Winged position {group_id}: execute_legs exception: {e}")
                 self._emit_execution_event(
                     event_type="position_open_error",
                     message=f"追单异常: {e}",
@@ -1306,7 +1315,7 @@ class PositionManager:
         failed = [r for r in results if r.status != "FILLED"]
         if failed:
             logger.error(
-                f"Iron Condor {group_id}: {len(failed)} leg(s) failed to fill – "
+                f"Winged position {group_id}: {len(failed)} leg(s) failed to fill – "
                 + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
             )
             rollback_due_to_margin = self._has_margin_insufficient_failure(failed)
@@ -1321,12 +1330,12 @@ class PositionManager:
                             requested_quantity=quantity,
                         )
                     except Exception as e:
-                        logger.error(f"Iron Condor {group_id}: partial persistence failed: {e}")
+                        logger.error(f"Winged position {group_id}: partial persistence failed: {e}")
                         return None
 
                     if condor is not None:
                         logger.warning(
-                            f"Iron Condor {group_id}: partial fill kept live without rollback; "
+                            f"Winged position {group_id}: partial fill kept live without rollback; "
                             f"filled={len(filled_results)}/{len(results)}"
                         )
                         self._emit_execution_event(
@@ -1379,7 +1388,7 @@ class PositionManager:
             if condor is None:
                 raise RuntimeError("No filled legs to persist after successful execution")
         except Exception as e:
-            logger.error(f"Iron Condor {group_id}: persistence failed after fills: {e}")
+            logger.error(f"Winged position {group_id}: persistence failed after fills: {e}")
             rollback_failures = self._rollback_legs([
                 (
                     r.leg_role,
@@ -1416,13 +1425,13 @@ class PositionManager:
             return None
 
         logger.info(
-            f"Iron Condor {group_id} opened via {execution_mode_norm}. "
+            f"Winged position {group_id} opened via {execution_mode_norm}. "
             f"Net premium: {total_premium:.4f} USD"
         )
 
         self._emit_execution_event(
             event_type="position_open_success",
-            message=f"Iron Condor {group_id} 已全部成交",
+            message=f"带翼组合 {group_id} 已全部成交",
             group_id=group_id,
             execution_mode=execution_mode_norm,
             execution_state="open",
@@ -1433,6 +1442,37 @@ class PositionManager:
         )
 
         return condor
+
+    def open_winged_position(
+        self,
+        sell_call_symbol: str,
+        buy_call_symbol: str,
+        sell_put_symbol: str,
+        buy_put_symbol: str,
+        sell_call_strike: float,
+        buy_call_strike: float,
+        sell_put_strike: float,
+        buy_put_strike: float,
+        quantity: float,
+        underlying_price: float,
+        execution_mode: str = "market",
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> OptionPosition | None:
+        """Neutral alias for opening a 4-leg winged position."""
+        return self.open_iron_condor(
+            sell_call_symbol=sell_call_symbol,
+            buy_call_symbol=buy_call_symbol,
+            sell_put_symbol=sell_put_symbol,
+            buy_put_symbol=buy_put_symbol,
+            sell_call_strike=sell_call_strike,
+            buy_call_strike=buy_call_strike,
+            sell_put_strike=sell_put_strike,
+            buy_put_strike=buy_put_strike,
+            quantity=quantity,
+            underlying_price=underlying_price,
+            execution_mode=execution_mode,
+            status_callback=status_callback,
+        )
 
     def _execute_market_legs(
         self,
@@ -1657,17 +1697,17 @@ class PositionManager:
         return failed_rollbacks
 
     # ------------------------------------------------------------------
-    # Close an iron condor
+    # Close a grouped position
     # ------------------------------------------------------------------
 
     def close_iron_condor(self, group_id: str, reason: str = "", execution_mode: str = "market") -> float:
-        """Close all legs of an iron condor.
+        """Close all legs of a grouped position.
 
         Returns total realized PnL.
         """
         condor = self.open_condors.get(group_id)
         if not condor or not condor.is_open:
-            logger.warning(f"Condor {group_id} not found or already closed")
+            logger.warning(f"Position {group_id} not found or already closed")
             return 0.0
 
         execution_mode_norm = str(execution_mode or "market").strip().lower()
@@ -1675,7 +1715,7 @@ class PositionManager:
             raise ValueError(f"Unsupported close execution_mode: {execution_mode}")
 
         logger.info(
-            f"Closing Iron Condor {group_id}, reason: {reason}, mode: {execution_mode_norm}"
+            f"Closing position {group_id}, reason: {reason}, mode: {execution_mode_norm}"
         )
 
         # Build close legs
@@ -1741,11 +1781,15 @@ class PositionManager:
         del self.open_condors[group_id]
 
         logger.info(
-            f"Iron Condor {group_id} closed. "
+            f"Position {group_id} closed. "
             f"Total PnL: {total_pnl:.4f} USD. Reason: {reason}"
         )
 
         return total_pnl
+
+    def close_position(self, group_id: str, reason: str = "", execution_mode: str = "market") -> float:
+        """Neutral alias for closing a live grouped position."""
+        return self.close_iron_condor(group_id, reason=reason, execution_mode=execution_mode)
 
     def close_all(self, reason: str = "close_all", execution_mode: str = "market") -> float:
         """Close all open iron condors."""
@@ -1896,7 +1940,7 @@ class PositionManager:
     # ------------------------------------------------------------------
 
     def get_unrealized_pnl(self, mark_prices: dict[str, float]) -> float:
-        """Compute total unrealized PnL across all open condors.
+        """Compute total unrealized PnL across all open positions.
 
         Parameters
         ----------
@@ -1922,8 +1966,18 @@ class PositionManager:
         upnl = self.get_unrealized_pnl(mark_prices or {})
         return {
             "open_condors": self.open_position_count,
+            "open_positions": self.open_position_count,
             "unrealized_pnl": upnl,
             "condors": {
+                gid: {
+                    "entry_time": c.entry_time.isoformat(),
+                    "underlying_price": c.underlying_price,
+                    "total_premium": c.total_premium,
+                    "legs": len(c.legs),
+                }
+                for gid, c in self.open_condors.items()
+            },
+            "positions": {
                 gid: {
                     "entry_time": c.entry_time.isoformat(),
                     "underlying_price": c.underlying_price,

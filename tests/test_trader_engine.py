@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -395,9 +395,10 @@ class TestEngineEquityIntegration:
         client.get_spot_price.return_value = 2500.0
         client.get_tickers.return_value = []
         client.get_mark_prices.return_value = {}
+        expiry_code = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%y%m%d")
         client.get_positions.return_value = [
-            {"symbol": "ETH-260405-2700-C", "side": "SHORT", "quantity": -0.5, "entryPrice": 55.0, "unrealizedPnl": -2.0},
-            {"symbol": "ETH-260405-2300-P", "side": "SHORT", "quantity": -0.5, "entryPrice": 50.0, "unrealizedPnl": 1.0},
+            {"symbol": f"ETH-{expiry_code}-2700-C", "side": "SHORT", "quantity": -0.5, "entryPrice": 55.0, "unrealizedPnl": -2.0},
+            {"symbol": f"ETH-{expiry_code}-2300-P", "side": "SHORT", "quantity": -0.5, "entryPrice": 50.0, "unrealizedPnl": 1.0},
         ]
 
         with patch("trader.engine.BinanceOptionsClient", return_value=client):
@@ -412,6 +413,6 @@ class TestEngineEquityIntegration:
             assert engine.storage is not None
             open_trades = engine.storage.get_open_trades()
             assert len(open_trades) == 2
-            assert {t["symbol"] for t in open_trades} == {"ETH-260405-2700-C", "ETH-260405-2300-P"}
+            assert {t["symbol"] for t in open_trades} == {f"ETH-{expiry_code}-2700-C", f"ETH-{expiry_code}-2300-P"}
 
             engine.stop(timeout=5.0)

@@ -13,6 +13,7 @@ exchange:
   account_currency: USDT
   simulate_private: false
 strategy:
+  mode: iron_condor
   underlying: ETH
   otm_pct: 0.01
   wing_width_pct: 0.08

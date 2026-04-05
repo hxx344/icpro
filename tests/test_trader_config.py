@@ -34,8 +34,8 @@ from trader.config import (
 class TestExchangeConfig:
     def test_defaults(self):
         cfg = ExchangeConfig()
-        assert cfg.testnet is True
-        assert cfg.timeout == 10
+        assert cfg.testnet is False
+        assert cfg.timeout == 15
         assert cfg.account_currency == "USDT"
         assert cfg.simulate_private is False
 
@@ -77,13 +77,11 @@ class TestExchangeConfig:
 class TestStrategyConfig:
     def test_defaults(self):
         cfg = StrategyConfig()
-        assert cfg.mode == "strangle"
-        assert cfg.underlying == "ETH"
-        assert cfg.otm_pct == 0.10
-        assert cfg.wing_width_pct == 0.02
-        assert cfg.target_dte_days == 7
-        assert cfg.dte_window_hours == 48
-        assert cfg.entry_time_utc == "08:00"
+        assert cfg.mode == "weekend_vol"
+        assert cfg.underlying == "BTC"
+        assert cfg.target_delta == 0.45
+        assert cfg.wing_delta == 0.0
+        assert cfg.entry_time_utc == "18:00"
         assert cfg.compound is True
 
 
@@ -96,7 +94,7 @@ class TestStorageConfig:
 class TestMonitorConfig:
     def test_defaults(self):
         cfg = MonitorConfig()
-        assert cfg.check_interval_sec == 60
+        assert cfg.check_interval_sec == 5
         assert cfg.heartbeat_interval_sec == 300
 
 
@@ -121,13 +119,13 @@ class TestLoadConfig:
     def test_load_none(self):
         """path=None 返回全部默认值."""
         cfg = load_config(None)
-        assert cfg.name == "Short Strangle 7DTE ±10%"
-        assert cfg.exchange.testnet is True
+        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
+        assert cfg.exchange.testnet is False
 
     def test_load_missing_file(self, tmp_path):
         """文件不存在时使用默认值 (不报错)."""
         cfg = load_config(tmp_path / "nonexistent.yaml")
-        assert cfg.name == "Short Strangle 7DTE ±10%"
+        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
 
     def test_load_yaml(self, tmp_path, monkeypatch):
         """从 YAML 加载配置并合并."""
@@ -144,7 +142,7 @@ class TestLoadConfig:
             },
             "strategy": {
                 "underlying": "BTC",
-                "otm_pct": 0.10,
+                "target_delta": 0.35,
             },
         }
         yaml_path = tmp_path / "test_config.yaml"
@@ -157,14 +155,14 @@ class TestLoadConfig:
         assert cfg.exchange.testnet is False
         assert "eapi.binance.com" in cfg.exchange.base_url
         assert cfg.strategy.underlying == "BTC"
-        assert cfg.strategy.otm_pct == 0.10
+        assert cfg.strategy.target_delta == 0.35
 
     def test_load_empty_yaml(self, tmp_path):
         """空 YAML 文件不报错."""
         yaml_path = tmp_path / "empty.yaml"
         yaml_path.write_text("")
         cfg = load_config(yaml_path)
-        assert cfg.name == "Short Strangle 7DTE ±10%"
+        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
 
     def test_all_sections_merge(self, tmp_path, monkeypatch):
         """所有配置节都能正确合并."""
@@ -191,7 +189,7 @@ class TestLoadConfig:
         [
             ({"strategy": {"mode": "bad_mode"}}, "strategy.mode"),
             ({"strategy": {"entry_time_utc": "25:00"}}, "entry_time_utc"),
-            ({"strategy": {"quantity": 0}}, "strategy.quantity"),
+            ({"strategy": {"compound": False, "quantity": 0}}, "strategy.quantity"),
             ({"chaser": {"window_seconds": 10, "market_fallback_sec": 10}}, "market_fallback_sec"),
         ],
     )

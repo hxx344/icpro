@@ -98,25 +98,22 @@ class TestBinanceFormulaHelpers:
 
 
 class TestOrderPreviewHelpers:
-    def test_preview_strangle_uses_formula_margin_and_scaled_quantity(self):
+    def test_preview_weekend_vol_without_wings_uses_formula_margin_and_scaled_quantity(self):
         sell_call = _make_ticker("BTC-260411-100000-C", 100000.0, "call", bid=100.0, ask=110.0, mark=105.0)
         sell_put = _make_ticker("BTC-260411-80000-P", 80000.0, "put", bid=90.0, ask=100.0, mark=95.0)
 
         preview = compute_option_order_preview(
-            mode="strangle",
             spot=90000.0,
-            base_quantity=0.01,
+            base_quantity=0.0,
             compound=True,
             equity=10000.0,
             available_balance=8000.0,
-            max_capital_pct=0.30,
-            otm_pct=0.10,
-            wing_width_pct=0.05,
+            leverage=3.0,
             sell_call=sell_call,
             sell_put=sell_put,
         )
 
-        assert preview["quantity"] == pytest.approx(0.16, abs=0.01)
+        assert preview["quantity"] == pytest.approx(0.3, abs=0.11)
         assert preview["margin_per_unit"] == pytest.approx(18029.0)
         assert preview["margin_used"] == pytest.approx(preview["margin_per_unit"] * preview["quantity"])
         assert preview["break_even_upper"] == pytest.approx(100190.0)
@@ -127,15 +124,12 @@ class TestOrderPreviewHelpers:
         sell_put = _make_ticker("BTC-260411-79000-P", 79000.0, "put", bid=90.0, ask=100.0, mark=95.0, spot=87000.0)
 
         preview = compute_option_order_preview(
-            mode="weekend_vol",
             spot=87000.0,
             base_quantity=0.1,
             compound=True,
             equity=10000.0,
             available_balance=8000.0,
             leverage=10.0,
-            otm_pct=0.10,
-            wing_width_pct=0.0,
             sell_call=sell_call,
             sell_put=sell_put,
         )
@@ -143,19 +137,16 @@ class TestOrderPreviewHelpers:
         assert preview["quantity"] == pytest.approx(0.4, abs=0.11)
         assert preview["equity_source"] == "实时权益(复利 10x)"
 
-    def test_preview_iron_condor_returns_total_max_loss(self):
+    def test_preview_winged_weekend_vol_returns_total_max_loss(self):
         sell_call = _make_ticker("BTC-260411-100000-C", 100000.0, "call", bid=100.0, ask=110.0, mark=105.0)
         sell_put = _make_ticker("BTC-260411-80000-P", 80000.0, "put", bid=90.0, ask=100.0, mark=95.0)
         buy_call = _make_ticker("BTC-260411-105000-C", 105000.0, "call", bid=60.0, ask=70.0, mark=65.0)
         buy_put = _make_ticker("BTC-260411-75000-P", 75000.0, "put", bid=55.0, ask=65.0, mark=60.0)
 
         preview = compute_option_order_preview(
-            mode="iron_condor",
             spot=90000.0,
             base_quantity=0.5,
             compound=False,
-            otm_pct=0.10,
-            wing_width_pct=0.05,
             sell_call=sell_call,
             sell_put=sell_put,
             buy_call=buy_call,

@@ -66,7 +66,7 @@ from trader.config import load_config
 from trader.storage import Storage
 from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.binance_client import BinanceOptionsClient, OptionTicker
-from trader.position_manager import PositionManager, IronCondorPosition, CondorLeg
+from trader.position_manager import PositionManager, OptionPosition, PositionLeg
 from trader.limit_chaser import ChaserConfig as DashboardChaserConfig
 from trader.order_preview import compute_option_order_preview
 
@@ -200,19 +200,19 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
         runtime["state"] = "engine_unavailable"
         return runtime
 
-    condor = engine_ref.pos_mgr.open_condors.get(group_id)
-    if condor is None or not condor.is_open:
+    position = engine_ref.pos_mgr.open_positions.get(group_id)
+    if position is None or not position.is_open:
         runtime["state"] = "not_open"
         return runtime
 
     runtime["state"] = "active"
-    runtime["legs"] = len(condor.legs)
-    runtime["entry_credit"] = float(condor.total_premium or 0.0)
-    runtime["entry_underlying_price"] = float(condor.underlying_price or 0.0)
-    runtime["sell_put_strike"] = float(condor.sell_put.strike) if condor.sell_put else None
-    runtime["sell_call_strike"] = float(condor.sell_call.strike) if condor.sell_call else None
+    runtime["legs"] = len(position.legs)
+    runtime["entry_credit"] = float(position.total_premium or 0.0)
+    runtime["entry_underlying_price"] = float(position.underlying_price or 0.0)
+    runtime["sell_put_strike"] = float(position.sell_put.strike) if position.sell_put else None
+    runtime["sell_call_strike"] = float(position.sell_call.strike) if position.sell_call else None
 
-    underlying = _infer_underlying_from_symbols([leg.symbol for leg in condor.legs])
+    underlying = _infer_underlying_from_symbols([leg.symbol for leg in position.legs])
     runtime["underlying"] = underlying
     if not underlying:
         runtime["state"] = "active_no_underlying"
@@ -225,7 +225,7 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
         current_spot = 0.0
     if current_spot > 0:
         runtime["current_spot"] = current_spot
-        entry_underlying_price = float(condor.underlying_price or 0.0)
+        entry_underlying_price = float(position.underlying_price or 0.0)
         if entry_underlying_price > 0:
             underlying_move_pct = abs((current_spot / entry_underlying_price - 1.0) * 100.0)
             runtime["underlying_move_pct"] = abs(
@@ -244,7 +244,7 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
 
     entry_credit = 0.0
     close_cost = 0.0
-    for leg in condor.legs:
+    for leg in position.legs:
         sign = 1.0 if leg.side == "SELL" else -1.0
         mark = float(mark_prices.get(leg.symbol, leg.entry_price) or leg.entry_price)
         entry_credit += float(leg.entry_price) * float(leg.quantity) * sign
@@ -266,8 +266,8 @@ def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[s
         runtime["stop_loss_trigger_close_cost"] = stop_loss_trigger_close_cost
         runtime["stop_loss_trigger_price_boundary"] = stop_loss_trigger_price_boundary
         runtime["stop_loss_trigger_pnl"] = -(entry_credit * stop_loss_pct / 100.0)
-        sell_put_strike = float(condor.sell_put.strike) if condor.sell_put else None
-        sell_call_strike = float(condor.sell_call.strike) if condor.sell_call else None
+        sell_put_strike = float(position.sell_put.strike) if position.sell_put else None
+        sell_call_strike = float(position.sell_call.strike) if position.sell_call else None
         if sell_put_strike is not None:
             runtime["stop_loss_trigger_spot_low"] = sell_put_strike - float(stop_loss_trigger_price_boundary or 0.0)
         if sell_call_strike is not None:
@@ -460,7 +460,7 @@ def _start_test_order_task(
                     "exchange_positions_error": str(_snapshot_exc),
                 }
 
-        def _recover_test_position_from_snapshot(snapshot: dict[str, object]) -> IronCondorPosition | None:
+        def _recover_test_position_from_snapshot(snapshot: dict[str, object]) -> OptionPosition | None:
             _positions = snapshot.get("exchange_positions") or []
             if not isinstance(_positions, list) or not _positions:
                 return None
@@ -489,7 +489,7 @@ def _start_test_order_task(
                 _matched.append((_role, _sym, _strike, _option_type, _side, _pos))
 
             _group_id = str(last_progress.get("group_id") or f"REC_{task_id[:8]}")
-            _condor = IronCondorPosition(
+            _position = OptionPosition(
                 group_id=_group_id,
                 entry_time=datetime.now(timezone.utc),
                 underlying_price=float(order_params.get("underlying_price") or 0.0),
@@ -499,7 +499,7 @@ def _start_test_order_task(
             for _role, _sym, _strike, _option_type, _side, _pos in _matched:
                 _entry_price = float(_pos.get("entryPrice") or 0.0)
                 _qty = abs(float(_pos.get("quantity") or order_params.get("quantity") or 0.0))
-                _leg = CondorLeg(
+                _leg = PositionLeg(
                     symbol=_sym,
                     side=_side,
                     option_type=_option_type,
@@ -509,10 +509,10 @@ def _start_test_order_task(
                     trade_id=0,
                     order_id="",
                 )
-                setattr(_condor, _role, _leg)
+                setattr(_position, _role, _leg)
                 _total_premium += _entry_price * _qty if _side == "SELL" else -_entry_price * _qty
-            _condor.total_premium = _total_premium
-            return _condor
+            _position.total_premium = _total_premium
+            return _position
 
         def _on_progress(progress: dict) -> None:
             last_progress.clear()
@@ -552,7 +552,7 @@ def _start_test_order_task(
 
             _is_strangle = not order_params.get("buy_call_symbol") and not order_params.get("buy_put_symbol")
             if _is_strangle:
-                condor = task_pos_mgr.open_short_strangle(
+                position = task_pos_mgr.open_short_strangle(
                     execution_mode="market",
                     status_callback=_on_progress,
                     sell_call_symbol=order_params["sell_call_symbol"],
@@ -563,16 +563,16 @@ def _start_test_order_task(
                     underlying_price=order_params["underlying_price"],
                 )
             else:
-                condor = task_pos_mgr.open_iron_condor(
+                position = task_pos_mgr.open_winged_position(
                     execution_mode="market",
                     status_callback=_on_progress,
                     **order_params,
                 )
 
-            if condor is not None:
-                _group_id = str(getattr(condor, "group_id", ""))
+            if position is not None:
+                _group_id = str(getattr(position, "group_id", ""))
                 if attach_to_engine_for_stop_loss and engine_ref.pos_mgr is not None:
-                    engine_ref.pos_mgr.open_condors[_group_id] = condor
+                    engine_ref.pos_mgr.open_positions[_group_id] = position
                 _snapshot = _capture_exchange_positions_snapshot()
                 _update_test_order_task(
                     task_id,
@@ -591,11 +591,11 @@ def _start_test_order_task(
                 )
             else:
                 _snapshot = _capture_exchange_positions_snapshot()
-                _recovered_condor = _recover_test_position_from_snapshot(_snapshot)
-                if _recovered_condor is not None:
-                    _group_id = str(_recovered_condor.group_id)
+                _recovered_position = _recover_test_position_from_snapshot(_snapshot)
+                if _recovered_position is not None:
+                    _group_id = str(_recovered_position.group_id)
                     if attach_to_engine_for_stop_loss and engine_ref.pos_mgr is not None:
-                        engine_ref.pos_mgr.open_condors[_group_id] = _recovered_condor
+                        engine_ref.pos_mgr.open_positions[_group_id] = _recovered_position
                     _update_test_order_task(
                         task_id,
                         state="success",
@@ -622,11 +622,11 @@ def _start_test_order_task(
                     )
         except Exception as exc:
             _snapshot = _capture_exchange_positions_snapshot()
-            _recovered_condor = _recover_test_position_from_snapshot(_snapshot)
-            if _recovered_condor is not None:
-                _group_id = str(_recovered_condor.group_id)
+            _recovered_position = _recover_test_position_from_snapshot(_snapshot)
+            if _recovered_position is not None:
+                _group_id = str(_recovered_position.group_id)
                 if attach_to_engine_for_stop_loss and engine_ref.pos_mgr is not None:
-                    engine_ref.pos_mgr.open_condors[_group_id] = _recovered_condor
+                    engine_ref.pos_mgr.open_positions[_group_id] = _recovered_position
                 _update_test_order_task(
                     task_id,
                     state="success",
@@ -668,7 +668,7 @@ def get_config_path() -> str:
     for i, a in enumerate(args):
         if a == "--config" and i + 1 < len(args):
             return args[i + 1]
-    return "configs/trader/short_strangle_7dte.yaml"
+    return "configs/trader/weekend_vol_btc.yaml"
 
 
 config_path = get_config_path()
@@ -755,23 +755,12 @@ st.query_params["mode"] = _mode_label_to_param.get(trading_mode, "readonly")
 is_trade_mode = "交易" in trading_mode
 st.sidebar.markdown(f"**策略:** {cfg.name}")
 st.sidebar.markdown(f"**标的:** {cfg.strategy.underlying}")
-_sidebar_mode = getattr(cfg.strategy, 'mode', 'iron_condor')
-if _sidebar_mode == "weekend_vol":
-    _mode_label = "周末波动率"
-    _delta_label = getattr(cfg.strategy, 'target_delta', 0.40)
-    _wing_d_label = getattr(cfg.strategy, 'wing_delta', 0.05)
-    st.sidebar.markdown(
-        f"**模式:** {_mode_label} | **Δ:** {_delta_label:.0%} / {_wing_d_label:.0%} | "
-        f"**杠杆:** {getattr(cfg.strategy, 'leverage', 1.0):.0f}x"
-    )
-elif _sidebar_mode == "strangle":
-    _mode_label = "裸卖双卖"
-    _dte_label = getattr(cfg.strategy, 'target_dte_days', 0)
-    st.sidebar.markdown(f"**模式:** {_mode_label} | **DTE:** {_dte_label}d | **OTM:** ±{cfg.strategy.otm_pct*100:.0f}%")
-else:
-    _mode_label = "铁鹰"
-    _dte_label = getattr(cfg.strategy, 'target_dte_days', 0)
-    st.sidebar.markdown(f"**模式:** {_mode_label} | **DTE:** {_dte_label}d | **OTM:** ±{cfg.strategy.otm_pct*100:.0f}%")
+_wing_label = "带翼结构" if getattr(cfg.strategy, 'wing_delta', 0.0) > 0 else "无翼结构"
+st.sidebar.markdown(
+    f"**模式:** 周末波动率 | **结构:** {_wing_label} | "
+    f"**Δ:** {getattr(cfg.strategy, 'target_delta', 0.40):.0%} / {getattr(cfg.strategy, 'wing_delta', 0.05):.0%} | "
+    f"**杠杆:** {getattr(cfg.strategy, 'leverage', 1.0):.0f}x"
+)
 st.sidebar.markdown(f"**数据库:** `{cfg.storage.db_path}`")
 
 st.sidebar.divider()
@@ -1641,30 +1630,17 @@ elif page == "🔧 策略配置":
     def _render_strategy_form() -> None:
         with st.form("config_editor", border=True):
             st.subheader("📄 策略参数")
-            _cur_mode = _strategy.get("mode", "strangle")
-            _mode_options = ["strangle", "iron_condor", "weekend_vol"]
-            _mode_index = _mode_options.index(_cur_mode) if _cur_mode in _mode_options else 0
 
             s_col1, s_col2, s_col3 = st.columns(3)
 
             with s_col1:
-                ed_mode = st.selectbox(
-                    "策略模式", _mode_options,
-                    index=_mode_index,
-                    help="strangle: 裸卖双卖(2腿)  iron_condor: 铁鹰(4腿)  weekend_vol: 周末波动率(delta选行权价)",
-                )
                 ed_underlying = st.selectbox(
                     "标的", ["ETH", "BTC"],
                     index=0 if _strategy.get("underlying", "ETH") == "ETH" else 1,
                 )
-                st.markdown("**▸ OTM% 选行权价** *(strangle / iron_condor)*")
-                ed_otm_pct = st.number_input("短腿 OTM %", min_value=1.0, max_value=50.0, value=_strategy.get("otm_pct", 0.10) * 100, step=1.0, format="%.1f", help="短腿离现货的距离百分比 (strangle/iron_condor)")
-                ed_wing_width = st.number_input("翼宽 % (仅铁鹰)", min_value=0.0, max_value=20.0, value=_strategy.get("wing_width_pct", 0.02) * 100, step=0.5, format="%.1f", help="保护翼额外偏移百分比 (strangle模式忽略)")
-                ed_target_dte = st.number_input("目标 DTE (天)", min_value=0, max_value=30, value=_strategy.get("target_dte_days", 7), step=1, help="目标到期天数 (0=0DTE当日到期)")
-                ed_dte_window = st.number_input("DTE 容差 (小时)", min_value=6, max_value=168, value=_strategy.get("dte_window_hours", 48), step=6, help="目标DTE ± 容差范围内的合约都可选")
-                st.markdown("**▸ Delta 选行权价** *(weekend_vol)*")
+                st.markdown("**▸ Weekend Vol Delta 参数**")
                 ed_target_delta = st.number_input("短腿目标 |Δ|", min_value=0.05, max_value=0.90, value=float(_strategy.get("target_delta", 0.40)), step=0.05, format="%.2f", help="Short legs 的 |delta| 目标 (weekend_vol)")
-                ed_wing_delta = st.number_input("翼 |Δ| (保护腿)", min_value=0.0, max_value=0.50, value=float(_strategy.get("wing_delta", 0.05)), step=0.01, format="%.2f", help="Long legs 的 |delta| 目标 (0=无翼/strangle)")
+                ed_wing_delta = st.number_input("翼 |Δ| (保护腿)", min_value=0.0, max_value=0.50, value=float(_strategy.get("wing_delta", 0.05)), step=0.01, format="%.2f", help="Long legs 的 |delta| 目标 (0=无翼结构)")
                 ed_leverage = st.number_input("杠杆倍数", min_value=0.5, max_value=10.0, value=float(_strategy.get("leverage", 1.0)), step=0.5, format="%.1f", help="仓位大小的杠杆倍数 (weekend_vol)")
                 ed_rv_hours = st.number_input("RV 回看小时数", min_value=0, max_value=168, value=int(_strategy.get("entry_realized_vol_lookback_hours", 24)), step=1, help="入场 RV 过滤的历史小时数；0 表示关闭过滤")
                 ed_rv_max = st.number_input("RV 上限", min_value=0.0, max_value=5.0, value=float(_strategy.get("entry_realized_vol_max", 1.20)), step=0.05, format="%.2f", help="仅当年化 RV 不超过该值时允许开仓")
@@ -1679,20 +1655,16 @@ elif page == "🔧 策略配置":
                 _entry_str = _strategy.get("entry_time_utc", "08:00")
                 _entry_parts = _entry_str.split(":")
                 _entry_time = _dt.time(int(_entry_parts[0]), int(_entry_parts[1]))
-                ed_entry_time = st.time_input("开仓时间 (UTC)", value=_entry_time, step=_dt.timedelta(minutes=1), help="每日开仓的 UTC 时间（精确到分钟）")
+                ed_entry_time = st.time_input("开仓时间 (UTC)", value=_entry_time, step=_dt.timedelta(minutes=1), help="每周 weekend_vol 开仓的 UTC 时间（精确到分钟）")
 
             with s_col2:
-                if ed_mode == "weekend_vol":
-                    ed_quantity = float(_strategy.get("quantity", 0.0) or 0.0)
-                    st.caption("基础数量：weekend_vol 实盘复利模式下不使用该参数")
-                else:
-                    ed_quantity = st.number_input("基础数量", min_value=0.001, max_value=100.0, value=float(_strategy.get("quantity", 0.01)), step=0.01, format="%.3f", help="每组策略的合约数量")
+                ed_quantity = st.number_input("基础数量", min_value=0.0, max_value=100.0, value=float(_strategy.get("quantity", 0.01)), step=0.01, format="%.3f", help="仅在关闭复利时使用")
+                st.caption("复利模式开启时，该值仅作为展示，不参与 weekend_vol 实盘仓位计算。")
                 ed_max_pos = st.number_input("最大持仓组数", min_value=1, max_value=20, value=_strategy.get("max_positions", 1), step=1)
 
             with s_col3:
-                ed_max_cap = st.number_input("最大资金比例 %", min_value=5.0, max_value=100.0, value=_strategy.get("max_capital_pct", 0.30) * 100, step=5.0, format="%.0f")
                 ed_compound = st.checkbox("复利模式", value=_strategy.get("compound", True), help="根据账户权益自动调整下单数量")
-                ed_wait_midpoint = st.checkbox("等待中点开仓", value=_strategy.get("wait_for_midpoint", False), help="等现货价格到达两个最近行权价的中点再开仓")
+                st.caption("开启复利后，数量按 实时权益 × 杠杆 ÷ 现货价格 估算，并受保证金上限约束。")
 
             st.divider()
             st.subheader("🔌 API & 运行参数")
@@ -1732,12 +1704,8 @@ elif page == "🔧 策略配置":
                     "simulate_private": _exchange.get("simulate_private", False),
                 },
                 "strategy": {
-                    "mode": ed_mode,
+                    "mode": "weekend_vol",
                     "underlying": ed_underlying,
-                    "otm_pct": round(ed_otm_pct / 100, 4),
-                    "wing_width_pct": round(ed_wing_width / 100, 4),
-                    "target_dte_days": ed_target_dte,
-                    "dte_window_hours": ed_dte_window,
                     "target_delta": round(ed_target_delta, 4),
                     "wing_delta": round(ed_wing_delta, 4),
                     "leverage": round(ed_leverage, 2),
@@ -1748,10 +1716,9 @@ elif page == "🔧 策略配置":
                     "entry_day": ed_entry_day,
                     "default_iv": round(ed_default_iv, 4),
                     "entry_time_utc": ed_entry_time.strftime("%H:%M"),
+                    "quantity": round(float(ed_quantity), 4),
                     "max_positions": ed_max_pos,
-                    "max_capital_pct": round(ed_max_cap / 100, 4),
                     "compound": ed_compound,
-                    "wait_for_midpoint": ed_wait_midpoint,
                 },
                 "storage": {
                     "db_path": ed_db_path,
@@ -1766,8 +1733,6 @@ elif page == "🔧 策略配置":
                     "equity_snapshot_interval_sec": ed_snapshot,
                 },
             }
-            if ed_mode != "weekend_vol":
-                _new_cfg["strategy"]["quantity"] = ed_quantity
             try:
                 _header = (
                     "# ============================================================\n"
@@ -1790,16 +1755,8 @@ elif page == "🔧 策略配置":
     # ------------------------------------------------------------------
     # 📋  下单预览 — 根据实时行情模拟下一次开仓
     # ------------------------------------------------------------------
-    _pv_mode = getattr(cfg.strategy, "mode", "iron_condor")
-    _pv_weekend_is_ic = getattr(cfg.strategy, "wing_delta", 0) > 0
-    if _pv_mode == "weekend_vol":
-        _pv_mode_label = "Weekend Vol Iron Condor" if _pv_weekend_is_ic else "Weekend Vol Short Strangle"
-    else:
-        _pv_mode_labels = {
-            "strangle": "Short Strangle",
-            "iron_condor": "Iron Condor",
-        }
-        _pv_mode_label = _pv_mode_labels.get(_pv_mode, _pv_mode)
+    _pv_is_ic = getattr(cfg.strategy, "wing_delta", 0) > 0
+    _pv_mode_label = "Weekend Vol 带翼结构" if _pv_is_ic else "Weekend Vol 无翼结构"
     st.subheader(f"📋 下单预览 ({_pv_mode_label})（实时行情）")
 
     @st.cache_resource
@@ -1818,33 +1775,20 @@ elif page == "🔧 策略配置":
             _prices = [t.underlying_price for t in _pv_tickers if t.underlying_price > 0]
             _pv_spot = _prices[0] if _prices else 0
 
-        # --- Filter tickers based on mode ---
-        _now_utc: datetime | None = None
-        _sunday_exp: datetime | None = None
-        if _pv_mode == "weekend_vol":
-            # Weekend vol: filter by nearest Sunday 08:00 UTC expiry
-            from datetime import timedelta as _td
-            _now_utc = datetime.now(timezone.utc)
-            _days_to_sunday = (6 - _now_utc.weekday()) % 7
-            if _days_to_sunday == 0 and _now_utc.hour >= 8:
-                _days_to_sunday = 7
-            _sunday_exp = _now_utc.replace(hour=8, minute=0, second=0, microsecond=0) + _td(days=_days_to_sunday)
-            _tolerance_h = 2.0
-            _pv_today = [
-                t for t in _pv_tickers
-                if abs((t.expiry - _sunday_exp).total_seconds()) < _tolerance_h * 3600
-            ]
-            _target_dte_days = round((_sunday_exp - _now_utc).total_seconds() / 86400, 1)
-            _dte_label_str = f"周日到期 ({_sunday_exp.strftime('%Y-%m-%d %H:%M')} UTC)"
-        else:
-            # Strangle / iron_condor: filter by DTE window
-            _target_dte_days = getattr(cfg.strategy, "target_dte_days", 0)
-            _dte_window = getattr(cfg.strategy, "dte_window_hours", 48)
-            _target_dte_h = _target_dte_days * 24
-            _dte_min = max(0.1, _target_dte_h - _dte_window)
-            _dte_max = _target_dte_h + _dte_window
-            _pv_today = [t for t in _pv_tickers if _dte_min < t.dte_hours < _dte_max]
-            _dte_label_str = f"DTE≈{_target_dte_days}天"
+        # --- Weekend vol expiry filter: nearest Sunday 08:00 UTC ---
+        from datetime import timedelta as _td
+        _now_utc = datetime.now(timezone.utc)
+        _days_to_sunday = (6 - _now_utc.weekday()) % 7
+        if _days_to_sunday == 0 and _now_utc.hour >= 8:
+            _days_to_sunday = 7
+        _sunday_exp = _now_utc.replace(hour=8, minute=0, second=0, microsecond=0) + _td(days=_days_to_sunday)
+        _tolerance_h = 2.0
+        _pv_today = [
+            t for t in _pv_tickers
+            if abs((t.expiry - _sunday_exp).total_seconds()) < _tolerance_h * 3600
+        ]
+        _target_dte_days = round((_sunday_exp - _now_utc).total_seconds() / 86400, 1)
+        _dte_label_str = f"周日到期 ({_sunday_exp.strftime('%Y-%m-%d %H:%M')} UTC)"
 
         if _pv_spot > 0 and _pv_today:
             # --- Strike selection ---
@@ -1852,17 +1796,6 @@ elif page == "🔧 策略配置":
             _sell_put: OptionTicker | None = None
             _buy_call: OptionTicker | None = None
             _buy_put: OptionTicker | None = None
-            _otm = float(getattr(cfg.strategy, "otm_pct", 0.0) or 0.0)
-            _wing = float(getattr(cfg.strategy, "wing_width_pct", 0.0) or 0.0)
-
-            def _best_by_strike(tks, otype, target):
-                """OTM%-based: find closest strike to target price."""
-                cs = [t for t in tks if t.option_type == otype]
-                if not cs:
-                    return None
-                cs.sort(key=lambda _t: abs(_t.strike - target))
-                return cs[0]
-
             def _best_by_delta(tks, otype, target_delta, spot_val, T_yr, fallback_iv):
                 """Delta-based: find closest |delta| to target."""
                 cs = [t for t in tks if t.option_type == otype]
@@ -1924,42 +1857,25 @@ elif page == "🔧 策略配置":
                 except Exception:
                     return "-"
 
-            if _pv_mode == "weekend_vol":
-                # Enrich tickers with greeks from exchange
-                try:
-                    _pv_client.enrich_greeks(_pv_today, _pv_ul)
-                except Exception:
-                    pass
+            # Enrich tickers with greeks from exchange
+            try:
+                _pv_client.enrich_greeks(_pv_today, _pv_ul)
+            except Exception:
+                pass
 
-                assert _sunday_exp is not None and _now_utc is not None
-                _T_years = max((_sunday_exp - _now_utc).total_seconds() / (365.25 * 86400), 1e-6)
-                _tgt_delta = getattr(cfg.strategy, "target_delta", 0.40)
-                _wing_d = getattr(cfg.strategy, "wing_delta", 0.05)
-                _def_iv = getattr(cfg.strategy, "default_iv", 0.60)
+            _T_years = max((_sunday_exp - _now_utc).total_seconds() / (365.25 * 86400), 1e-6)
+            _tgt_delta = getattr(cfg.strategy, "target_delta", 0.40)
+            _wing_d = getattr(cfg.strategy, "wing_delta", 0.05)
+            _def_iv = getattr(cfg.strategy, "default_iv", 0.60)
 
-                _sell_call = _best_by_delta(_pv_today, "call", _tgt_delta, _pv_spot, _T_years, _def_iv)
-                _sell_put = _best_by_delta(_pv_today, "put", _tgt_delta, _pv_spot, _T_years, _def_iv)
+            _sell_call = _best_by_delta(_pv_today, "call", _tgt_delta, _pv_spot, _T_years, _def_iv)
+            _sell_put = _best_by_delta(_pv_today, "put", _tgt_delta, _pv_spot, _T_years, _def_iv)
 
-                if _wing_d > 0:
-                    _buy_call = _best_by_delta(_pv_today, "call", _wing_d, _pv_spot, _T_years, _def_iv)
-                    _buy_put = _best_by_delta(_pv_today, "put", _wing_d, _pv_spot, _T_years, _def_iv)
-            else:
-                _otm = cfg.strategy.otm_pct
-                _wing = cfg.strategy.wing_width_pct
-                _sc_target = _pv_spot * (1 + _otm)
-                _sp_target = _pv_spot * (1 - _otm)
+            if _wing_d > 0:
+                _buy_call = _best_by_delta(_pv_today, "call", _wing_d, _pv_spot, _T_years, _def_iv)
+                _buy_put = _best_by_delta(_pv_today, "put", _wing_d, _pv_spot, _T_years, _def_iv)
 
-                _sell_call = _best_by_strike(_pv_today, "call", _sc_target)
-                _sell_put = _best_by_strike(_pv_today, "put", _sp_target)
-
-                if _pv_mode == "iron_condor":
-                    _lc_target = _pv_spot * (1 + _otm + _wing)
-                    _lp_target = _pv_spot * (1 - _otm - _wing)
-                    _buy_call = _best_by_strike(_pv_today, "call", _lc_target)
-                    _buy_put = _best_by_strike(_pv_today, "put", _lp_target)
-
-            # Determine if we're doing an IC (4-leg) or strangle (2-leg)
-            _is_ic = _pv_mode == "iron_condor" or (_pv_mode == "weekend_vol" and getattr(cfg.strategy, "wing_delta", 0) > 0)
+            _is_ic = _pv_is_ic
 
             _has_all_legs = (
                 all([_sell_call, _buy_call, _sell_put, _buy_put])
@@ -1985,10 +1901,10 @@ elif page == "🔧 策略配置":
                     _buy_call_t = _buy_call
                     _buy_put_t = _buy_put
 
-                _base_qty = 0.0 if _pv_mode == "weekend_vol" else cfg.strategy.quantity
+                _base_qty = float(getattr(cfg.strategy, "quantity", 0.0) or 0.0)
                 _pv_equity = 0.0
                 _pv_available = 0.0
-                _pv_equity_src = "自动仓位" if _pv_mode == "weekend_vol" else "配置基础数量"
+                _pv_equity_src = "自动仓位" if cfg.strategy.compound else "配置基础数量"
                 if cfg.strategy.compound:
                     try:
                         _pv_acct = _pv_client.get_account()
@@ -1998,16 +1914,12 @@ elif page == "🔧 策略配置":
                         _pv_equity_src = "权益获取失败, 用基础数量"
 
                 _preview = compute_option_order_preview(
-                    mode=_pv_mode,
                     spot=_pv_spot,
                     base_quantity=_base_qty,
                     compound=cfg.strategy.compound,
                     equity=_pv_equity,
                     available_balance=_pv_available,
                     leverage=getattr(cfg.strategy, "leverage", 1.0),
-                    max_capital_pct=getattr(cfg.strategy, "max_capital_pct", 0.0),
-                    otm_pct=_otm,
-                    wing_width_pct=_wing,
                     sell_call=_sell_call_t,
                     sell_put=_sell_put_t,
                     buy_call=_buy_call_t,
@@ -2044,14 +1956,14 @@ elif page == "🔧 策略配置":
                     }
 
                 if not _is_ic:
-                    # ---- Strangle / weekend_vol without wings P&L ----
+                    # ---- Weekend vol without wings P&L ----
                     _premium_per = float(_preview["premium_per_unit"])
                     _total_premium = float(_preview["total_premium"])
                     _margin_used = float(_preview["margin_used"])
                     _be_upper = float(_preview["break_even_upper"])
                     _be_lower = float(_preview["break_even_lower"])
                 else:
-                    # ---- Iron Condor P&L ----
+                    # ---- Weekend vol with wings P&L ----
                     assert _buy_call_t is not None and _buy_put_t is not None
                     _lc_bid = _buy_call_t.bid_price
                     _lc_ask = _buy_call_t.ask_price
@@ -2118,7 +2030,7 @@ elif page == "🔧 策略配置":
                 _test_task_running = bool(_active_test_task and _active_test_task.get("state") in {"queued", "running"})
                 _test_disabled_reason = None
                 _sl_cfg_pct = float(getattr(cfg.strategy, "stop_loss_pct", 0.0) or 0.0)
-                _sl_supported = _pv_mode == "weekend_vol" and _sl_cfg_pct > 0 and engine.is_running and is_trade_mode
+                _sl_supported = _sl_cfg_pct > 0 and engine.is_running and is_trade_mode
                 if not is_trade_mode:
                     _test_disabled_reason = "当前为只读模式，切换到交易模式后才可发送测试单。"
                 elif _test_task_running:
@@ -2129,8 +2041,8 @@ elif page == "🔧 策略配置":
                 st.caption(
                     f"按当前预览目标固定发送 {_test_leg_count} 条腿市价单，每条腿数量 0.01，用于验证真实下单链路。"
                 )
-                _auto_sl_pref_key = f"preview_auto_sl_pref_{_pv_mode}_{_test_leg_count}"
-                _auto_sl_widget_key = f"preview_auto_sl_widget_{_pv_mode}_{_test_leg_count}"
+                _auto_sl_pref_key = f"preview_auto_sl_pref_weekend_vol_{_test_leg_count}"
+                _auto_sl_widget_key = f"preview_auto_sl_widget_weekend_vol_{_test_leg_count}"
                 if _auto_sl_pref_key not in st.session_state:
                     st.session_state[_auto_sl_pref_key] = False
                 _tc1, _tc2 = st.columns([1, 2])
@@ -2146,7 +2058,7 @@ elif page == "🔧 策略配置":
                     _preview_test_clicked = st.button(
                         _test_button_label,
                         key=(
-                            f"preview_test_combo_{_pv_mode}_"
+                            f"preview_test_combo_weekend_vol_"
                             f"{_sell_put.symbol}_{_sell_call.symbol}_"
                             f"{_buy_put.symbol if _buy_put else 'none'}_"
                             f"{_buy_call.symbol if _buy_call else 'none'}"
@@ -2172,9 +2084,7 @@ elif page == "🔧 策略配置":
                         )
 
                 if not _sl_supported:
-                    if _pv_mode != "weekend_vol":
-                        st.caption("自动止损接管仅对 `weekend_vol` 策略开放。")
-                    elif _sl_cfg_pct <= 0:
+                    if _sl_cfg_pct <= 0:
                         st.caption("当前策略未配置止损线，无法对测试单启用自动止损。")
                     elif not engine.is_running:
                         st.caption("引擎未运行，无法接管测试单并执行自动止损。")
@@ -2513,7 +2423,7 @@ elif page == "🔧 策略配置":
                         (_sell_put_t.strike,  f"Short Put ${_sell_put_t.strike:,.0f}",  "red"),
                         (_sell_call_t.strike, f"Short Call ${_sell_call_t.strike:,.0f}", "red"),
                     ]
-                    # No max loss line for strangle (unlimited)
+                    # No max loss line for wingless structure (unlimited)
                     _max_loss_line = None
                 else:
                     assert _buy_call_t is not None and _buy_put_t is not None
@@ -2597,11 +2507,10 @@ elif page == "🔧 策略配置":
                 # Text summary
                 with st.expander("📊 完整计算明细"):
                     if not _is_ic:
-                        _mode_detail = f"模式: {_pv_mode_label}"
-                        if _pv_mode == "weekend_vol":
-                            _mode_detail += f"  |Δ|={getattr(cfg.strategy, 'target_delta', 0.40):.0%}"
-                        else:
-                            _mode_detail += f"  OTM: {_otm*100:.1f}%  DTE: {_target_dte_days}天"
+                        _mode_detail = (
+                            f"模式: {_pv_mode_label}  |Δ|={getattr(cfg.strategy, 'target_delta', 0.40):.0%}  "
+                            f"到期: {_target_dte_days:.1f}天"
+                        )
                         st.code(
                             f"标的: {_pv_ul}  现货: ${_pv_spot:,.2f}\n"
                             f"{_mode_detail}\n"
@@ -2610,7 +2519,7 @@ elif page == "🔧 策略配置":
                             f"Short Call: {_sell_call.symbol}  K=${_sell_call.strike:,.0f}\n"
                             f"───────────────────────────────\n"
                             f"数量: {_pv_qty:.2f} 张  (base={_base_qty}, compound={cfg.strategy.compound})\n"
-                            f"权益: ${_pv_equity:,.2f}  max_capital: {cfg.strategy.max_capital_pct*100:.0f}%\n"
+                            f"权益: ${_pv_equity:,.2f}  leverage: {getattr(cfg.strategy, 'leverage', 1.0):.1f}x\n"
                             f"估算保证金: ${_margin_used:,.0f}\n"
                             f"───────────────────────────────\n"
                             f"净权利金/组: ${_premium_per:.2f}  (sell_call_bid={_sc_bid:.2f} + sell_put_bid={_sp_bid:.2f})\n"
@@ -2621,11 +2530,10 @@ elif page == "🔧 策略配置":
                             language=None,
                         )
                     else:
-                        _mode_detail = f"模式: {_pv_mode_label}"
-                        if _pv_mode == "weekend_vol":
-                            _mode_detail += f"  |Δ|={getattr(cfg.strategy, 'target_delta', 0.40):.0%}  翼Δ={getattr(cfg.strategy, 'wing_delta', 0.05):.0%}"
-                        else:
-                            _mode_detail += f"  OTM: {_otm*100:.1f}%  翼宽: {_wing*100:.1f}%"
+                        _mode_detail = (
+                            f"模式: {_pv_mode_label}  |Δ|={getattr(cfg.strategy, 'target_delta', 0.40):.0%}  "
+                            f"翼Δ={getattr(cfg.strategy, 'wing_delta', 0.05):.0%}  到期: {_target_dte_days:.1f}天"
+                        )
                         _margin_pct_str = f" ({_margin_used/_pv_equity*100:.1f}% 权益)" if _pv_equity > 0 else ""
                         assert _buy_call_t is not None and _buy_put_t is not None
                         st.code(
@@ -2641,7 +2549,7 @@ elif page == "🔧 策略配置":
                             f"Call侧翼宽: ${_call_width:,.0f}\n"
                             f"───────────────────────────────\n"
                             f"数量: {_pv_qty:.2f} 张  (base={_base_qty}, compound={cfg.strategy.compound})\n"
-                            f"权益: ${_pv_equity:,.2f}  max_capital: {cfg.strategy.max_capital_pct*100:.0f}%\n"
+                            f"权益: ${_pv_equity:,.2f}  leverage: {getattr(cfg.strategy, 'leverage', 1.0):.1f}x\n"
                             f"保证金: ${_margin_used:,.0f}{_margin_pct_str}\n"
                             f"───────────────────────────────\n"
                             f"净权利金/组: ${_premium_per:.2f}  (sell_call_bid={_sc_bid:.2f} + sell_put_bid={_sp_bid:.2f}"
@@ -2792,54 +2700,53 @@ elif page == "🖥 引擎状态":
     if strategy_status.get("position_source") == "exchange":
         _symbols = strategy_status.get("exchange_position_symbols") or []
         st.caption(f"当前持仓组数按交易所实时持仓兜底显示；本地数据库为空，交易所合约: {', '.join(_symbols) if _symbols else '-'}")
-    if getattr(cfg.strategy, "mode", "") == "weekend_vol":
-        col9, col10, col11, col12 = st.columns(4)
-        with col9:
-            rv_now = strategy_status.get("entry_realized_vol_current")
-            st.metric(
-                "当前 RV24",
-                f"{rv_now:.2%}" if isinstance(rv_now, (int, float)) else "-",
-            )
-        with col10:
-            rv_cap = strategy_status.get("entry_realized_vol_max")
-            st.metric(
-                "RV 上限",
-                f"{rv_cap:.2f}" if isinstance(rv_cap, (int, float)) and rv_cap > 0 else "关闭",
-            )
-        with col11:
-            basket_pnl = strategy_status.get("basket_pnl_pct")
-            st.metric(
-                "篮子 PnL%",
-                f"{basket_pnl:.1f}%" if isinstance(basket_pnl, (int, float)) else "-",
-            )
-        with col12:
-            sl_pct = strategy_status.get("stop_loss_pct")
-            sl_move_pct = strategy_status.get("stop_loss_underlying_move_pct")
-            st.metric(
-                "止损线",
-                (
-                    f"-{sl_pct:.0f}% / {sl_move_pct:.1f}%"
-                    if isinstance(sl_pct, (int, float)) and sl_pct > 0 and isinstance(sl_move_pct, (int, float)) and sl_move_pct > 0
-                    else (f"-{sl_pct:.0f}%" if isinstance(sl_pct, (int, float)) and sl_pct > 0 else "关闭")
-                ),
-            )
+    col9, col10, col11, col12 = st.columns(4)
+    with col9:
+        rv_now = strategy_status.get("entry_realized_vol_current")
+        st.metric(
+            "当前 RV24",
+            f"{rv_now:.2%}" if isinstance(rv_now, (int, float)) else "-",
+        )
+    with col10:
+        rv_cap = strategy_status.get("entry_realized_vol_max")
+        st.metric(
+            "RV 上限",
+            f"{rv_cap:.2f}" if isinstance(rv_cap, (int, float)) and rv_cap > 0 else "关闭",
+        )
+    with col11:
+        basket_pnl = strategy_status.get("basket_pnl_pct")
+        st.metric(
+            "篮子 PnL%",
+            f"{basket_pnl:.1f}%" if isinstance(basket_pnl, (int, float)) else "-",
+        )
+    with col12:
+        sl_pct = strategy_status.get("stop_loss_pct")
+        sl_move_pct = strategy_status.get("stop_loss_underlying_move_pct")
+        st.metric(
+            "止损线",
+            (
+                f"-{sl_pct:.0f}% / {sl_move_pct:.1f}%"
+                if isinstance(sl_pct, (int, float)) and sl_pct > 0 and isinstance(sl_move_pct, (int, float)) and sl_move_pct > 0
+                else (f"-{sl_pct:.0f}%" if isinstance(sl_pct, (int, float)) and sl_pct > 0 else "关闭")
+            ),
+        )
 
-        _last_order_status = str(strategy_status.get("last_order_status") or "")
-        _last_order_message = str(strategy_status.get("last_order_message") or "")
-        _last_order_attempt_at = str(strategy_status.get("last_order_attempt_at") or "")
-        _last_order_group_id = str(strategy_status.get("last_order_group_id") or "")
+    _last_order_status = str(strategy_status.get("last_order_status") or "")
+    _last_order_message = str(strategy_status.get("last_order_message") or "")
+    _last_order_attempt_at = str(strategy_status.get("last_order_attempt_at") or "")
+    _last_order_group_id = str(strategy_status.get("last_order_group_id") or "")
 
-        if _last_order_status and _last_order_status != "idle":
-            st.subheader("🧾 最近一次实盘开仓结果")
-            _lc1, _lc2, _lc3, _lc4 = st.columns(4)
-            with _lc1:
-                st.metric("状态", _last_order_status)
-            with _lc2:
-                st.metric("尝试时间", _last_order_attempt_at or "-")
-            with _lc3:
-                st.metric("组合ID", _last_order_group_id or "-")
-            with _lc4:
-                st.metric("持仓复核", "已执行" if strategy_status.get("last_order_exchange_positions_checked") else "未执行")
+    if _last_order_status and _last_order_status != "idle":
+        st.subheader("🧾 最近一次实盘开仓结果")
+        _lc1, _lc2, _lc3, _lc4 = st.columns(4)
+        with _lc1:
+            st.metric("状态", _last_order_status)
+        with _lc2:
+            st.metric("尝试时间", _last_order_attempt_at or "-")
+        with _lc3:
+            st.metric("组合ID", _last_order_group_id or "-")
+        with _lc4:
+            st.metric("持仓复核", "已执行" if strategy_status.get("last_order_exchange_positions_checked") else "未执行")
 
             if _last_order_status == "success":
                 st.success(_last_order_message or "最近一次实盘开仓成功")
@@ -3007,61 +2914,42 @@ elif page == "🖥 引擎状态":
 
     # --- Config summary ---
     st.subheader("📋 运行配置摘要")
-    _cs_mode = getattr(cfg.strategy, "mode", "iron_condor")
-    if _cs_mode == "weekend_vol":
-        run_info = {
-            "配置项": [
-                "策略名", "模式", "标的", "短腿 |Δ|", "翼 |Δ|",
-                "杠杆", "开仓日/时间", "RV过滤", "止损", "基础数量", "复利", "API环境",
-            ],
-            "值": [
-                cfg.name,
-                "Weekend Vol (delta选行权价)",
-                cfg.strategy.underlying,
-                f"{getattr(cfg.strategy, 'target_delta', 0.40):.0%}",
-                f"{getattr(cfg.strategy, 'wing_delta', 0.05):.0%}",
-                f"{getattr(cfg.strategy, 'leverage', 1.0):.1f}x",
-                f"{getattr(cfg.strategy, 'entry_day', 'friday')} {cfg.strategy.entry_time_utc} UTC",
+    run_info = {
+        "配置项": [
+            "策略名", "模式", "结构", "标的", "短腿 |Δ|", "翼 |Δ|",
+            "杠杆", "开仓日/时间", "RV过滤", "止损", "基础数量", "复利", "API环境", "检查间隔",
+        ],
+        "值": [
+            cfg.name,
+            "Weekend Vol (delta选行权价)",
+            "带翼结构" if getattr(cfg.strategy, 'wing_delta', 0.0) > 0 else "无翼结构",
+            cfg.strategy.underlying,
+            f"{getattr(cfg.strategy, 'target_delta', 0.40):.0%}",
+            f"{getattr(cfg.strategy, 'wing_delta', 0.05):.0%}",
+            f"{getattr(cfg.strategy, 'leverage', 1.0):.1f}x",
+            f"{getattr(cfg.strategy, 'entry_day', 'friday')} {cfg.strategy.entry_time_utc} UTC",
+            (
+                f"RV{getattr(cfg.strategy, 'entry_realized_vol_lookback_hours', 0)} <= "
+                f"{getattr(cfg.strategy, 'entry_realized_vol_max', 0.0):.2f}"
+                if getattr(cfg.strategy, 'entry_realized_vol_lookback_hours', 0) > 1
+                and getattr(cfg.strategy, 'entry_realized_vol_max', 0.0) > 0
+                else "关闭"
+            ),
+            (
                 (
-                    f"RV{getattr(cfg.strategy, 'entry_realized_vol_lookback_hours', 0)} <= "
-                    f"{getattr(cfg.strategy, 'entry_realized_vol_max', 0.0):.2f}"
-                    if getattr(cfg.strategy, 'entry_realized_vol_lookback_hours', 0) > 1
-                    and getattr(cfg.strategy, 'entry_realized_vol_max', 0.0) > 0
-                    else "关闭"
-                ),
-                (
-                    (
-                        f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}% + 标的单边{getattr(cfg.strategy, 'stop_loss_underlying_move_pct', 0.0):.1f}%"
-                        if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0 and getattr(cfg.strategy, 'stop_loss_underlying_move_pct', 0.0) > 0
-                        else f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}%"
-                    )
-                    if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0
-                    else "关闭"
-                ),
-                "自动" if _cs_mode == "weekend_vol" else str(cfg.strategy.quantity),
-                "✅" if cfg.strategy.compound else "❌",
-                "测试网" if cfg.exchange.testnet else "正式环境",
-            ],
-        }
-    else:
-        run_info = {
-            "配置项": [
-                "策略名", "模式", "标的", "OTM%", "翼宽%", "开仓时间",
-                "基础数量", "复利", "API环境", "检查间隔",
-            ],
-            "值": [
-                cfg.name,
-                "裸卖双卖" if _cs_mode == "strangle" else "铁鹰",
-                cfg.strategy.underlying,
-                f"±{cfg.strategy.otm_pct*100:.0f}%",
-                f"{cfg.strategy.wing_width_pct*100:.0f}%",
-                f"{cfg.strategy.entry_time_utc} UTC",
-                str(cfg.strategy.quantity),
-                "✅" if cfg.strategy.compound else "❌",
-                "测试网" if cfg.exchange.testnet else "正式环境",
-                f"{cfg.monitor.check_interval_sec}s",
-            ],
-        }
+                    f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}% + 标的单边{getattr(cfg.strategy, 'stop_loss_underlying_move_pct', 0.0):.1f}%"
+                    if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0 and getattr(cfg.strategy, 'stop_loss_underlying_move_pct', 0.0) > 0
+                    else f"-{getattr(cfg.strategy, 'stop_loss_pct', 0.0):.0f}%"
+                )
+                if getattr(cfg.strategy, 'stop_loss_pct', 0.0) > 0
+                else "关闭"
+            ),
+            str(cfg.strategy.quantity),
+            "✅" if cfg.strategy.compound else "❌",
+            "测试网" if cfg.exchange.testnet else "正式环境",
+            f"{cfg.monitor.check_interval_sec}s",
+        ],
+    }
     st.dataframe(pd.DataFrame(run_info), width="stretch", hide_index=True)
 
     st.caption(

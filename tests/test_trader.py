@@ -4,7 +4,7 @@ Tests cover:
   - Config: loading, defaults, env vars, YAML merge
   - Storage: CRUD for trades, equity snapshots, daily PnL, state
   - PositionManager: open/close condors, strangle, PnL tracking
-  - Strategy: OptionSellingStrategy + WeekendVolStrategy entry logic
+    - Strategy: WeekendVolStrategy entry logic
   - EquityTracker: snapshot, daily PnL, day rollover
   - LimitChaser: price computation, leg execution
   - Engine: init, start/stop lifecycle, status
@@ -51,7 +51,7 @@ from trader.position_manager import (
 )
 from trader.limit_chaser import ChaserConfig, LegOrder, LimitChaser
 from trader.equity import EquityTracker
-from trader.strategy import OptionSellingStrategy, WeekendVolStrategy
+from trader.strategy import WeekendVolStrategy
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -207,7 +207,7 @@ class MockClient:
 class TestExchangeConfig:
     def test_defaults(self):
         cfg = ExchangeConfig()
-        assert cfg.testnet is True
+        assert cfg.testnet is False
         assert cfg.account_currency == "USDT"
         assert cfg.simulate_private is False
 
@@ -229,34 +229,33 @@ class TestExchangeConfig:
 class TestStrategyConfig:
     def test_defaults(self):
         cfg = StrategyConfig()
-        assert cfg.mode == "strangle"
-        assert cfg.underlying == "ETH"
-        assert cfg.target_delta == 0.40
+        assert cfg.mode == "weekend_vol"
+        assert cfg.underlying == "BTC"
+        assert cfg.target_delta == 0.45
 
     def test_weekend_vol_params(self):
         cfg = StrategyConfig(
-            mode="weekend_vol",
             underlying="BTC",
-            target_delta=0.40,
-            wing_delta=0.05,
+            target_delta=0.45,
+            wing_delta=0.0,
             leverage=3.0,
         )
         assert cfg.leverage == 3.0
-        assert cfg.wing_delta == 0.05
+        assert cfg.wing_delta == 0.0
 
 
 class TestTraderConfig:
     def test_default_construction(self):
         cfg = TraderConfig()
-        assert cfg.name == "Short Strangle 7DTE ±10%"
+        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
         assert isinstance(cfg.exchange, ExchangeConfig)
         assert isinstance(cfg.strategy, StrategyConfig)
 
     def test_merge_section(self):
         cfg = StrategyConfig()
-        _merge_section(cfg, {"mode": "iron_condor", "underlying": "BTC"})
-        assert cfg.mode == "iron_condor"
-        assert cfg.underlying == "BTC"
+        _merge_section(cfg, {"mode": "weekend_vol", "underlying": "ETH"})
+        assert cfg.mode == "weekend_vol"
+        assert cfg.underlying == "ETH"
 
     def test_load_config_default(self):
         cfg = load_config(None)
@@ -772,221 +771,6 @@ class TestEquityTracker:
         assert "total_trades" in stats
         assert "max_drawdown_pct" in stats
         assert "sharpe_ratio" in stats
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Test: OptionSellingStrategy
-# ═══════════════════════════════════════════════════════════════════════
-
-class TestOptionSellingStrategy:
-    def test_init(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(mode="iron_condor", underlying="BTC")
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-        assert strategy.cfg.mode == "iron_condor"
-
-    def test_should_enter_wrong_time(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(entry_time_utc="16:00")
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-
-        # 06:00 UTC → before entry time
-        now = datetime(2026, 3, 24, 6, 0, 0, tzinfo=timezone.utc)
-        today = now.strftime("%Y-%m-%d")
-        assert strategy._should_enter(now, today) is False
-
-    def test_should_enter_already_traded(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(entry_time_utc="08:00")
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-        strategy._last_trade_date = "2026-03-24"
-
-        now = datetime(2026, 3, 24, 9, 0, 0, tzinfo=timezone.utc)
-        today = "2026-03-24"
-        assert strategy._should_enter(now, today) is False
-
-    def test_should_enter_max_positions(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(entry_time_utc="08:00", max_positions=1)
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-
-        # Open a position
-        pm.open_short_strangle("S1", "S2", 90000, 85000, 0.1, 87000, execution_mode="chaser")
-
-        now = datetime(2026, 3, 24, 9, 0, 0, tzinfo=timezone.utc)
-        today = "2026-03-24"
-        assert strategy._should_enter(now, today) is False
-
-    def test_should_enter_too_late(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(entry_time_utc="08:00")
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-
-        # 11:00 UTC → 3 hours after entry (max is 2h)
-        now = datetime(2026, 3, 24, 11, 0, 0, tzinfo=timezone.utc)
-        today = "2026-03-24"
-        assert strategy._should_enter(now, today) is False
-
-    def test_find_best_strike(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig()
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-
-        tickers = [
-            _make_ticker("S1", strike=85000, option_type="call"),
-            _make_ticker("S2", strike=90000, option_type="call"),
-            _make_ticker("S3", strike=95000, option_type="call"),
-        ]
-
-        best = strategy._find_best_strike(tickers, "call", 89000)
-        assert best is not None
-        assert best.strike == 90000
-
-    def test_compute_quantity_base(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(quantity=0.01, compound=False)
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-        qty = strategy._compute_quantity(87000)
-        assert qty == 0.01
-
-    def test_compute_quantity_compound_uses_official_margin_formula(self, storage):
-        client = MockClient(spot=90000, equity=10000)
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(
-            mode="strangle",
-            quantity=0.01,
-            compound=True,
-            max_capital_pct=0.30,
-            otm_pct=0.10,
-        )
-
-        sell_call = _make_ticker(
-            symbol="BTC-260328-100000-C",
-            strike=100000,
-            option_type="call",
-            bid_price=100,
-            ask_price=120,
-            mark_price=110,
-            underlying_price=90000,
-        )
-        sell_put = _make_ticker(
-            symbol="BTC-260328-80000-P",
-            strike=80000,
-            option_type="put",
-            bid_price=100,
-            ask_price=120,
-            mark_price=110,
-            underlying_price=90000,
-        )
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-        qty = strategy._compute_quantity(90000, sell_call=sell_call, sell_put=sell_put)
-        assert qty == pytest.approx(0.16, abs=0.01)
-
-    def test_status(self, storage):
-        client = MockClient()
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(mode="iron_condor", underlying="BTC")
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-        status = strategy.status()
-        assert status["mode"] == "iron_condor"
-        assert status["underlying"] == "BTC"
-
-    def test_market_open_flow_persists_position_end_to_end(self, storage):
-        client = MockClient(spot=90000.0, equity=20000.0)
-        now = datetime.now(timezone.utc)
-        expiry = now + timedelta(days=7)
-        expiry_code = expiry.strftime("%y%m%d")
-        client._tickers = [
-            _make_ticker(
-                symbol=f"BTC-{expiry_code}-99000-C",
-                underlying="BTC",
-                strike=99000.0,
-                option_type="call",
-                expiry=expiry,
-                bid_price=110.0,
-                ask_price=114.0,
-                mark_price=112.0,
-                underlying_price=90000.0,
-            ),
-            _make_ticker(
-                symbol=f"BTC-{expiry_code}-81000-P",
-                underlying="BTC",
-                strike=81000.0,
-                option_type="put",
-                expiry=expiry,
-                bid_price=108.0,
-                ask_price=112.0,
-                mark_price=110.0,
-                underlying_price=90000.0,
-            ),
-        ]
-
-        def _submit_and_track_position(symbol, side, quantity, order_type="MARKET",
-                                       price=None, time_in_force=None, reduce_only=False, client_order_id=None):
-            result = client.place_order(
-                symbol=symbol,
-                side=side,
-                quantity=quantity,
-                order_type=order_type,
-                price=price,
-                reduce_only=reduce_only,
-                client_order_id=client_order_id,
-            )
-            if not reduce_only:
-                client._positions.append(
-                    {
-                        "symbol": symbol,
-                        "side": "SHORT" if str(side).upper() == "SELL" else "LONG",
-                        "quantity": float(quantity),
-                        "entryPrice": float(result.avg_price or result.price or 0.0),
-                        "unrealizedPnl": 0.0,
-                    }
-                )
-            return result
-
-        client.submit_order = _submit_and_track_position
-        pm = PositionManager(client, storage)
-        cfg = StrategyConfig(
-            mode="strangle",
-            underlying="BTC",
-            quantity=0.1,
-            compound=False,
-            target_dte_days=7,
-            dte_window_hours=48,
-            entry_time_utc="00:00",
-            otm_pct=0.10,
-            wait_for_midpoint=False,
-        )
-
-        strategy = OptionSellingStrategy(client, pm, storage, cfg)
-        today = now.strftime("%Y-%m-%d")
-
-        strategy._try_open_condor(now, today)
-
-        assert strategy._last_trade_date == today
-        assert pm.open_position_count == 1
-        open_trades = storage.get_open_trades()
-        assert len(open_trades) == 2
-        assert {t["symbol"] for t in open_trades} == {
-            f"BTC-{expiry_code}-99000-C",
-            f"BTC-{expiry_code}-81000-P",
-        }
 
 
 # ═══════════════════════════════════════════════════════════════════════
