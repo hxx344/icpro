@@ -63,7 +63,7 @@ import streamlit as st
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from trader.config import load_config, TraderConfig
+from trader.config import load_config
 from trader.storage import Storage
 from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.binance_client import BinanceOptionsClient, OptionTicker
@@ -162,6 +162,19 @@ def _to_float(value: object, default: float = 0.0) -> float:
         return float(cast(Any, value))
     except (TypeError, ValueError):
         return default
+
+
+def _exchange_position_snapshot_rows(positions: list[dict[str, object]]) -> list[dict[str, object]]:
+    return [
+        {
+            "合约": p.get("symbol", ""),
+            "方向": p.get("side", ""),
+            "数量": _to_float(p.get("quantity"), 0.0),
+            "开仓价": f"${_to_float(p.get('entryPrice'), 0.0):.4f}",
+            "未实现PnL": f"${_to_float(p.get('unrealizedPnl'), 0.0):.4f}",
+        }
+        for p in positions
+    ]
 
 
 def _get_test_stop_loss_runtime(task: dict, engine_ref: TradingEngine) -> dict[str, object]:
@@ -1280,8 +1293,9 @@ elif page == "📈 资产曲线":
         )
 
         # --- Drawdown series (precompute) ---
-        peak_series = df["total_equity"].cummax()
-        plot_dd_series = ((peak_series - df["total_equity"]) / peak_series * 100).fillna(0)
+        total_equity_series = df["total_equity"].astype(float)
+        peak_series = total_equity_series.cummax()
+        plot_dd_series = ((peak_series - total_equity_series) / peak_series).fillna(0.0).mul(100.0)
         plot_df = df.reset_index(drop=True)
         plot_dd_series = plot_dd_series.reset_index(drop=True)
 
@@ -2102,6 +2116,25 @@ elif page == "🔧 策略配置":
                 _sp_bid = _sell_put_t.bid_price
                 _sp_ask = _sell_put_t.ask_price
 
+                def _preview_leg_row(
+                    title: str,
+                    ticker: OptionTicker,
+                    bid: float,
+                    ask: float,
+                    direction: str,
+                ) -> dict[str, str]:
+                    return {
+                        "腿": title,
+                        "合约": ticker.symbol,
+                        "行权价": f"${ticker.strike:,.0f}",
+                        "距Spot": f"{(ticker.strike/_pv_spot - 1)*100:+.1f}%",
+                        "Delta": _format_preview_delta(ticker, _pv_spot, _preview_fallback_iv),
+                        "方向": direction,
+                        "Bid (USDT)": f"${bid:.2f}",
+                        "Ask (USDT)": f"${ask:.2f}",
+                        "DTE": f"{ticker.dte_hours:.0f}h ({ticker.dte_hours/24:.1f}d)",
+                    }
+
                 if not _is_ic:
                     # ---- Strangle / weekend_vol without wings P&L ----
                     _premium_per = float(_preview["premium_per_unit"])
@@ -2153,77 +2186,17 @@ elif page == "🔧 策略配置":
                 if not _is_ic:
                     st.markdown("##### 🦵 两条腿明细")
                     _legs_data = [
-                        {
-                            "腿": "① Short Put (卖出收权利金)",
-                            "合约": _sell_put_t.symbol,
-                            "行权价": f"${_sell_put_t.strike:,.0f}",
-                            "距Spot": f"{(_sell_put_t.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_put_t, _pv_spot, _preview_fallback_iv),
-                            "方向": "🔴 卖出",
-                            "Bid (USDT)": f"${_sp_bid:.2f}",
-                            "Ask (USDT)": f"${_sp_ask:.2f}",
-                            "DTE": f"{_sell_put_t.dte_hours:.0f}h ({_sell_put_t.dte_hours/24:.1f}d)",
-                        },
-                        {
-                            "腿": "② Short Call (卖出收权利金)",
-                            "合约": _sell_call_t.symbol,
-                            "行权价": f"${_sell_call_t.strike:,.0f}",
-                            "距Spot": f"{(_sell_call_t.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_call_t, _pv_spot, _preview_fallback_iv),
-                            "方向": "🔴 卖出",
-                            "Bid (USDT)": f"${_sc_bid:.2f}",
-                            "Ask (USDT)": f"${_sc_ask:.2f}",
-                            "DTE": f"{_sell_call_t.dte_hours:.0f}h ({_sell_call_t.dte_hours/24:.1f}d)",
-                        },
+                        _preview_leg_row("① Short Put (卖出收权利金)", _sell_put_t, _sp_bid, _sp_ask, "🔴 卖出"),
+                        _preview_leg_row("② Short Call (卖出收权利金)", _sell_call_t, _sc_bid, _sc_ask, "🔴 卖出"),
                     ]
                 else:
                     st.markdown("##### 🦵 四条腿明细")
                     assert _buy_call_t is not None and _buy_put_t is not None
                     _legs_data = [
-                        {
-                            "腿": "① Long Put (买入保护)",
-                            "合约": _buy_put_t.symbol,
-                            "行权价": f"${_buy_put_t.strike:,.0f}",
-                            "距Spot": f"{(_buy_put_t.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_buy_put_t, _pv_spot, _preview_fallback_iv),
-                            "方向": "🟢 买入",
-                            "Bid (USDT)": f"${_lp_bid:.2f}",
-                            "Ask (USDT)": f"${_lp_ask:.2f}",
-                            "DTE": f"{_buy_put_t.dte_hours:.0f}h ({_buy_put_t.dte_hours/24:.1f}d)",
-                        },
-                        {
-                            "腿": "② Short Put (卖出收权利金)",
-                            "合约": _sell_put_t.symbol,
-                            "行权价": f"${_sell_put_t.strike:,.0f}",
-                            "距Spot": f"{(_sell_put_t.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_put_t, _pv_spot, _preview_fallback_iv),
-                            "方向": "🔴 卖出",
-                            "Bid (USDT)": f"${_sp_bid:.2f}",
-                            "Ask (USDT)": f"${_sp_ask:.2f}",
-                            "DTE": f"{_sell_put_t.dte_hours:.0f}h ({_sell_put_t.dte_hours/24:.1f}d)",
-                        },
-                        {
-                            "腿": "③ Short Call (卖出收权利金)",
-                            "合约": _sell_call_t.symbol,
-                            "行权价": f"${_sell_call_t.strike:,.0f}",
-                            "距Spot": f"{(_sell_call_t.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_sell_call_t, _pv_spot, _preview_fallback_iv),
-                            "方向": "🔴 卖出",
-                            "Bid (USDT)": f"${_sc_bid:.2f}",
-                            "Ask (USDT)": f"${_sc_ask:.2f}",
-                            "DTE": f"{_sell_call_t.dte_hours:.0f}h ({_sell_call_t.dte_hours/24:.1f}d)",
-                        },
-                        {
-                            "腿": "④ Long Call (买入保护)",
-                            "合约": _buy_call_t.symbol,
-                            "行权价": f"${_buy_call_t.strike:,.0f}",
-                            "距Spot": f"{(_buy_call_t.strike/_pv_spot - 1)*100:+.1f}%",
-                            "Delta": _format_preview_delta(_buy_call_t, _pv_spot, _preview_fallback_iv),
-                            "方向": "🟢 买入",
-                            "Bid (USDT)": f"${_lc_bid:.2f}",
-                            "Ask (USDT)": f"${_lc_ask:.2f}",
-                            "DTE": f"{_buy_call_t.dte_hours:.0f}h ({_buy_call_t.dte_hours/24:.1f}d)",
-                        },
+                        _preview_leg_row("① Long Put (买入保护)", _buy_put_t, _lp_bid, _lp_ask, "🟢 买入"),
+                        _preview_leg_row("② Short Put (卖出收权利金)", _sell_put_t, _sp_bid, _sp_ask, "🔴 卖出"),
+                        _preview_leg_row("③ Short Call (卖出收权利金)", _sell_call_t, _sc_bid, _sc_ask, "🔴 卖出"),
+                        _preview_leg_row("④ Long Call (买入保护)", _buy_call_t, _lc_bid, _lc_ask, "🟢 买入"),
                     ]
                 st.dataframe(pd.DataFrame(_legs_data), width="stretch", hide_index=True)
 
@@ -2532,21 +2505,12 @@ elif page == "🔧 策略配置":
                         _snapshot_underlying = str(_task.get("exchange_positions_underlying") or "")
                         _snapshot_error = _task.get("exchange_positions_error")
                         _snapshot_positions = _task.get("exchange_positions") or []
+                        _snapshot_rows = _exchange_position_snapshot_rows(_snapshot_positions)
                         if _snapshot_checked and (_snapshot_error or _snapshot_positions):
                             st.markdown("##### 📦 当前测试持仓复核")
                             if _snapshot_error:
                                 st.warning(f"持仓复核失败（{_snapshot_underlying or '-'}）：{_snapshot_error}")
                             elif _snapshot_positions:
-                                _snapshot_rows = [
-                                    {
-                                        "合约": p.get("symbol", ""),
-                                        "方向": p.get("side", ""),
-                                        "数量": float(p.get("quantity") or 0.0),
-                                        "开仓价": f"${float(p.get('entryPrice') or 0.0):.4f}",
-                                        "未实现PnL": f"${float(p.get('unrealizedPnl') or 0.0):.4f}",
-                                    }
-                                    for p in _snapshot_positions
-                                ]
                                 st.dataframe(pd.DataFrame(_snapshot_rows), width="stretch", hide_index=True)
 
                         if _task.get("traceback"):
@@ -2559,16 +2523,6 @@ elif page == "🔧 策略配置":
                                 if _snapshot_error:
                                     st.warning(f"持仓复核失败（{_snapshot_underlying or '-'}）：{_snapshot_error}")
                                 elif _snapshot_positions:
-                                    _snapshot_rows = [
-                                        {
-                                            "合约": p.get("symbol", ""),
-                                            "方向": p.get("side", ""),
-                                            "数量": float(p.get("quantity") or 0.0),
-                                            "开仓价": f"${float(p.get('entryPrice') or 0.0):.4f}",
-                                            "未实现PnL": f"${float(p.get('unrealizedPnl') or 0.0):.4f}",
-                                        }
-                                        for p in _snapshot_positions
-                                    ]
                                     st.error(
                                         f"复核发现 {_snapshot_underlying} 仍有 {len(_snapshot_positions)} 条真实持仓，请立即核对是否存在残留仓位。"
                                     )

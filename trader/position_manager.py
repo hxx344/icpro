@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 import time as _time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, cast
 
@@ -17,7 +17,6 @@ from loguru import logger
 
 from trader.binance_client import (
     OrderResult,
-    OptionTicker,
     _parse_symbol,
 )
 from trader.limit_chaser import ChaserConfig, LegOrder, LimitChaser
@@ -476,6 +475,61 @@ class PositionManager:
         return max(float(leg.quantity or 0.0) - float(leg.filled_qty or 0.0), 0.0)
 
     @staticmethod
+    def _serialize_leg_status(
+        leg: LegOrder,
+        snapshots: dict[str, dict[str, float | bool | str]] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "leg_role": leg.leg_role,
+            "symbol": leg.symbol,
+            "side": leg.side,
+            "quantity": leg.quantity,
+            "filled_qty": leg.filled_qty,
+            "status": leg.status,
+            "avg_price": leg.avg_price,
+            "attempts": leg.attempts,
+        }
+        if snapshots is not None:
+            snapshot = snapshots.get(leg.symbol) or {}
+            payload["spread"] = float(snapshot.get("spread") or 0.0)
+            payload["top_qty"] = float(snapshot.get("available_qty") or 0.0)
+        return payload
+
+    @staticmethod
+    def _fill_ratio(leg_orders: list[LegOrder]) -> float:
+        filled = sum(float(leg.filled_qty or 0.0) for leg in leg_orders)
+        total = sum(float(leg.quantity or 0.0) for leg in leg_orders)
+        return filled / max(total, 1e-9)
+
+    def _serialize_open_request_legs(self, leg_orders: list[LegOrder]) -> list[dict[str, Any]]:
+        return [
+            {
+                "leg_role": leg.leg_role,
+                "symbol": leg.symbol,
+                "side": leg.side,
+                "quantity": leg.quantity,
+                "status": leg.status,
+            }
+            for leg in leg_orders
+        ]
+
+    def _serialize_leg_results(self, results: list[LegOrder]) -> list[dict[str, Any]]:
+        return [self._serialize_leg_status(result) for result in results]
+
+    @staticmethod
+    def _rollback_failure_message(
+        rollback_due_to_margin: bool,
+        rollback_failures: list[str],
+    ) -> str:
+        if rollback_due_to_margin and rollback_failures:
+            return "保证金不足导致至少有一条腿未成交，且回滚失败，可能存在残留仓位：" + ", ".join(rollback_failures)
+        if rollback_due_to_margin:
+            return "保证金不足导致至少有一条腿未成交，已完成回滚"
+        if rollback_failures:
+            return "至少有一条腿未成交，且回滚失败，可能存在残留仓位：" + ", ".join(rollback_failures)
+        return "至少有一条腿未成交，已完成回滚"
+
+    @staticmethod
     def _merge_leg_fill(leg: LegOrder, result: OrderResult) -> None:
         filled_qty = max(float(result.quantity or 0.0), 0.0)
         avg_price = float(result.avg_price or result.price or 0.0)
@@ -890,10 +944,7 @@ class PositionManager:
                 "message": f"开始提交 Short Strangle {group_id}（{execution_mode_norm}）",
                 "group_id": group_id,
                 "execution_mode": execution_mode_norm,
-                "legs": [
-                    {"leg_role": leg.leg_role, "symbol": leg.symbol, "side": leg.side, "quantity": leg.quantity, "status": leg.status}
-                    for leg in leg_orders
-                ],
+                "legs": self._serialize_open_request_legs(leg_orders),
                 "total_legs": len(leg_orders),
             })
 
@@ -950,18 +1001,7 @@ class PositionManager:
                                 "group_id": group_id,
                                 "execution_mode": execution_mode_norm,
                                 "failed_legs": [r.leg_role for r in failed],
-                                "legs": [
-                                    {
-                                        "leg_role": r.leg_role,
-                                        "symbol": r.symbol,
-                                        "side": r.side,
-                                        "quantity": r.quantity,
-                                        "filled_qty": r.filled_qty,
-                                        "status": r.status,
-                                        "avg_price": r.avg_price,
-                                    }
-                                    for r in results
-                                ],
+                                "legs": self._serialize_leg_results(results),
                             })
                         return condor
             filled_results = [
@@ -975,37 +1015,15 @@ class PositionManager:
             ]
             rollback_failures = self._rollback_legs(filled_results)
             if status_callback is not None:
-                _rollback_msg = (
-                    "保证金不足导致至少有一条腿未成交，且回滚失败，可能存在残留仓位："
-                    + ", ".join(rollback_failures)
-                    if rollback_due_to_margin and rollback_failures
-                    else "保证金不足导致至少有一条腿未成交，已完成回滚"
-                    if rollback_due_to_margin
-                    else "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
-                    + ", ".join(rollback_failures)
-                    if rollback_failures
-                    else "至少有一条腿未成交，已完成回滚"
-                )
                 status_callback({
                     "event": "position_open_failed",
-                    "message": _rollback_msg,
+                    "message": self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
                     "group_id": group_id,
                     "execution_mode": execution_mode_norm,
                     "failed_legs": [r.leg_role for r in failed],
                     "abort_reason": "margin_insufficient" if rollback_due_to_margin else "submit_failed",
                     "rollback_failed_legs": rollback_failures,
-                    "legs": [
-                        {
-                            "leg_role": r.leg_role,
-                            "symbol": r.symbol,
-                            "side": r.side,
-                            "quantity": r.quantity,
-                            "filled_qty": r.filled_qty,
-                            "status": r.status,
-                            "avg_price": r.avg_price,
-                        }
-                        for r in results
-                    ],
+                    "legs": self._serialize_leg_results(results),
                 })
             return None
 
@@ -1146,10 +1164,7 @@ class PositionManager:
                 "message": f"开始提交 Iron Condor {group_id}（{execution_mode_norm}）",
                 "group_id": group_id,
                 "execution_mode": execution_mode_norm,
-                "legs": [
-                    {"leg_role": leg.leg_role, "symbol": leg.symbol, "side": leg.side, "quantity": leg.quantity, "status": leg.status}
-                    for leg in leg_orders
-                ],
+                "legs": self._serialize_open_request_legs(leg_orders),
                 "total_legs": len(leg_orders),
             })
 
@@ -1217,18 +1232,7 @@ class PositionManager:
                                 "group_id": group_id,
                                 "execution_mode": execution_mode_norm,
                                 "failed_legs": [r.leg_role for r in failed],
-                                "legs": [
-                                    {
-                                        "leg_role": r.leg_role,
-                                        "symbol": r.symbol,
-                                        "side": r.side,
-                                        "quantity": r.quantity,
-                                        "filled_qty": r.filled_qty,
-                                        "status": r.status,
-                                        "avg_price": r.avg_price,
-                                    }
-                                    for r in results
-                                ],
+                                "legs": self._serialize_leg_results(results),
                             })
                         return condor
             # Rollback filled legs
@@ -1245,34 +1249,13 @@ class PositionManager:
             if status_callback is not None:
                 status_callback({
                     "event": "position_open_failed",
-                    "message": (
-                        "保证金不足导致至少有一条腿未成交，且回滚失败，可能存在残留仓位："
-                        + ", ".join(rollback_failures)
-                        if rollback_due_to_margin and rollback_failures
-                        else "保证金不足导致至少有一条腿未成交，已完成回滚"
-                        if rollback_due_to_margin
-                        else "至少有一条腿未成交，且回滚失败，可能存在残留仓位："
-                        + ", ".join(rollback_failures)
-                        if rollback_failures
-                        else "至少有一条腿未成交，已完成回滚"
-                    ),
+                    "message": self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
                     "group_id": group_id,
                     "execution_mode": execution_mode_norm,
                     "failed_legs": [r.leg_role for r in failed],
                     "abort_reason": "margin_insufficient" if rollback_due_to_margin else "submit_failed",
                     "rollback_failed_legs": rollback_failures,
-                    "legs": [
-                        {
-                            "leg_role": r.leg_role,
-                            "symbol": r.symbol,
-                            "side": r.side,
-                            "quantity": r.quantity,
-                            "filled_qty": r.filled_qty,
-                            "status": r.status,
-                            "avg_price": r.avg_price,
-                        }
-                        for r in results
-                    ],
+                    "legs": self._serialize_leg_results(results),
                 })
             return None
 
@@ -1331,18 +1314,7 @@ class PositionManager:
                 "group_id": group_id,
                 "execution_mode": execution_mode_norm,
                 "net_premium": total_premium,
-                "legs": [
-                    {
-                        "leg_role": r.leg_role,
-                        "symbol": r.symbol,
-                        "side": r.side,
-                        "quantity": r.quantity,
-                        "filled_qty": r.filled_qty,
-                        "status": r.status,
-                        "avg_price": r.avg_price,
-                    }
-                    for r in results
-                ],
+                "legs": [self._serialize_leg_status(r) for r in results],
             })
 
         return condor
@@ -1403,19 +1375,7 @@ class PositionManager:
                             "batch_qty": batch_qty,
                             "max_spread_usd": self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
                             "retry_window_sec": self.MARKET_PARTIAL_RETRY_WINDOW_SEC,
-                            "legs": [
-                                {
-                                    "leg_role": leg.leg_role,
-                                    "symbol": leg.symbol,
-                                    "side": leg.side,
-                                    "quantity": leg.quantity,
-                                    "filled_qty": leg.filled_qty,
-                                    "status": leg.status,
-                                    "avg_price": leg.avg_price,
-                                    "attempts": leg.attempts,
-                                }
-                                for leg in leg_orders
-                            ],
+                            "legs": [self._serialize_leg_status(leg) for leg in leg_orders],
                         })
                     continue
                 for leg in pending:
@@ -1433,22 +1393,8 @@ class PositionManager:
                     "batch_qty": batch_qty,
                     "filled_legs": sum(1 for leg in leg_orders if self._remaining_leg_qty(leg) <= 1e-9),
                     "total_legs": total_legs,
-                    "fill_ratio": sum(float(leg.filled_qty or 0.0) for leg in leg_orders) / max(sum(float(leg.quantity or 0.0) for leg in leg_orders), 1e-9),
-                    "legs": [
-                        {
-                            "leg_role": leg.leg_role,
-                            "symbol": leg.symbol,
-                            "side": leg.side,
-                            "quantity": leg.quantity,
-                            "filled_qty": leg.filled_qty,
-                            "status": leg.status,
-                            "avg_price": leg.avg_price,
-                            "attempts": leg.attempts,
-                            "spread": float((snapshots.get(leg.symbol) or {}).get("spread") or 0.0),
-                            "top_qty": float((snapshots.get(leg.symbol) or {}).get("available_qty") or 0.0),
-                        }
-                        for leg in leg_orders
-                    ],
+                    "fill_ratio": self._fill_ratio(leg_orders),
+                    "legs": [self._serialize_leg_status(leg, snapshots=snapshots) for leg in leg_orders],
                 })
 
             fatal_error: tuple[LegOrder, Exception] | None = None
@@ -1505,20 +1451,8 @@ class PositionManager:
                     "batch_qty": batch_qty,
                     "filled_legs": filled_count,
                     "total_legs": total_legs,
-                    "fill_ratio": sum(float(leg.filled_qty or 0.0) for leg in leg_orders) / max(sum(float(leg.quantity or 0.0) for leg in leg_orders), 1e-9),
-                    "legs": [
-                        {
-                            "leg_role": leg.leg_role,
-                            "symbol": leg.symbol,
-                            "side": leg.side,
-                            "quantity": leg.quantity,
-                            "filled_qty": leg.filled_qty,
-                            "status": leg.status,
-                            "avg_price": leg.avg_price,
-                            "attempts": leg.attempts,
-                        }
-                        for leg in leg_orders
-                    ],
+                    "fill_ratio": self._fill_ratio(leg_orders),
+                    "legs": [self._serialize_leg_status(leg) for leg in leg_orders],
                 })
 
             if fatal_error is not None:
@@ -1532,19 +1466,7 @@ class PositionManager:
                         "execution_mode": "market",
                         "failed_leg": failed_leg.leg_role,
                         "abort_reason": getattr(failed_leg, "abort_reason", "submit_failed"),
-                        "legs": [
-                            {
-                                "leg_role": leg.leg_role,
-                                "symbol": leg.symbol,
-                                "side": leg.side,
-                                "quantity": leg.quantity,
-                                "filled_qty": leg.filled_qty,
-                                "status": leg.status,
-                                "avg_price": leg.avg_price,
-                                "attempts": leg.attempts,
-                            }
-                            for leg in leg_orders
-                        ],
+                        "legs": [self._serialize_leg_status(leg) for leg in leg_orders],
                     })
                 if partial_fill_started and getattr(failed_leg, "abort_reason", "") != "margin_insufficient":
                     if completion_deadline is not None and _time.monotonic() < completion_deadline:
