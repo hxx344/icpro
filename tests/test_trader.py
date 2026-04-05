@@ -1032,6 +1032,8 @@ class TestWeekendVolStrategy:
         assert len(open_trades) == 2
         assert {t["symbol"] for t in open_trades} == {"BTC-260405-67000-C", "BTC-260405-66500-P"}
         assert all(json.loads(t["meta"]).get("recovered_from_exchange") is True for t in open_trades)
+        assert {round(float(t["fee"]), 4) for t in open_trades} == {8.6, 10.44}
+        assert all(json.loads(t["meta"]).get("fee_estimated") is True for t in open_trades)
 
     def test_init_replaces_conflicting_local_open_trades_with_exchange_positions(self, storage):
         storage.record_trade(

@@ -118,6 +118,8 @@ class PositionManager:
     MARKET_BATCH_STAGE_WAIT_SEC = 300.0
     MARKET_BATCH_POLL_SEC = 0.5
     MARKET_PARTIAL_RETRY_WINDOW_SEC = 600.0
+    DEFAULT_OPTION_TRANSACTION_FEE_RATE = 0.0003
+    DEFAULT_OPTION_CONTRACT_UNIT = 1.0
 
     def __init__(
         self,
@@ -302,6 +304,11 @@ class PositionManager:
             if quantity <= 1e-9:
                 continue
             entry_price = float(pos.get("entryPrice") or 0.0)
+            estimated_fee = self._estimate_default_option_fee(
+                index_price=spot_price,
+                order_price=entry_price,
+                quantity=quantity,
+            )
             meta = {
                 "leg_role": leg_role,
                 "option_type": parsed.get("option_type", ""),
@@ -309,6 +316,8 @@ class PositionManager:
                 "underlying_price": spot_price,
                 "group_id": group_id,
                 "recovered_from_exchange": True,
+                "fee_estimated": True,
+                "fee_rate_used": self.DEFAULT_OPTION_TRANSACTION_FEE_RATE,
                 "exchange_side": exchange_side,
             }
             self.storage.record_trade(
@@ -317,7 +326,7 @@ class PositionManager:
                 side=open_side,
                 quantity=quantity,
                 price=entry_price,
-                fee=0.0,
+                fee=estimated_fee,
                 order_id=str(pos.get("orderId") or ""),
                 meta=meta,
             )
@@ -412,6 +421,22 @@ class PositionManager:
     @staticmethod
     def _has_margin_insufficient_failure(results: list[LegOrder]) -> bool:
         return any(getattr(r, "abort_reason", "") == "margin_insufficient" for r in results)
+
+    @classmethod
+    def _estimate_default_option_fee(
+        cls,
+        index_price: float,
+        order_price: float,
+        quantity: float,
+    ) -> float:
+        index_component = (
+            max(float(index_price or 0.0), 0.0)
+            * cls.DEFAULT_OPTION_CONTRACT_UNIT
+            * cls.DEFAULT_OPTION_TRANSACTION_FEE_RATE
+        )
+        order_component = 0.10 * max(float(order_price or 0.0), 0.0)
+        per_unit_fee = min(index_component, order_component) if index_component > 0 and order_component > 0 else max(index_component, order_component)
+        return max(float(quantity or 0.0), 0.0) * per_unit_fee
 
     def _persist_position_from_results(
         self,
