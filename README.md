@@ -17,7 +17,7 @@
 git clone https://github.com/hxx344/icpro.git
 cd icpro
 
-python -m venv .venv
+python3 -m venv .venv
 
 # Windows
 .venv\Scripts\activate
