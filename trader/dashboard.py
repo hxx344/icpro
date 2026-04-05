@@ -76,7 +76,7 @@ from trader.order_preview import compute_option_order_preview
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="铁鹰交易面板",
+    page_title="期权交易面板",
     page_icon="🦅",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -701,7 +701,7 @@ def _check_login() -> bool:
 
     # --- Login form ---
     st.markdown(
-        "<h2 style='text-align:center; margin-top:80px;'>🦅 铁鹰交易面板</h2>"
+        "<h2 style='text-align:center; margin-top:80px;'>🦅 期权交易面板</h2>"
         "<p style='text-align:center; color:#888;'>请输入用户名和密码登录</p>",
         unsafe_allow_html=True,
     )
