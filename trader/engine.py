@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from trader.binance_client import BinanceOptionsClient
-from trader.config import TraderConfig, load_config
+from trader.config import TraderConfig
 from trader.equity import EquityTracker
 from trader.limit_chaser import ChaserConfig as _ChaserConfig
 from trader.position_manager import PositionManager
@@ -164,6 +163,14 @@ class TradingEngine:
             "open_positions",
             self.pos_mgr.open_position_count if self.pos_mgr else 0,
         )
+        execution_metrics: dict[str, Any] = {}
+        recent_execution_events: list[dict[str, Any]] = []
+        if self.storage is not None:
+            try:
+                execution_metrics = self.storage.get_execution_metrics()
+                recent_execution_events = self.storage.get_execution_events(limit=10)
+            except Exception as e:
+                logger.debug(f"Failed to load execution status: {e}")
 
         return {
             "running": self.is_running,
@@ -176,6 +183,8 @@ class TradingEngine:
             "error_count": self._error_count,
             "check_interval": self.cfg.monitor.check_interval_sec,
             "open_positions": effective_open_positions,
+            "execution_metrics": execution_metrics,
+            "recent_execution_events": recent_execution_events,
             "strategy_status": strategy_status,
         }
 

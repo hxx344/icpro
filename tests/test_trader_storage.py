@@ -49,7 +49,7 @@ class TestInit:
         s.close()
 
     def test_tables_exist(self, db):
-        """验证所有 5 张表已创建."""
+        """验证所有核心表已创建."""
         conn = db._get_conn()
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
@@ -59,6 +59,7 @@ class TestInit:
         assert "equity_snapshots" in names
         assert "daily_pnl" in names
         assert "strategy_state" in names
+        assert "execution_events" in names
 
     def test_connection_pragmas(self, db):
         conn = db._get_conn()
@@ -261,6 +262,60 @@ class TestDailyPnl:
         result = db.get_daily_pnl(start_date="2026-03-19", end_date="2026-03-19")
         assert len(result) == 1
         assert result[0]["date"] == "2026-03-19"
+
+
+class TestExecutionEvents:
+    def test_record_and_query(self, db):
+        row_id = db.record_execution_event(
+            event_type="position_open_start",
+            execution_state="opening",
+            group_id="IC_TEST",
+            underlying="BTC",
+            execution_mode="market",
+            message="开始提交",
+            legs=[{"symbol": "BTC-TEST-C", "leg_role": "sell_call"}],
+            meta={"batch_index": 1},
+        )
+
+        assert row_id > 0
+        events = db.get_execution_events(limit=10)
+        assert len(events) == 1
+        assert events[0]["event_type"] == "position_open_start"
+        assert events[0]["execution_state"] == "opening"
+        assert events[0]["legs"][0]["symbol"] == "BTC-TEST-C"
+        assert events[0]["meta"]["batch_index"] == 1
+
+    def test_metrics_summary(self, db):
+        db.record_execution_event(
+            event_type="position_open_start",
+            execution_state="opening",
+            group_id="IC_A",
+            underlying="BTC",
+            message="开始",
+        )
+        db.record_execution_event(
+            event_type="exchange_reconcile_adjustment",
+            execution_state="partial_exposure",
+            severity="warning",
+            group_id="IC_A",
+            underlying="BTC",
+            message="复核调整",
+        )
+        db.record_execution_event(
+            event_type="position_open_partial",
+            execution_state="partial_exposure",
+            severity="warning",
+            group_id="IC_A",
+            underlying="BTC",
+            message="部分成交",
+        )
+
+        metrics = db.get_execution_metrics(lookback_hours=24)
+        assert metrics["open_attempts"] == 1
+        assert metrics["open_partials"] == 1
+        assert metrics["open_successes"] == 0
+        assert metrics["reconcile_adjustments"] == 1
+        assert metrics["risk_alerts"] >= 2
 
 
 # ======================================================================

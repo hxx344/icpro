@@ -6,6 +6,7 @@ Tables:
   - equity_snapshots: 资产曲线（定期快照）
   - daily_pnl:       每日损益汇总
   - strategy_state:  策略状态（跨重启恢复）
+    - execution_events: 执行事件日志（下单/补腿/回滚/对账）
 """
 
 from __future__ import annotations
@@ -76,7 +77,8 @@ class Storage:
             DELETE FROM equity_snapshots;
             DELETE FROM daily_pnl;
             DELETE FROM strategy_state;
-            DELETE FROM sqlite_sequence WHERE name IN ('trades', 'equity_snapshots', 'daily_pnl');
+            DELETE FROM execution_events;
+            DELETE FROM sqlite_sequence WHERE name IN ('trades', 'equity_snapshots', 'daily_pnl', 'execution_events');
         """)
         conn.commit()
 
@@ -133,6 +135,20 @@ class Storage:
                 value       TEXT NOT NULL,
                 updated_at  TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS execution_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp       TEXT NOT NULL,
+                event_type      TEXT NOT NULL,
+                execution_state TEXT NOT NULL,
+                severity        TEXT NOT NULL DEFAULT 'info',
+                group_id        TEXT DEFAULT '',
+                underlying      TEXT DEFAULT '',
+                execution_mode  TEXT DEFAULT '',
+                message         TEXT DEFAULT '',
+                legs            TEXT DEFAULT '[]',
+                meta            TEXT DEFAULT '{}'
+            );
         """)
         self._ensure_schema_compatibility(conn)
         conn.executescript("""
@@ -141,6 +157,9 @@ class Storage:
             CREATE INDEX IF NOT EXISTS idx_trades_open ON trades(is_open);
             CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(timestamp);
             CREATE INDEX IF NOT EXISTS idx_daily_date ON daily_pnl(date);
+            CREATE INDEX IF NOT EXISTS idx_exec_events_ts ON execution_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_exec_events_group ON execution_events(group_id);
+            CREATE INDEX IF NOT EXISTS idx_exec_events_type ON execution_events(event_type);
         """)
         conn.commit()
         logger.info(f"Storage initialized: {self.db_path}")
@@ -179,6 +198,21 @@ class Storage:
                 "unrealized_pnl": "REAL DEFAULT 0",
                 "total_fees": "REAL DEFAULT 0",
                 "trade_count": "INTEGER DEFAULT 0",
+                "meta": "TEXT DEFAULT '{}'",
+            },
+        )
+        self._ensure_table_columns(
+            conn,
+            "execution_events",
+            {
+                "event_type": "TEXT NOT NULL DEFAULT ''",
+                "execution_state": "TEXT NOT NULL DEFAULT ''",
+                "severity": "TEXT NOT NULL DEFAULT 'info'",
+                "group_id": "TEXT DEFAULT ''",
+                "underlying": "TEXT DEFAULT ''",
+                "execution_mode": "TEXT DEFAULT ''",
+                "message": "TEXT DEFAULT ''",
+                "legs": "TEXT DEFAULT '[]'",
                 "meta": "TEXT DEFAULT '{}'",
             },
         )
@@ -565,6 +599,139 @@ class Storage:
         if row:
             return json.loads(row["value"])
         return default
+
+    # ------------------------------------------------------------------
+    # Execution events
+    # ------------------------------------------------------------------
+
+    def record_execution_event(
+        self,
+        event_type: str,
+        execution_state: str,
+        severity: str = "info",
+        group_id: str = "",
+        underlying: str = "",
+        execution_mode: str = "",
+        message: str = "",
+        legs: list[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> int:
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO execution_events
+                    (timestamp, event_type, execution_state, severity, group_id,
+                     underlying, execution_mode, message, legs, meta)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    event_type,
+                    execution_state,
+                    severity,
+                    group_id,
+                    underlying,
+                    execution_mode,
+                    message,
+                    json.dumps(legs or []),
+                    json.dumps(meta or {}),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_execution_events(
+        self,
+        limit: int = 50,
+        start_time: str | None = None,
+        group_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM execution_events"
+        params: list[Any] = []
+        conditions: list[str] = []
+
+        if start_time:
+            conditions.append("timestamp >= ?")
+            params.append(start_time)
+        if group_id:
+            conditions.append("group_id = ?")
+            params.append(group_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY timestamp DESC"
+        if limit > 0:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        conn = self._get_conn()
+        rows = conn.execute(query, params).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["legs"] = json.loads(item.get("legs") or "[]")
+            item["meta"] = json.loads(item.get("meta") or "{}")
+            result.append(item)
+        return result
+
+    def get_execution_metrics(self, lookback_hours: int = 168) -> dict[str, Any]:
+        start_time = None
+        if lookback_hours > 0:
+            start_time = datetime.now(timezone.utc).timestamp() - lookback_hours * 3600
+            start_time = datetime.fromtimestamp(start_time, tz=timezone.utc).isoformat()
+
+        events = self.get_execution_events(limit=0, start_time=start_time)
+        starts = [e for e in events if e.get("event_type") == "position_open_start"]
+        successes = [e for e in events if e.get("event_type") == "position_open_success"]
+        partials = [e for e in events if e.get("event_type") == "position_open_partial"]
+        failures = [
+            e for e in events
+            if e.get("event_type") in {"position_open_failed", "position_open_error"}
+        ]
+        reconcile_adjustments = [e for e in events if e.get("event_type") == "exchange_reconcile_adjustment"]
+        risk_alerts = [
+            e for e in events
+            if str(e.get("execution_state") or "") in {"partial_exposure", "partial_exposure_timeout"}
+            or str(e.get("severity") or "") in {"warning", "error"}
+        ]
+
+        started_at: dict[str, str] = {}
+        terminal_events: dict[str, dict[str, Any]] = {}
+        for event in sorted(events, key=lambda item: str(item.get("timestamp") or "")):
+            group_id = str(event.get("group_id") or "")
+            if not group_id:
+                continue
+            if event.get("event_type") == "position_open_start" and group_id not in started_at:
+                started_at[group_id] = str(event.get("timestamp") or "")
+            if event.get("event_type") in {"position_open_success", "position_open_partial", "position_open_failed", "position_open_error"}:
+                terminal_events[group_id] = event
+
+        durations: list[float] = []
+        for group_id, start_ts in started_at.items():
+            terminal = terminal_events.get(group_id)
+            if terminal is None:
+                continue
+            try:
+                start_dt = datetime.fromisoformat(start_ts)
+                end_dt = datetime.fromisoformat(str(terminal.get("timestamp") or ""))
+            except Exception:
+                continue
+            durations.append(max((end_dt - start_dt).total_seconds(), 0.0))
+
+        attempts = len(starts)
+        return {
+            "lookback_hours": lookback_hours,
+            "open_attempts": attempts,
+            "open_successes": len(successes),
+            "open_partials": len(partials),
+            "open_failures": len(failures),
+            "reconcile_adjustments": len(reconcile_adjustments),
+            "risk_alerts": len(risk_alerts),
+            "success_rate_pct": (len(successes) / attempts * 100.0) if attempts > 0 else 0.0,
+            "partial_rate_pct": (len(partials) / attempts * 100.0) if attempts > 0 else 0.0,
+            "failure_rate_pct": (len(failures) / attempts * 100.0) if attempts > 0 else 0.0,
+            "avg_open_duration_sec": (sum(durations) / len(durations)) if durations else 0.0,
+            "latest_event_at": str(events[0].get("timestamp") or "") if events else "",
+        }
 
     # ------------------------------------------------------------------
     # Statistics helpers

@@ -516,6 +516,70 @@ class PositionManager:
     def _serialize_leg_results(self, results: list[LegOrder]) -> list[dict[str, Any]]:
         return [self._serialize_leg_status(result) for result in results]
 
+    def _emit_execution_event(
+        self,
+        *,
+        event_type: str,
+        message: str,
+        group_id: str = "",
+        execution_mode: str = "",
+        execution_state: str,
+        severity: str = "info",
+        underlying: str = "",
+        legs: list[dict[str, Any]] | None = None,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
+        **payload: Any,
+    ) -> None:
+        event_underlying = underlying or ""
+        if not event_underlying and legs:
+            first_symbol = str((legs[0] or {}).get("symbol") or "")
+            event_underlying = self._infer_underlying(first_symbol)
+
+        event_payload: dict[str, Any] = {
+            "event": event_type,
+            "message": message,
+            "group_id": group_id,
+            "execution_mode": execution_mode,
+            "execution_state": execution_state,
+            "severity": severity,
+            "underlying": event_underlying,
+        }
+        if legs is not None:
+            event_payload["legs"] = legs
+        event_payload.update(payload)
+
+        if status_callback is not None:
+            status_callback(event_payload)
+
+        meta = {
+            key: value
+            for key, value in event_payload.items()
+            if key not in {
+                "event",
+                "message",
+                "group_id",
+                "execution_mode",
+                "execution_state",
+                "severity",
+                "underlying",
+                "legs",
+            }
+        }
+        try:
+            self.storage.record_execution_event(
+                event_type=event_type,
+                execution_state=execution_state,
+                severity=severity,
+                group_id=group_id,
+                underlying=event_underlying,
+                execution_mode=execution_mode,
+                message=message,
+                legs=legs,
+                meta=meta,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to persist execution event {event_type} for {group_id}: {e}")
+
     @staticmethod
     def _rollback_failure_message(
         rollback_due_to_margin: bool,
@@ -664,54 +728,34 @@ class PositionManager:
                         f"Market batch {group_id} timed out at spread<={prev_max_spread:.2f}; "
                         f"relaxing to spread<={current_max_spread:.2f} for batch_qty={batch_qty:.4f}"
                     )
-                    if status_callback is not None:
-                        status_callback({
-                            "event": "market_batch_spread_relaxed",
-                            "message": f"等待超时，放宽最大价差到 {current_max_spread:.0f} USD：批次={batch_qty:.4f}",
-                            "group_id": group_id,
-                            "execution_mode": "market",
-                            "batch_qty": batch_qty,
-                            "required_depth": required_depth,
-                            "max_spread_usd": current_max_spread,
-                            "legs": [
-                                {
-                                    "leg_role": leg.leg_role,
-                                    "symbol": leg.symbol,
-                                    "side": leg.side,
-                                    "quantity": leg.quantity,
-                                    "filled_qty": leg.filled_qty,
-                                    "status": leg.status,
-                                    "avg_price": leg.avg_price,
-                                    "attempts": leg.attempts,
-                                }
-                                for leg in legs
-                            ],
-                        })
+                    self._emit_execution_event(
+                        event_type="market_batch_spread_relaxed",
+                        message=f"等待超时，放宽最大价差到 {current_max_spread:.0f} USD：批次={batch_qty:.4f}",
+                        group_id=group_id,
+                        execution_mode="market",
+                        execution_state="opening",
+                        severity="warning",
+                        batch_qty=batch_qty,
+                        required_depth=required_depth,
+                        max_spread_usd=current_max_spread,
+                        legs=[self._serialize_leg_status(leg) for leg in legs],
+                        status_callback=status_callback,
+                    )
                     continue
-                if status_callback is not None:
-                    status_callback({
-                        "event": "market_batch_timeout",
-                        "message": f"批量下单等待超时：批次={batch_qty:.4f}",
-                        "group_id": group_id,
-                        "execution_mode": "market",
-                        "batch_qty": batch_qty,
-                        "required_depth": required_depth,
-                        "max_spread_usd": current_max_spread,
-                        "blockers": blockers,
-                        "legs": [
-                            {
-                                "leg_role": leg.leg_role,
-                                "symbol": leg.symbol,
-                                "side": leg.side,
-                                "quantity": leg.quantity,
-                                "filled_qty": leg.filled_qty,
-                                "status": leg.status,
-                                "avg_price": leg.avg_price,
-                                "attempts": leg.attempts,
-                            }
-                            for leg in legs
-                        ],
-                    })
+                self._emit_execution_event(
+                    event_type="market_batch_timeout",
+                    message=f"批量下单等待超时：批次={batch_qty:.4f}",
+                    group_id=group_id,
+                    execution_mode="market",
+                    execution_state="partial_exposure_timeout" if self._filled_leg_count(legs) > 0 else "opening",
+                    severity="warning",
+                    batch_qty=batch_qty,
+                    required_depth=required_depth,
+                    max_spread_usd=current_max_spread,
+                    blockers=blockers,
+                    legs=[self._serialize_leg_status(leg) for leg in legs],
+                    status_callback=status_callback,
+                )
                 return None
 
             if status_callback is not None:
@@ -827,6 +871,9 @@ class PositionManager:
         reduce_only: bool = False,
         max_polls: int = 3,
         poll_delay_sec: float = 0.25,
+        group_id: str = "",
+        execution_mode: str = "market",
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         """Reconcile order results against live exchange positions.
 
@@ -838,6 +885,10 @@ class PositionManager:
             return
 
         underlying = self._infer_underlying(leg_orders[0].symbol)
+        before_state = {
+            leg.symbol: (float(leg.filled_qty or 0.0), str(leg.status or ""))
+            for leg in leg_orders
+        }
         target_legs = list(leg_orders)
         for poll_idx in range(max_polls):
             try:
@@ -892,6 +943,29 @@ class PositionManager:
             self._cancel_leg_order(leg)
             leg.status = "PENDING"
 
+        adjusted_legs = []
+        for leg in leg_orders:
+            prev_qty, prev_status = before_state.get(leg.symbol, (0.0, ""))
+            curr_qty = float(leg.filled_qty or 0.0)
+            curr_status = str(leg.status or "")
+            if curr_qty > prev_qty + 1e-9 or curr_status != prev_status:
+                adjusted_legs.append(self._serialize_leg_status(leg))
+
+        if adjusted_legs:
+            remaining_exists = any(self._remaining_leg_qty(leg) > 1e-9 for leg in leg_orders)
+            self._emit_execution_event(
+                event_type="exchange_reconcile_adjustment",
+                message="交易所持仓复核已更新批次成交结果",
+                group_id=group_id,
+                execution_mode=execution_mode,
+                execution_state="partial_exposure" if remaining_exists else "opening",
+                severity="warning" if remaining_exists else "info",
+                underlying=underlying,
+                adjusted_legs=adjusted_legs,
+                legs=[self._serialize_leg_status(leg) for leg in leg_orders],
+                status_callback=status_callback,
+            )
+
     # ------------------------------------------------------------------
     # Open a new short strangle (2-leg naked sell)
     # ------------------------------------------------------------------
@@ -938,15 +1012,17 @@ class PositionManager:
         ]
         underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
 
-        if status_callback is not None:
-            status_callback({
-                "event": "position_open_start",
-                "message": f"开始提交 Short Strangle {group_id}（{execution_mode_norm}）",
-                "group_id": group_id,
-                "execution_mode": execution_mode_norm,
-                "legs": self._serialize_open_request_legs(leg_orders),
-                "total_legs": len(leg_orders),
-            })
+        self._emit_execution_event(
+            event_type="position_open_start",
+            message=f"开始提交 Short Strangle {group_id}（{execution_mode_norm}）",
+            group_id=group_id,
+            execution_mode=execution_mode_norm,
+            execution_state="opening",
+            underlying=underlying,
+            legs=self._serialize_open_request_legs(leg_orders),
+            total_legs=len(leg_orders),
+            status_callback=status_callback,
+        )
 
         if execution_mode_norm == "market":
             results = self._execute_market_legs(
@@ -994,15 +1070,18 @@ class PositionManager:
                             f"Short Strangle {group_id}: partial fill kept live without rollback; "
                             f"filled={len(filled_results)}/{len(results)}"
                         )
-                        if status_callback is not None:
-                            status_callback({
-                                "event": "position_open_partial",
-                                "message": "已有成交腿保留，未再执行回滚；剩余腿未完成",
-                                "group_id": group_id,
-                                "execution_mode": execution_mode_norm,
-                                "failed_legs": [r.leg_role for r in failed],
-                                "legs": self._serialize_leg_results(results),
-                            })
+                        self._emit_execution_event(
+                            event_type="position_open_partial",
+                            message="已有成交腿保留，未再执行回滚；剩余腿未完成",
+                            group_id=group_id,
+                            execution_mode=execution_mode_norm,
+                            execution_state="partial_exposure",
+                            severity="warning",
+                            underlying=underlying,
+                            failed_legs=[r.leg_role for r in failed],
+                            legs=self._serialize_leg_results(results),
+                            status_callback=status_callback,
+                        )
                         return condor
             filled_results = [
                 (r.leg_role, OrderResult(
@@ -1014,17 +1093,20 @@ class PositionManager:
                 for r in results if r.status == "FILLED"
             ]
             rollback_failures = self._rollback_legs(filled_results)
-            if status_callback is not None:
-                status_callback({
-                    "event": "position_open_failed",
-                    "message": self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
-                    "group_id": group_id,
-                    "execution_mode": execution_mode_norm,
-                    "failed_legs": [r.leg_role for r in failed],
-                    "abort_reason": "margin_insufficient" if rollback_due_to_margin else "submit_failed",
-                    "rollback_failed_legs": rollback_failures,
-                    "legs": self._serialize_leg_results(results),
-                })
+            self._emit_execution_event(
+                event_type="position_open_failed",
+                message=self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
+                group_id=group_id,
+                execution_mode=execution_mode_norm,
+                execution_state="partial_exposure" if rollback_failures else "rolled_back",
+                severity="error" if rollback_failures else "warning",
+                underlying=underlying,
+                failed_legs=[r.leg_role for r in failed],
+                abort_reason="margin_insufficient" if rollback_due_to_margin else "submit_failed",
+                rollback_failed_legs=rollback_failures,
+                legs=self._serialize_leg_results(results),
+                status_callback=status_callback,
+            )
             return None
 
         try:
@@ -1055,19 +1137,22 @@ class PositionManager:
                 )
                 for r in results if (r.filled_qty or 0) > 0
             ])
-            if status_callback is not None:
-                _msg = (
-                    f"成交后本地记账失败，且回滚失败，可能有残留仓位：{', '.join(rollback_failures)}"
-                    if rollback_failures
-                    else f"成交后本地记账失败，已尝试全部回滚：{e}"
-                )
-                status_callback({
-                    "event": "position_open_error",
-                    "message": _msg,
-                    "group_id": group_id,
-                    "execution_mode": execution_mode_norm,
-                    "rollback_failed_legs": rollback_failures,
-                })
+            _msg = (
+                f"成交后本地记账失败，且回滚失败，可能有残留仓位：{', '.join(rollback_failures)}"
+                if rollback_failures
+                else f"成交后本地记账失败，已尝试全部回滚：{e}"
+            )
+            self._emit_execution_event(
+                event_type="position_open_error",
+                message=_msg,
+                group_id=group_id,
+                execution_mode=execution_mode_norm,
+                execution_state="partial_exposure" if rollback_failures else "rolled_back",
+                severity="error",
+                underlying=underlying,
+                rollback_failed_legs=rollback_failures,
+                status_callback=status_callback,
+            )
             return None
 
         logger.info(
@@ -1075,26 +1160,17 @@ class PositionManager:
             f"Net premium: {total_premium:.4f} USD"
         )
 
-        if status_callback is not None:
-            status_callback({
-                "event": "position_open_success",
-                "message": f"Short Strangle {group_id} 已全部成交",
-                "group_id": group_id,
-                "execution_mode": execution_mode_norm,
-                "net_premium": total_premium,
-                "legs": [
-                    {
-                        "leg_role": r.leg_role,
-                        "symbol": r.symbol,
-                        "side": r.side,
-                        "quantity": r.quantity,
-                        "filled_qty": r.filled_qty,
-                        "status": r.status,
-                        "avg_price": r.avg_price,
-                    }
-                    for r in results
-                ],
-            })
+        self._emit_execution_event(
+            event_type="position_open_success",
+            message=f"Short Strangle {group_id} 已全部成交",
+            group_id=group_id,
+            execution_mode=execution_mode_norm,
+            execution_state="open",
+            underlying=underlying,
+            net_premium=total_premium,
+            legs=self._serialize_leg_results(results),
+            status_callback=status_callback,
+        )
 
         return condor
 
@@ -1158,15 +1234,18 @@ class PositionManager:
             ),
         ]
 
-        if status_callback is not None:
-            status_callback({
-                "event": "position_open_start",
-                "message": f"开始提交 Iron Condor {group_id}（{execution_mode_norm}）",
-                "group_id": group_id,
-                "execution_mode": execution_mode_norm,
-                "legs": self._serialize_open_request_legs(leg_orders),
-                "total_legs": len(leg_orders),
-            })
+        underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
+        self._emit_execution_event(
+            event_type="position_open_start",
+            message=f"开始提交 Iron Condor {group_id}（{execution_mode_norm}）",
+            group_id=group_id,
+            execution_mode=execution_mode_norm,
+            execution_state="opening",
+            underlying=underlying,
+            legs=self._serialize_open_request_legs(leg_orders),
+            total_legs=len(leg_orders),
+            status_callback=status_callback,
+        )
 
         if execution_mode_norm == "market":
             results = self._execute_market_iron_condor(
@@ -1178,8 +1257,6 @@ class PositionManager:
             if results is None:
                 return None
         else:
-            underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
-
             # Execute via limit chaser (blocks up to window_seconds)
             try:
                 results = self.chaser.execute_legs(
@@ -1189,13 +1266,16 @@ class PositionManager:
                 )
             except Exception as e:
                 logger.error(f"Iron Condor {group_id}: execute_legs exception: {e}")
-                if status_callback is not None:
-                    status_callback({
-                        "event": "position_open_error",
-                        "message": f"追单异常: {e}",
-                        "group_id": group_id,
-                        "execution_mode": execution_mode_norm,
-                    })
+                self._emit_execution_event(
+                    event_type="position_open_error",
+                    message=f"追单异常: {e}",
+                    group_id=group_id,
+                    execution_mode=execution_mode_norm,
+                    execution_state="error",
+                    severity="error",
+                    underlying=underlying,
+                    status_callback=status_callback,
+                )
                 return None
 
         # Check for failures
@@ -1225,15 +1305,18 @@ class PositionManager:
                             f"Iron Condor {group_id}: partial fill kept live without rollback; "
                             f"filled={len(filled_results)}/{len(results)}"
                         )
-                        if status_callback is not None:
-                            status_callback({
-                                "event": "position_open_partial",
-                                "message": "已有成交腿保留，未再执行回滚；剩余腿未完成",
-                                "group_id": group_id,
-                                "execution_mode": execution_mode_norm,
-                                "failed_legs": [r.leg_role for r in failed],
-                                "legs": self._serialize_leg_results(results),
-                            })
+                        self._emit_execution_event(
+                            event_type="position_open_partial",
+                            message="已有成交腿保留，未再执行回滚；剩余腿未完成",
+                            group_id=group_id,
+                            execution_mode=execution_mode_norm,
+                            execution_state="partial_exposure",
+                            severity="warning",
+                            underlying=underlying,
+                            failed_legs=[r.leg_role for r in failed],
+                            legs=self._serialize_leg_results(results),
+                            status_callback=status_callback,
+                        )
                         return condor
             # Rollback filled legs
             filled_results = [
@@ -1246,17 +1329,20 @@ class PositionManager:
                 for r in results if r.status == "FILLED"
             ]
             rollback_failures = self._rollback_legs(filled_results)
-            if status_callback is not None:
-                status_callback({
-                    "event": "position_open_failed",
-                    "message": self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
-                    "group_id": group_id,
-                    "execution_mode": execution_mode_norm,
-                    "failed_legs": [r.leg_role for r in failed],
-                    "abort_reason": "margin_insufficient" if rollback_due_to_margin else "submit_failed",
-                    "rollback_failed_legs": rollback_failures,
-                    "legs": self._serialize_leg_results(results),
-                })
+            self._emit_execution_event(
+                event_type="position_open_failed",
+                message=self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
+                group_id=group_id,
+                execution_mode=execution_mode_norm,
+                execution_state="partial_exposure" if rollback_failures else "rolled_back",
+                severity="error" if rollback_failures else "warning",
+                underlying=underlying,
+                failed_legs=[r.leg_role for r in failed],
+                abort_reason="margin_insufficient" if rollback_due_to_margin else "submit_failed",
+                rollback_failed_legs=rollback_failures,
+                legs=self._serialize_leg_results(results),
+                status_callback=status_callback,
+            )
             return None
 
         try:
@@ -1287,19 +1373,22 @@ class PositionManager:
                 )
                 for r in results if (r.filled_qty or 0) > 0
             ])
-            if status_callback is not None:
-                _msg = (
-                    f"成交后本地记账失败，且回滚失败，可能有残留仓位：{', '.join(rollback_failures)}"
-                    if rollback_failures
-                    else f"成交后本地记账失败，已尝试全部回滚：{e}"
-                )
-                status_callback({
-                    "event": "position_open_error",
-                    "message": _msg,
-                    "group_id": group_id,
-                    "execution_mode": execution_mode_norm,
-                    "rollback_failed_legs": rollback_failures,
-                })
+            _msg = (
+                f"成交后本地记账失败，且回滚失败，可能有残留仓位：{', '.join(rollback_failures)}"
+                if rollback_failures
+                else f"成交后本地记账失败，已尝试全部回滚：{e}"
+            )
+            self._emit_execution_event(
+                event_type="position_open_error",
+                message=_msg,
+                group_id=group_id,
+                execution_mode=execution_mode_norm,
+                execution_state="partial_exposure" if rollback_failures else "rolled_back",
+                severity="error",
+                underlying=underlying,
+                rollback_failed_legs=rollback_failures,
+                status_callback=status_callback,
+            )
             return None
 
         logger.info(
@@ -1307,15 +1396,17 @@ class PositionManager:
             f"Net premium: {total_premium:.4f} USD"
         )
 
-        if status_callback is not None:
-            status_callback({
-                "event": "position_open_success",
-                "message": f"Iron Condor {group_id} 已全部成交",
-                "group_id": group_id,
-                "execution_mode": execution_mode_norm,
-                "net_premium": total_premium,
-                "legs": [self._serialize_leg_status(r) for r in results],
-            })
+        self._emit_execution_event(
+            event_type="position_open_success",
+            message=f"Iron Condor {group_id} 已全部成交",
+            group_id=group_id,
+            execution_mode=execution_mode_norm,
+            execution_state="open",
+            underlying=underlying,
+            net_premium=total_premium,
+            legs=[self._serialize_leg_status(r) for r in results],
+            status_callback=status_callback,
+        )
 
         return condor
 
@@ -1365,37 +1456,40 @@ class PositionManager:
             )
             if snapshots is None:
                 if partial_mode and completion_deadline is not None and _time.monotonic() < completion_deadline:
-                    if status_callback is not None:
-                        status_callback({
-                            "event": "market_batch_retry_pending",
-                            "message": f"已有单腿成交，继续放宽条件补齐剩余腿：批次={batch_qty:.4f}",
-                            "group_id": group_id,
-                            "execution_mode": "market",
-                            "batch_index": batch_index,
-                            "batch_qty": batch_qty,
-                            "max_spread_usd": self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
-                            "retry_window_sec": self.MARKET_PARTIAL_RETRY_WINDOW_SEC,
-                            "legs": [self._serialize_leg_status(leg) for leg in leg_orders],
-                        })
+                    self._emit_execution_event(
+                        event_type="market_batch_retry_pending",
+                        message=f"已有单腿成交，继续放宽条件补齐剩余腿：批次={batch_qty:.4f}",
+                        group_id=group_id,
+                        execution_mode="market",
+                        execution_state="partial_exposure",
+                        severity="warning",
+                        batch_index=batch_index,
+                        batch_qty=batch_qty,
+                        max_spread_usd=self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
+                        retry_window_sec=self.MARKET_PARTIAL_RETRY_WINDOW_SEC,
+                        legs=[self._serialize_leg_status(leg) for leg in leg_orders],
+                        status_callback=status_callback,
+                    )
                     continue
                 for leg in pending:
                     if self._remaining_leg_qty(leg) > 1e-9:
                         leg.status = "FAILED"
                 break
 
-            if status_callback is not None:
-                status_callback({
-                    "event": "market_batch_submit",
-                    "message": f"第 {batch_index} 批开始同步下单，批次={batch_qty:.4f}",
-                    "group_id": group_id,
-                    "execution_mode": "market",
-                    "batch_index": batch_index,
-                    "batch_qty": batch_qty,
-                    "filled_legs": sum(1 for leg in leg_orders if self._remaining_leg_qty(leg) <= 1e-9),
-                    "total_legs": total_legs,
-                    "fill_ratio": self._fill_ratio(leg_orders),
-                    "legs": [self._serialize_leg_status(leg, snapshots=snapshots) for leg in leg_orders],
-                })
+            self._emit_execution_event(
+                event_type="market_batch_submit",
+                message=f"第 {batch_index} 批开始同步下单，批次={batch_qty:.4f}",
+                group_id=group_id,
+                execution_mode="market",
+                execution_state="partial_exposure" if partial_mode else "opening",
+                batch_index=batch_index,
+                batch_qty=batch_qty,
+                filled_legs=sum(1 for leg in leg_orders if self._remaining_leg_qty(leg) <= 1e-9),
+                total_legs=total_legs,
+                fill_ratio=self._fill_ratio(leg_orders),
+                legs=[self._serialize_leg_status(leg, snapshots=snapshots) for leg in leg_orders],
+                status_callback=status_callback,
+            )
 
             fatal_error: tuple[LegOrder, Exception] | None = None
             for leg in pending:
@@ -1438,36 +1532,47 @@ class PositionManager:
             self._reconcile_market_results_with_exchange_positions(
                 leg_orders,
                 reduce_only=reduce_only,
+                group_id=group_id,
+                execution_mode="market",
+                status_callback=status_callback,
             )
 
-            if status_callback is not None:
-                filled_count = sum(1 for leg in leg_orders if self._remaining_leg_qty(leg) <= 1e-9)
-                status_callback({
-                    "event": "market_batch_result",
-                    "message": f"第 {batch_index} 批完成",
-                    "group_id": group_id,
-                    "execution_mode": "market",
-                    "batch_index": batch_index,
-                    "batch_qty": batch_qty,
-                    "filled_legs": filled_count,
-                    "total_legs": total_legs,
-                    "fill_ratio": self._fill_ratio(leg_orders),
-                    "legs": [self._serialize_leg_status(leg) for leg in leg_orders],
-                })
+            filled_count = sum(1 for leg in leg_orders if self._remaining_leg_qty(leg) <= 1e-9)
+            self._emit_execution_event(
+                event_type="market_batch_result",
+                message=f"第 {batch_index} 批完成",
+                group_id=group_id,
+                execution_mode="market",
+                execution_state=(
+                    "open"
+                    if filled_count == total_legs
+                    else ("partial_exposure" if filled_count > 0 else "opening")
+                ),
+                severity="warning" if 0 < filled_count < total_legs else "info",
+                batch_index=batch_index,
+                batch_qty=batch_qty,
+                filled_legs=filled_count,
+                total_legs=total_legs,
+                fill_ratio=self._fill_ratio(leg_orders),
+                legs=[self._serialize_leg_status(leg) for leg in leg_orders],
+                status_callback=status_callback,
+            )
 
             if fatal_error is not None:
                 failed_leg, exc = fatal_error
                 partial_fill_started = partial_mode or self._filled_leg_count(leg_orders) > 0
-                if status_callback is not None:
-                    status_callback({
-                        "event": "position_open_error",
-                        "message": f"批量市价单提交失败: {failed_leg.leg_role} | {exc}",
-                        "group_id": group_id,
-                        "execution_mode": "market",
-                        "failed_leg": failed_leg.leg_role,
-                        "abort_reason": getattr(failed_leg, "abort_reason", "submit_failed"),
-                        "legs": [self._serialize_leg_status(leg) for leg in leg_orders],
-                    })
+                self._emit_execution_event(
+                    event_type="position_open_error",
+                    message=f"批量市价单提交失败: {failed_leg.leg_role} | {exc}",
+                    group_id=group_id,
+                    execution_mode="market",
+                    execution_state="partial_exposure" if partial_fill_started else "error",
+                    severity="error",
+                    failed_leg=failed_leg.leg_role,
+                    abort_reason=getattr(failed_leg, "abort_reason", "submit_failed"),
+                    legs=[self._serialize_leg_status(leg) for leg in leg_orders],
+                    status_callback=status_callback,
+                )
                 if partial_fill_started and getattr(failed_leg, "abort_reason", "") != "margin_insufficient":
                     if completion_deadline is not None and _time.monotonic() < completion_deadline:
                         failed_leg.status = "PENDING"

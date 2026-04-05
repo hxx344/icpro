@@ -1654,7 +1654,7 @@ elif page == "📋 成交历史":
         )
 
         # --- Group-level PnL breakdown ---
-        st.subheader("🦅 铁鹰组合损益")
+        st.subheader("🦅 组合损益")
         closed_trades = [t for t in all_trades if not t["is_open"]]
         if closed_trades:
             group_pnl: dict[str, float] = {}
@@ -2964,6 +2964,41 @@ elif page == "🖥 引擎状态":
                     st.dataframe(pd.DataFrame(_snapshot_rows), width="stretch", hide_index=True)
                 elif strategy_status.get("last_order_exchange_positions_checked"):
                     st.success(f"复核完成：{_snapshot_underlying or cfg.strategy.underlying} 当前无真实持仓残留。")
+
+    execution_metrics = es.get("execution_metrics") or {}
+    recent_execution_events = es.get("recent_execution_events") or []
+    if execution_metrics:
+        st.subheader("🩺 执行健康")
+        _ec1, _ec2, _ec3, _ec4, _ec5, _ec6 = st.columns(6)
+        with _ec1:
+            st.metric("开仓尝试", int(execution_metrics.get("open_attempts") or 0))
+        with _ec2:
+            st.metric("成功率", f"{float(execution_metrics.get('success_rate_pct') or 0.0):.1f}%")
+        with _ec3:
+            st.metric("部分成交", int(execution_metrics.get("open_partials") or 0))
+        with _ec4:
+            st.metric("失败次数", int(execution_metrics.get("open_failures") or 0))
+        with _ec5:
+            st.metric("风险告警", int(execution_metrics.get("risk_alerts") or 0))
+        with _ec6:
+            st.metric("平均完成时长", f"{float(execution_metrics.get('avg_open_duration_sec') or 0.0):.1f}s")
+
+    if recent_execution_events:
+        st.markdown("##### 最近执行事件")
+        event_rows = [
+            {
+                "时间": str(item.get("timestamp") or ""),
+                "事件": str(item.get("event_type") or ""),
+                "状态": str(item.get("execution_state") or ""),
+                "级别": str(item.get("severity") or ""),
+                "组合ID": str(item.get("group_id") or ""),
+                "标的": str(item.get("underlying") or ""),
+                "模式": str(item.get("execution_mode") or ""),
+                "消息": str(item.get("message") or ""),
+            }
+            for item in recent_execution_events
+        ]
+        st.dataframe(pd.DataFrame(event_rows), width="stretch", hide_index=True)
 
     st.divider()
 

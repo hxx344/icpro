@@ -274,6 +274,36 @@ class TestOpenIronCondor:
         quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
         assert quantities == [0.4, 0.4]
 
+    def test_market_open_records_execution_events(self, pos_mgr, mock_client):
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 1.0, "entryPrice": 0.05},
+            ],
+        ]
+
+        condor = pos_mgr.open_short_strangle(
+            sell_call_symbol="BTC-260321-100000-C",
+            sell_put_symbol="BTC-260321-80000-P",
+            sell_call_strike=100000,
+            sell_put_strike=80000,
+            quantity=1.0,
+            underlying_price=90000.0,
+            execution_mode="market",
+        )
+
+        assert condor is not None
+        events = pos_mgr.storage.get_execution_events(limit=20)
+        event_types = {event["event_type"] for event in events}
+        assert "position_open_start" in event_types
+        assert "market_batch_submit" in event_types
+        assert "market_batch_result" in event_types
+        assert "position_open_success" in event_types
+
     def test_market_batch_relaxes_spread_to_10_after_first_timeout(self, pos_mgr, mock_client):
         leg = LegOrder(
             leg_role="sell_call",

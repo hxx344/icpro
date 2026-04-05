@@ -94,6 +94,24 @@ class TestTradingEngine:
         assert s["running"] is False
         assert s["state"] == TradingEngine.STATE_STOPPED
         assert s["uptime_sec"] == 0
+        assert s["execution_metrics"] == {}
+        assert s["recent_execution_events"] == []
+
+    def test_status_includes_execution_metrics(self, sim_config):
+        engine = TradingEngine(sim_config)
+        storage_mock = MagicMock(spec=Storage)
+        storage_mock.get_execution_metrics.return_value = {
+            "open_attempts": 3,
+            "success_rate_pct": 66.7,
+        }
+        storage_mock.get_execution_events.return_value = [
+            {"event_type": "position_open_success", "group_id": "IC_TEST"}
+        ]
+        engine.storage = storage_mock
+
+        s = engine.status()
+        assert s["execution_metrics"]["open_attempts"] == 3
+        assert s["recent_execution_events"][0]["event_type"] == "position_open_success"
 
     def test_start_stop(self, sim_config, tmp_path):
         """引擎启动后应在后台运行，stop 后退出."""
