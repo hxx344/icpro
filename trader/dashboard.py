@@ -24,7 +24,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 # ---------------------------------------------------------------------------
 # OS-aware Streamlit server config (injected before Streamlit reads config)
@@ -2912,6 +2912,58 @@ elif page == "🖥 引擎状态":
             for item in recent_execution_events
         ]
         st.dataframe(pd.DataFrame(event_rows), width="stretch", hide_index=True)
+
+    risk_lock_active = bool(
+        strategy_status.get("execution_risk_lock_active")
+        or storage.load_state("wv_execution_risk_lock_active", False)
+    )
+    if risk_lock_active:
+        risk_lock_since = str(
+            strategy_status.get("execution_risk_lock_since")
+            or storage.load_state("wv_execution_risk_lock_since", "")
+            or ""
+        )
+        risk_lock_reason = str(
+            strategy_status.get("execution_risk_lock_reason")
+            or storage.load_state("wv_execution_risk_lock_reason", "")
+            or "执行风控锁已触发"
+        )
+        risk_lock_event = str(
+            strategy_status.get("execution_risk_lock_event")
+            or storage.load_state("wv_execution_risk_lock_event", "")
+            or ""
+        )
+        st.warning(
+            f"执行风控锁已生效：{risk_lock_reason}"
+            + (f" | 触发时间: {risk_lock_since}" if risk_lock_since else "")
+            + (f" | 来源事件: {risk_lock_event}" if risk_lock_event else "")
+        )
+        if st.button(
+            "🧯 清除执行风控锁",
+            use_container_width=True,
+            disabled=not is_trade_mode,
+            help="仅在确认当前无残留仓位、无未处理执行风险后再清除。",
+        ):
+            _clear_lock = getattr(getattr(engine, "strategy", None), "clear_execution_risk_lock", None)
+            if callable(_clear_lock):
+                typed_clear_lock = cast(Callable[[], None], _clear_lock)
+                typed_clear_lock()
+            else:
+                storage.save_state("wv_execution_risk_lock_active", False)
+                storage.save_state("wv_execution_risk_lock_since", "")
+                storage.save_state("wv_execution_risk_lock_reason", "")
+                storage.save_state("wv_execution_risk_lock_group_id", "")
+                storage.save_state("wv_execution_risk_lock_event", "")
+                storage.record_execution_event(
+                    event_type="execution_risk_lock_cleared",
+                    execution_state="idle",
+                    severity="info",
+                    underlying=cfg.strategy.underlying.upper(),
+                    execution_mode="market",
+                    message="人工清除执行风控锁（引擎未运行）",
+                )
+            st.success("执行风控锁已清除")
+            _rerun_preserve_nav_page("🖥 引擎状态")
 
     st.divider()
 

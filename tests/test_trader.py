@@ -1127,6 +1127,41 @@ class TestWeekendVolStrategy:
         strategy._last_trade_week = now.strftime("%G-W%V")
         assert strategy._should_enter(now) is False
 
+    def test_should_enter_blocked_by_execution_risk_lock(self, storage):
+        client = MockClient()
+        pm = PositionManager(client, storage)
+        cfg = StrategyConfig(
+            mode="weekend_vol",
+            entry_day="friday",
+            entry_time_utc="16:00",
+            max_positions=1,
+        )
+
+        strategy = WeekendVolStrategy(client, pm, storage, cfg)
+        strategy._set_execution_risk_lock("部分成交待人工核查", event_type="position_open_partial", group_id="IC_LOCK")
+
+        now = datetime(2026, 3, 27, 16, 30, 0, tzinfo=timezone.utc)
+        assert strategy._should_enter(now) is False
+        assert strategy.status()["execution_risk_lock_active"] is True
+
+    def test_clear_execution_risk_lock(self, storage):
+        client = MockClient()
+        pm = PositionManager(client, storage)
+        cfg = StrategyConfig(
+            mode="weekend_vol",
+            entry_day="friday",
+            entry_time_utc="16:00",
+        )
+
+        strategy = WeekendVolStrategy(client, pm, storage, cfg)
+        strategy._set_execution_risk_lock("失败后残留仓位", event_type="position_open_failed")
+        strategy.clear_execution_risk_lock()
+
+        now = datetime(2026, 3, 27, 16, 30, 0, tzinfo=timezone.utc)
+        assert strategy._should_enter(now) is True
+        assert strategy.status()["execution_risk_lock_active"] is False
+        assert storage.load_state("wv_execution_risk_lock_active", True) is False
+
     def test_next_sunday_0800_from_friday(self):
         # Friday 16:00 → next Sunday 08:00
         friday = datetime(2026, 3, 27, 16, 0, 0, tzinfo=timezone.utc)

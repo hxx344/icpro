@@ -653,6 +653,11 @@ class WeekendVolStrategy:
         self._last_order_exchange_positions_error: str = ""
         self._last_guard_exchange_positions: list[dict[str, Any]] = []
         self._last_guard_exchange_positions_error: str = ""
+        self._execution_risk_lock_active: bool = bool(self.storage.load_state("wv_execution_risk_lock_active", False))
+        self._execution_risk_lock_since: str = str(self.storage.load_state("wv_execution_risk_lock_since", "") or "")
+        self._execution_risk_lock_reason: str = str(self.storage.load_state("wv_execution_risk_lock_reason", "") or "")
+        self._execution_risk_lock_group_id: str = str(self.storage.load_state("wv_execution_risk_lock_group_id", "") or "")
+        self._execution_risk_lock_event: str = str(self.storage.load_state("wv_execution_risk_lock_event", "") or "")
         recovery = self.pos_mgr.sync_exchange_positions_to_local(self.cfg.underlying, replace_on_conflict=True)
         if recovery.get("restored"):
             week_id = datetime.now(timezone.utc).strftime("%G-W%V")
@@ -663,6 +668,64 @@ class WeekendVolStrategy:
             logger.warning(
                 f"[WeekendVol] Recovered exchange positions into local storage on startup: {recovery.get('symbols') or []}"
             )
+        if self._execution_risk_lock_active:
+            logger.warning(
+                f"[WeekendVol] Execution risk lock active since {self._execution_risk_lock_since or '-'}: "
+                f"{self._execution_risk_lock_reason or 'unknown'}"
+            )
+
+    def _set_execution_risk_lock(
+        self,
+        reason: str,
+        event_type: str,
+        group_id: str = "",
+    ) -> None:
+        reason_text = str(reason or "执行风控锁已触发")
+        since = datetime.now(timezone.utc).isoformat()
+        self._execution_risk_lock_active = True
+        self._execution_risk_lock_since = since
+        self._execution_risk_lock_reason = reason_text
+        self._execution_risk_lock_group_id = str(group_id or "")
+        self._execution_risk_lock_event = str(event_type or "")
+        self.storage.save_state("wv_execution_risk_lock_active", True)
+        self.storage.save_state("wv_execution_risk_lock_since", since)
+        self.storage.save_state("wv_execution_risk_lock_reason", reason_text)
+        self.storage.save_state("wv_execution_risk_lock_group_id", self._execution_risk_lock_group_id)
+        self.storage.save_state("wv_execution_risk_lock_event", self._execution_risk_lock_event)
+        self.storage.record_execution_event(
+            event_type="execution_risk_lock_set",
+            execution_state="risk_locked",
+            severity="error",
+            group_id=self._execution_risk_lock_group_id,
+            underlying=self.cfg.underlying.upper(),
+            execution_mode="market",
+            message=reason_text,
+            meta={"source_event": self._execution_risk_lock_event},
+        )
+        logger.error(f"[WeekendVol] Execution risk lock set: {reason_text}")
+
+    def clear_execution_risk_lock(self) -> None:
+        previous_reason = self._execution_risk_lock_reason or "manual_clear"
+        self._execution_risk_lock_active = False
+        self._execution_risk_lock_since = ""
+        self._execution_risk_lock_reason = ""
+        self._execution_risk_lock_group_id = ""
+        self._execution_risk_lock_event = ""
+        self.storage.save_state("wv_execution_risk_lock_active", False)
+        self.storage.save_state("wv_execution_risk_lock_since", "")
+        self.storage.save_state("wv_execution_risk_lock_reason", "")
+        self.storage.save_state("wv_execution_risk_lock_group_id", "")
+        self.storage.save_state("wv_execution_risk_lock_event", "")
+        self.storage.record_execution_event(
+            event_type="execution_risk_lock_cleared",
+            execution_state="idle",
+            severity="info",
+            underlying=self.cfg.underlying.upper(),
+            execution_mode="market",
+            message="人工清除执行风控锁",
+            meta={"previous_reason": previous_reason},
+        )
+        logger.warning("[WeekendVol] Execution risk lock cleared manually")
 
     def _get_exchange_position_guard_snapshot(self) -> tuple[list[dict[str, Any]], str]:
         try:
@@ -739,6 +802,13 @@ class WeekendVolStrategy:
             return False
         if exchange_error:
             logger.error(f"[WeekendVol] Position check failed: {exchange_error} – skipping")
+            return False
+
+        if self._execution_risk_lock_active:
+            logger.error(
+                f"[WeekendVol] Execution risk lock active since {self._execution_risk_lock_since or '-'}: "
+                f"{self._execution_risk_lock_reason or 'unknown'} – skipping"
+            )
             return False
 
         return True
@@ -981,6 +1051,7 @@ class WeekendVolStrategy:
         self._last_order_exchange_positions_underlying = ""
         self._last_order_exchange_positions = []
         self._last_order_exchange_positions_error = ""
+        self._set_execution_risk_lock(message, event_type="position_open_partial", group_id=group_id)
 
     def _record_live_order_failure(self, underlying: str, message: str, status: str) -> None:
         self._last_order_attempt_at = datetime.now(timezone.utc).isoformat()
@@ -998,12 +1069,20 @@ class WeekendVolStrategy:
                     f"[WeekendVol] Post-failure exchange position check found {len(positions)} live position(s): "
                     f"{[p.get('symbol') for p in positions]}"
                 )
+                self._set_execution_risk_lock(
+                    f"{message}；失败后交易所仍有真实持仓残留",
+                    event_type="position_open_failed",
+                )
             else:
                 logger.info(f"[WeekendVol] Post-failure exchange position check: no live {underlying.upper()} positions")
         except Exception as e:
             self._last_order_exchange_positions = []
             self._last_order_exchange_positions_error = str(e)
             logger.error(f"[WeekendVol] Post-failure exchange position check failed: {e}")
+            self._set_execution_risk_lock(
+                f"{message}；失败后交易所持仓复核异常: {e}",
+                event_type="position_open_error",
+            )
 
     def _manage_open_positions(self, now: datetime) -> None:
         if self.pos_mgr.open_position_count <= 0 or self.cfg.stop_loss_pct <= 0:
@@ -1442,6 +1521,11 @@ class WeekendVolStrategy:
             "last_order_exchange_positions_underlying": self._last_order_exchange_positions_underlying,
             "last_order_exchange_positions": self._last_order_exchange_positions,
             "last_order_exchange_positions_error": self._last_order_exchange_positions_error,
+            "execution_risk_lock_active": self._execution_risk_lock_active,
+            "execution_risk_lock_since": self._execution_risk_lock_since,
+            "execution_risk_lock_reason": self._execution_risk_lock_reason,
+            "execution_risk_lock_group_id": self._execution_risk_lock_group_id,
+            "execution_risk_lock_event": self._execution_risk_lock_event,
             "last_trade_week": self._last_trade_week,
             "open_positions": effective_open_positions,
             "local_open_positions": local_open_positions,
