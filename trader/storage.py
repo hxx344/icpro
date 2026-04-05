@@ -1,12 +1,11 @@
 """SQLite persistent storage – 持久化存储.
 
 Tables:
-  - trades:          每笔成交记录
-  - positions:       当前持仓快照
+    - trades:            每笔成交记录
   - equity_snapshots: 资产曲线（定期快照）
-  - daily_pnl:       每日损益汇总
-  - strategy_state:  策略状态（跨重启恢复）
-    - execution_events: 执行事件日志（下单/补腿/回滚/对账）
+    - daily_pnl:         每日损益汇总
+    - strategy_state:    策略状态（跨重启恢复）
+    - execution_events:  执行事件日志（下单/补腿/回滚/对账）
 """
 
 from __future__ import annotations
@@ -259,7 +258,7 @@ class Storage:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (ts, trade_group, symbol, side, quantity, price, fee,
                   order_id, json.dumps(meta or {})))
-            return cur.lastrowid
+            return int(cur.lastrowid or 0)
 
     def close_trade(
         self,

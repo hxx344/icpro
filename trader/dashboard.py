@@ -8,7 +8,7 @@ Streamlit 前端，用于:
 - 手动操作 (平仓、暂停)
 
 Usage:
-    streamlit run trader/dashboard.py -- --config configs/trader_iron_condor_0dte.yaml
+    streamlit run trader/dashboard.py -- --config configs/trader/weekend_vol_btc.yaml
 """
 
 from __future__ import annotations

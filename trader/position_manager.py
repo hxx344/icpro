@@ -1,7 +1,6 @@
 """Position manager – 仓位管理.
 
-Tracks open multi-leg option positions, maps exchange positions to
-local trade records, and provides aggregated risk views.
+负责多腿期权仓位的开平、批量执行、交易所持仓恢复与本地账本同步。
 """
 
 from __future__ import annotations

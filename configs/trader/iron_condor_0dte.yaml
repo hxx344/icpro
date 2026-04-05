@@ -34,7 +34,7 @@ monitor:
   equity_snapshot_interval_sec: 300
 chaser:
   window_seconds: 1800          # 30分钟追单窗口
-  poll_interval_sec: 60         # 每10秒检查/调价
+  poll_interval_sec: 60         # 每60秒检查/调价
   tick_size_usdt: 5.0           # Binance 期权价格最小跳动 (USD)
   market_fallback_sec: 60       # 最后60秒切市价单
   max_amend_attempts: 180       # 最大改单次数

@@ -1,37 +1,38 @@
 # IC Pro
 
-加密货币期权回测 + 自动交易系统。基于 Binance European Options API（USD 保证金）。
+加密货币期权回测与实盘交易系统，当前实盘部分基于 Binance European Options（USD 保证金）。
+
+## 交易程序概览
+
+- 默认实盘配置：`configs/trader/weekend_vol_btc.yaml`
+- 支持策略：`weekend_vol`、`iron_condor`、`strangle`
+- Dashboard 页面：总览、资产曲线、成交历史、策略配置、引擎状态
+- 当前已接入执行事件日志、执行健康指标与“执行风控锁”
 
 ## 快速开始
 
 ### 1. 安装
 
 ```bash
-# 克隆项目
 git clone https://github.com/hxx344/icpro.git
 cd icpro
 
-# 创建虚拟环境
-python3 -m venv .venv
+python -m venv .venv
 
 # Windows
 .venv\Scripts\activate
 # Linux/macOS
 source .venv/bin/activate
 
-# 安装依赖
 pip install -U pip setuptools wheel
 pip install -U -e ".[dev,trader]"
 ```
 
-> **Streamlit 版本要求**：当前 Dashboard 使用了 `st.fragment`，因此需要 `streamlit>=1.37`。如果你是在旧虚拟环境里升级项目，安装完成后可用 `python -m pip show streamlit` 确认版本。
->
-> 如果在执行 `pip install -U pip setuptools wheel` 时看到类似 `streamlit 1.28.2 requires packaging<24` 的报错，不是这一步失败，而是**旧版 Streamlit 还没升级前**的临时依赖冲突提示。继续执行下一步项目安装即可；若升级后仍残留旧版，可再手动执行 `pip install -U "streamlit>=1.37,<2.0"`。
+> Dashboard 使用了 `st.fragment`，请确保 `streamlit>=1.37`。
 
 ### 2. 配置 API 密钥
 
 ```bash
-# 设置环境变量
 # Windows PowerShell
 $env:BINANCE_API_KEY = "your_key"
 $env:BINANCE_API_SECRET = "your_secret"
@@ -41,113 +42,63 @@ export BINANCE_API_KEY="your_key"
 export BINANCE_API_SECRET="your_secret"
 ```
 
-也可以在 `.env` 文件中配置：
+也可以写入 `.env`。
+
+### 3. 启动
 
 ```bash
-cp .env.example .env
-# 编辑 .env 填写 BINANCE_API_KEY / BINANCE_API_SECRET
-```
-
-### 3. 启动交易
-
-```bash
-# 推荐：Dashboard + 引擎（Streamlit Web UI）
+# Dashboard + 后台引擎
 streamlit run trader/dashboard.py -- --config configs/trader/weekend_vol_btc.yaml
 
-# 仅后端引擎（无 UI）
+# 仅命令行引擎
 python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 ```
 
-> **注意**：默认配置 `simulate_private: true`，引擎只模拟下单不实际成交，适合调试。正式交易前改为 `false`，并确认 `testnet: false`。
+> 当前示例实盘配置 `configs/trader/weekend_vol_btc.yaml` 使用 `simulate_private: false`、`testnet: false`。如需先做私有接口模拟，请手动改为 `simulate_private: true`。
 
-### Ubuntu VPS 命令清单（从 0 到启动）
+## 推荐实盘策略
 
-```bash
-# 1) 基础依赖
-sudo apt update && sudo apt install -y python3 python3-pip python3-venv git
+### Weekend Vol BTC（推荐）
 
-# 2) 克隆项目
-git clone https://github.com/hxx344/icpro.git
-cd icpro
+当前推荐配置是 BTC 周末波动率卖方策略，默认是**裸双卖**而不是铁鹰：
 
-# 3) 创建并激活虚拟环境
-python3 -m venv .venv
-source .venv/bin/activate
+- `mode: weekend_vol`
+- `underlying: BTC`
+- `target_delta: 0.45`
+- `wing_delta: 0.0`（即无保护翼，short strangle）
+- `entry_day: friday`
+- `entry_time_utc: 18:00`
+- `check_interval_sec: 5`
+- `stop_loss_pct: 200`
+- `stop_loss_underlying_move_pct: 5`
 
-# 4) 安装项目依赖
-pip install -U pip setuptools wheel
-pip install -U -e ".[trader]"
+对应配置文件：`configs/trader/weekend_vol_btc.yaml`
 
-# 5) 配置 API 密钥
-export BINANCE_API_KEY="your_key"
-export BINANCE_API_SECRET="your_secret"
+### 其他配置
 
-# 6) 启动 Dashboard + 引擎
-streamlit run trader/dashboard.py -- --config configs/trader/weekend_vol_btc.yaml
+| 配置文件 | 说明 |
+|---|---|
+| `configs/trader/weekend_vol_btc.yaml` | Weekend Vol BTC Short Strangle |
+| `configs/trader/iron_condor_0dte.yaml` | ETH 0DTE Iron Condor |
+| `configs/trader/short_strangle_7dte.yaml` | ETH 7DTE Short Strangle |
 
-# 7) 或使用 systemd 服务（参考 deploy/setup.sh）
-sudo bash deploy/setup.sh
-```
+## 当前实盘特性
 
-> 如果 VPS 里是之前遗留的旧环境，执行完安装后请确认 `streamlit` 版本不低于 `1.37`，否则 `Dashboard` 中使用的 `st.fragment` 无法运行。
+- 优先使用交易所返回的 `delta / mark_iv`
+- 支持同步分批市价执行，也保留可选限价追单能力
+- 开仓前检查交易所真实持仓，避免与手动单冲突
+- 启动时可从交易所持仓恢复到本地账本
+- 恢复仓位可按默认费率估算手续费并回填
+- 已接入执行事件日志、执行健康指标、执行风控锁
 
-## 交易策略
-
-### Weekend Vol（推荐）
-
-周末波动率卖权策略 — 周五开仓 Iron Condor，周日到期结算。基于回测优化参数：
-
-| 参数 | 值 | 说明 |
-|------|----|------|
-| target_delta | 0.40 | Call/Put 卖方 delta |
-| wing_delta | 0.05 | 翼保护 delta |
-| leverage | 3.0 | 杠杆倍数 |
-| entry_day | friday | 开仓日（UTC） |
-| entry_time_utc | 16:00 | 开仓时间 |
-| settlement | Sunday 08:00 UTC | 最优结算日 |
-
-回测表现（BTC, 3x, Sunday）：APR 113%, MaxDD 18.7%, Sharpe 3.10, Win Rate 81.7%
+## 常用 CLI
 
 ```bash
 python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
-```
-
-### 其他策略配置
-
-| 配置文件 | 策略 |
-|----------|------|
-| `configs/trader/weekend_vol_btc.yaml` | Weekend Vol BTC Iron Condor（推荐） |
-| `configs/trader/iron_condor_0dte.yaml` | 0DTE Iron Condor |
-| `configs/trader/short_strangle_7dte.yaml` | 7DTE Short Strangle |
-
-## 核心特性
-
-- **交易所 Delta**：优先使用 Binance API 返回的 Greeks（delta / markIV），Black-76 仅作 fallback
-- **限价追单引擎**：窗口内自适应漂移限价单，二次曲线从最优价渐移至市价，兜底市价成交
-- **交易所持仓检查**：开仓前查询 Binance 实际持仓，防止与手动单冲突
-- **仓位恢复**：引擎重启自动从 SQLite 恢复未平仓位
-- **Streamlit Dashboard**：一键启动/停止，实时查看持仓、权益曲线、成交记录
-- **USD 保证金**：Binance 欧式期权 USDT 保证金模式
-
-## CLI 命令
-
-```bash
-# 启动交易引擎
-python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
-
-# 查看当前持仓
 python -m trader.main status -c configs/trader/weekend_vol_btc.yaml
-
-# 查看成交记录
 python -m trader.main trades -c configs/trader/weekend_vol_btc.yaml
-
-# 查看权益快照
 python -m trader.main equity -c configs/trader/weekend_vol_btc.yaml
-
-# 查看统计
 python -m trader.main stats -c configs/trader/weekend_vol_btc.yaml
-
-# 平掉所有仓位
 python -m trader.main close-all -c configs/trader/weekend_vol_btc.yaml
 ```
 

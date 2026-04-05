@@ -1,7 +1,7 @@
-"""Trading Engine – 后台交易引擎线程包装.
+"""Trading Engine – 后台交易引擎.
 
-将 TraderApp 包装为可在后台线程运行的引擎, 供 Dashboard 或其他调用方使用.
-支持 start / stop / 状态查询, 线程安全.
+在后台线程中运行实盘策略循环，供 Dashboard 或其他调用方使用。
+支持 start / stop / 状态查询，线程安全。
 """
 
 from __future__ import annotations
