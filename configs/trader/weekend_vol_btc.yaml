@@ -65,7 +65,7 @@ storage:
   log_retention: 30 days
 
 monitor:
-  check_interval_sec: 60       # 每 60 秒检查一次
+  check_interval_sec: 5        # 每 5 秒检查一次
   heartbeat_interval_sec: 300  # 每 5 分钟心跳
   equity_snapshot_interval_sec: 1800  # 每 30 分钟快照 (周末交易时间短)
 

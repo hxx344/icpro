@@ -11,7 +11,7 @@ import time as _time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from loguru import logger
 
@@ -113,9 +113,10 @@ class PositionManager:
 
     MARKET_BATCH_MAX_QTY = 1.0
     MARKET_BATCH_MAX_SPREAD_USD = 5.0
+    MARKET_BATCH_SECONDARY_MAX_SPREAD_USD = 10.0
     MARKET_BATCH_RELAXED_MAX_SPREAD_USD = 15.0
     MARKET_BATCH_DEPTH_BUFFER_MULT = 1.5
-    MARKET_BATCH_WAIT_SEC = 30.0
+    MARKET_BATCH_STAGE_WAIT_SEC = 300.0
     MARKET_BATCH_POLL_SEC = 0.5
     MARKET_PARTIAL_RETRY_WINDOW_SEC = 600.0
 
@@ -227,7 +228,8 @@ class PositionManager:
             return {"restored": False, "reason": "client_has_no_get_positions"}
 
         underlying_norm = str(underlying or "").upper()
-        positions = list(get_positions(underlying_norm) or [])
+        raw_positions = get_positions(underlying_norm)
+        positions = raw_positions if isinstance(raw_positions, list) else []
         exchange_symbols = {
             str(pos.get("symbol") or "").upper()
             for pos in positions
@@ -366,7 +368,8 @@ class PositionManager:
         extractor = getattr(self.client, "_extract_api_error", None)
         if callable(extractor):
             try:
-                code, msg = extractor(exc)
+                typed_extractor = cast(Callable[[Exception], tuple[int | None, str | None]], extractor)
+                code, msg = typed_extractor(exc)
                 return code, msg
             except Exception:
                 pass
@@ -496,6 +499,8 @@ class PositionManager:
         status = str(result.status or "").upper()
         if remaining <= 1e-9:
             leg.status = "FILLED"
+        elif status in {"FAILED", "ERROR", "REJECTED", "EXPIRED", "CANCELED", "CANCELLED"} and filled_qty > 0:
+            leg.status = "PARTIALLY_FILLED"
         elif status in {"PARTIALLY_FILLED", "NEW", "PENDING"}:
             leg.status = status
         elif status in {"FAILED", "ERROR", "REJECTED", "EXPIRED", "CANCELED", "CANCELLED"}:
@@ -563,38 +568,57 @@ class PositionManager:
             return _blockers, _snapshots
 
         required_depth = batch_qty * self.MARKET_BATCH_DEPTH_BUFFER_MULT
-        initial_max_spread = float(max_spread_usd or self.MARKET_BATCH_MAX_SPREAD_USD)
-        relaxed_max_spread = None if max_spread_usd is not None else float(self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD)
-        deadline = _time.monotonic() + float(wait_sec or self.MARKET_BATCH_WAIT_SEC)
+        stage_wait_sec = float(wait_sec or self.MARKET_BATCH_STAGE_WAIT_SEC)
+        if max_spread_usd is not None:
+            spread_stages: list[tuple[float, float | None]] = [
+                (float(max_spread_usd), stage_wait_sec),
+            ]
+        else:
+            spread_stages = [
+                (float(self.MARKET_BATCH_MAX_SPREAD_USD), stage_wait_sec),
+                (float(self.MARKET_BATCH_SECONDARY_MAX_SPREAD_USD), stage_wait_sec),
+                (float(self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD), None),
+            ]
+        stage_index = 0
+        current_max_spread, current_wait_sec = spread_stages[stage_index]
+        deadline = (
+            _time.monotonic() + current_wait_sec
+            if current_wait_sec is not None
+            else None
+        )
         poll_idx = 0
 
         while True:
             poll_idx += 1
-            blockers, snapshots = _collect_blockers(initial_max_spread)
+            blockers, snapshots = _collect_blockers(current_max_spread)
 
             if not blockers:
                 return snapshots
 
             now = _time.monotonic()
-            if now >= deadline:
-                if relaxed_max_spread is not None:
-                    relaxed_blockers, relaxed_snapshots = _collect_blockers(relaxed_max_spread)
-                else:
-                    relaxed_blockers, relaxed_snapshots = blockers, snapshots
-                if relaxed_max_spread is not None and not relaxed_blockers:
+            if deadline is not None and now >= deadline:
+                if stage_index + 1 < len(spread_stages):
+                    prev_max_spread = current_max_spread
+                    stage_index += 1
+                    current_max_spread, current_wait_sec = spread_stages[stage_index]
+                    deadline = (
+                        now + current_wait_sec
+                        if current_wait_sec is not None
+                        else None
+                    )
                     logger.warning(
-                        f"Market batch {group_id} timed out at spread<={initial_max_spread:.2f}; "
-                        f"relaxing to spread<={relaxed_max_spread:.2f} for batch_qty={batch_qty:.4f}"
+                        f"Market batch {group_id} timed out at spread<={prev_max_spread:.2f}; "
+                        f"relaxing to spread<={current_max_spread:.2f} for batch_qty={batch_qty:.4f}"
                     )
                     if status_callback is not None:
                         status_callback({
                             "event": "market_batch_spread_relaxed",
-                            "message": f"等待超时，放宽最大价差到 {relaxed_max_spread:.0f} USD：批次={batch_qty:.4f}",
+                            "message": f"等待超时，放宽最大价差到 {current_max_spread:.0f} USD：批次={batch_qty:.4f}",
                             "group_id": group_id,
                             "execution_mode": "market",
                             "batch_qty": batch_qty,
                             "required_depth": required_depth,
-                            "max_spread_usd": relaxed_max_spread,
+                            "max_spread_usd": current_max_spread,
                             "legs": [
                                 {
                                     "leg_role": leg.leg_role,
@@ -609,7 +633,7 @@ class PositionManager:
                                 for leg in legs
                             ],
                         })
-                    return relaxed_snapshots
+                    continue
                 if status_callback is not None:
                     status_callback({
                         "event": "market_batch_timeout",
@@ -618,7 +642,7 @@ class PositionManager:
                         "execution_mode": "market",
                         "batch_qty": batch_qty,
                         "required_depth": required_depth,
-                        "max_spread_usd": initial_max_spread,
+                        "max_spread_usd": current_max_spread,
                         "blockers": blockers,
                         "legs": [
                             {
@@ -644,7 +668,7 @@ class PositionManager:
                     "execution_mode": "market",
                     "batch_qty": batch_qty,
                     "required_depth": required_depth,
-                    "max_spread_usd": initial_max_spread,
+                    "max_spread_usd": current_max_spread,
                     "poll_index": poll_idx,
                     "blockers": blockers,
                     "legs": [

@@ -39,7 +39,14 @@ from trader.storage import Storage
 # ======================================================================
 
 
-def _make_order_result(side="SELL", avg_price=0.05, fee=0.001, quantity=1.0, symbol="ETH-260321-2700-C") -> OrderResult:
+def _make_order_result(
+    side="SELL",
+    avg_price=0.05,
+    fee=0.001,
+    quantity=1.0,
+    symbol="ETH-260321-2700-C",
+    status="FILLED",
+) -> OrderResult:
     return OrderResult(
         order_id="ORD_001",
         symbol=symbol,
@@ -47,7 +54,7 @@ def _make_order_result(side="SELL", avg_price=0.05, fee=0.001, quantity=1.0, sym
         quantity=quantity,
         price=avg_price,
         avg_price=avg_price,
-        status="FILLED",
+        status=status,
         fee=fee,
         raw={},
     )
@@ -267,7 +274,7 @@ class TestOpenIronCondor:
         quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
         assert quantities == [0.4, 0.4]
 
-    def test_market_batch_relaxes_spread_to_15_after_timeout(self, pos_mgr, mock_client):
+    def test_market_batch_relaxes_spread_to_10_after_first_timeout(self, pos_mgr, mock_client):
         leg = LegOrder(
             leg_role="sell_call",
             symbol="BTC-260321-100000-C",
@@ -281,7 +288,7 @@ class TestOpenIronCondor:
             "asks": [(110.0, 1.0)],
         }
 
-        with patch("trader.position_manager._time.monotonic", side_effect=[0.0, 31.0]):
+        with patch("trader.position_manager._time.monotonic", side_effect=[0.0, 301.0]):
             snapshots = pos_mgr._wait_until_market_batch_ready(
                 group_id="TEST_RELAX",
                 legs=[leg],
@@ -403,6 +410,103 @@ class TestOpenIronCondor:
         assert len(condor.legs) == 2
         assert mock_client.cancel_order.call_count >= 1
         assert [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list] == [0.6, 0.6, 0.6]
+
+    def test_market_open_retries_after_ioc_partial_expired(self, pos_mgr, mock_client):
+        mock_client.submit_order.side_effect = [
+            _make_order_result(side="SELL", quantity=0.4, symbol="BTC-260321-80000-P", status="EXPIRED"),
+            _make_order_result(side="SELL", quantity=0.6, symbol="BTC-260321-100000-C"),
+            _make_order_result(side="SELL", quantity=0.2, symbol="BTC-260321-80000-P"),
+        ]
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 0.6, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 0.6, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.4, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 0.6, "entryPrice": 0.05},
+            ],
+            [
+                {"symbol": "BTC-260321-80000-P", "side": "SHORT", "quantity": 0.6, "entryPrice": 0.05},
+                {"symbol": "BTC-260321-100000-C", "side": "SHORT", "quantity": 0.6, "entryPrice": 0.05},
+            ],
+        ]
+
+        condor = pos_mgr.open_short_strangle(
+            sell_call_symbol="BTC-260321-100000-C",
+            sell_put_symbol="BTC-260321-80000-P",
+            sell_call_strike=100000,
+            sell_put_strike=80000,
+            quantity=0.6,
+            underlying_price=90000.0,
+            execution_mode="market",
+        )
+
+        assert condor is not None
+        assert len(condor.legs) == 2
+        quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
+        assert quantities == pytest.approx([0.6, 0.6, 0.2])
+        assert mock_client.cancel_order.call_count >= 1
+
+    def test_merge_leg_fill_treats_expired_with_partial_qty_as_partially_filled(self, pos_mgr):
+        leg = LegOrder(
+            leg_role="sell_put",
+            symbol="BTC-260321-80000-P",
+            side="SELL",
+            quantity=1.0,
+            strike=80000.0,
+            option_type="put",
+        )
+
+        pos_mgr._merge_leg_fill(
+            leg,
+            OrderResult(
+                order_id="ORD_IOC_1",
+                symbol=leg.symbol,
+                side="SELL",
+                quantity=0.4,
+                price=0.05,
+                avg_price=0.05,
+                status="EXPIRED",
+                fee=0.0,
+                raw={"executedQty": "0.4", "status": "EXPIRED"},
+            ),
+        )
+
+        assert leg.filled_qty == pytest.approx(0.4)
+        assert leg.status == "PARTIALLY_FILLED"
+
+    def test_merge_leg_fill_treats_cancelled_with_partial_qty_as_partially_filled(self, pos_mgr):
+        leg = LegOrder(
+            leg_role="sell_call",
+            symbol="BTC-260321-100000-C",
+            side="SELL",
+            quantity=1.0,
+            strike=100000.0,
+            option_type="call",
+        )
+
+        pos_mgr._merge_leg_fill(
+            leg,
+            OrderResult(
+                order_id="ORD_IOC_2",
+                symbol=leg.symbol,
+                side="SELL",
+                quantity=0.3,
+                price=0.04,
+                avg_price=0.04,
+                status="CANCELLED",
+                fee=0.0,
+                raw={"executedQty": "0.3", "status": "CANCELLED"},
+            ),
+        )
+
+        assert leg.filled_qty == pytest.approx(0.3)
+        assert leg.status == "PARTIALLY_FILLED"
 
     def test_failed_leg_triggers_rollback(self, pos_mgr, mock_client):
         """某腿挂单失败时应回滚已成交的腿."""
