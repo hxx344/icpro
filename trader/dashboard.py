@@ -1104,16 +1104,7 @@ if page == "📊 总览":
                 )
                 if payoff_fig is not None:
                     st.plotly_chart(payoff_fig, width='stretch')
-    elif not exchange_positions:
-        st.info("当前无持仓")
-    # If no local trades but exchange has positions, skip the "无持仓" message
-    # since exchange positions section below will show them
-
-    st.subheader("🏦 交易所实时持仓")
-    if not has_creds:
-        st.caption("未配置 API Key/Secret，跳过交易所私有持仓查询")
     elif exchange_positions:
-        # Compute total entry value and total unrealized PnL
         _total_ex_upnl = sum(float(p.get("unrealizedPnl") or 0) for p in exchange_positions)
         ex_rows = []
         for p in exchange_positions:
@@ -1128,8 +1119,10 @@ if page == "📊 总览":
             )
         st.dataframe(pd.DataFrame(ex_rows), width='stretch', hide_index=True)
         st.caption(f"合计未实现盈亏: **${_total_ex_upnl:,.4f}**  |  持仓数: **{len(exchange_positions)}**")
+    elif not has_creds:
+        st.caption("未配置 API Key/Secret，无法查询交易所私有持仓。")
     else:
-        st.caption("交易所当前无持仓")
+        st.info("当前无持仓")
 
     st.divider()
 
@@ -1151,6 +1144,8 @@ if page == "📊 总览":
                 "组": t["trade_group"][:20],
             })
         st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    elif exchange_positions:
+        st.info("暂无本地成交记录；当前持仓来自交易所实时持仓。")
     else:
         st.info("暂无成交记录")
 
