@@ -3,7 +3,7 @@
 Streamlit 前端，用于:
 - 实时查看策略状态和持仓
 - 资产曲线图表
-- 损益记录与统计
+- 交易统计与历史
 - 成交历史查询
 - 手动操作 (平仓、暂停)
 
@@ -55,7 +55,6 @@ else:
     _set_default("STREAMLIT_SERVER_PORT", "8501")
 
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
@@ -881,9 +880,12 @@ if st.sidebar.button("🔄 立即刷新", use_container_width=True):
 # Navigation
 # --------------------------------------------------------------------------
 
+if st.session_state.get("nav_page") == "💰 损益记录":
+    st.session_state["nav_page"] = "📊 总览"
+
 page = st.sidebar.radio(
     "导航",
-    ["📊 总览", "📈 资产曲线", "💰 损益记录", "📋 成交历史", "🔧 策略配置", "🖥 引擎状态"],
+    ["📊 总览", "📈 资产曲线", "📋 成交历史", "🔧 策略配置", "🖥 引擎状态"],
     key="nav_page",
 )
 
@@ -930,8 +932,6 @@ if page == "📊 总览":
     # --- DB stored data (historical) ---
     stats = storage.get_trade_stats()
     equity_curve = storage.get_equity_curve(start_date, end_date)
-    daily_pnl = storage.get_daily_pnl(start_date, end_date)
-
     # Compute derived stats
     total_pnl = stats["total_pnl"]
     total_fees = stats["total_fees"]
@@ -1471,96 +1471,6 @@ elif page == "📈 资产曲线":
 
 
 # ==========================================================================
-# PAGE: 损益记录 (PnL Records)
-# ==========================================================================
-
-elif page == "💰 损益记录":
-    st.title("💰 每日损益记录")
-
-    daily_pnl = storage.get_daily_pnl(start_date, end_date)
-
-    if not daily_pnl:
-        st.info("暂无每日损益数据。")
-    else:
-        df = pd.DataFrame(daily_pnl)
-        df["date"] = pd.to_datetime(df["date"])
-        df["daily_return"] = (df["ending_equity"] - df["starting_equity"])
-        df["daily_return_pct"] = df.apply(
-            lambda r: (r["ending_equity"] - r["starting_equity"]) / r["starting_equity"] * 100
-            if r["starting_equity"] > 0 else 0,
-            axis=1,
-        )
-        df["cumulative_pnl"] = df["realized_pnl"].cumsum()
-
-        # KPIs
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            total_rpnl = df["realized_pnl"].sum()
-            st.metric("累计已实现 PnL", f"${total_rpnl:,.2f}")
-        with col2:
-            total_fees = df["total_fees"].sum()
-            st.metric("累计手续费", f"${total_fees:,.2f}")
-        with col3:
-            profitable = (df["daily_return"] > 0).sum()
-            total_days = len(df)
-            st.metric("盈利天数", f"{profitable} / {total_days}")
-        with col4:
-            avg_daily = df["daily_return_pct"].mean()
-            st.metric("日均收益率", f"{avg_daily:.3f}%")
-
-        st.divider()
-
-        # --- Daily PnL bar chart ---
-        st.subheader("📊 每日收益")
-        fig_pnl = go.Figure()
-
-        colors = ["#00C49A" if v >= 0 else "#FF6B6B" for v in df["daily_return"]]
-        fig_pnl.add_trace(go.Bar(
-            x=df["date"], y=df["daily_return"],
-            name="日收益 (USD)",
-            marker_color=colors,
-        ))
-
-        fig_pnl.update_layout(
-            height=350, margin=dict(l=50, r=20, t=10, b=20),
-            yaxis_title="USD",
-        )
-        st.plotly_chart(fig_pnl, width='stretch')
-
-        # --- Cumulative PnL chart ---
-        st.subheader("📈 累计已实现 PnL")
-        fig_cum = px.area(df, x="date", y="cumulative_pnl",
-                          color_discrete_sequence=["#8884d8"])
-        fig_cum.update_layout(height=250, margin=dict(l=50, r=20, t=10, b=20),
-                              yaxis_title="USD")
-        st.plotly_chart(fig_cum, width='stretch')
-
-        # --- Daily return distribution ---
-        st.subheader("📊 日收益率分布")
-        fig_hist = px.histogram(df, x="daily_return_pct", nbins=30,
-                                color_discrete_sequence=["#00C49A"],
-                                labels={"daily_return_pct": "日收益率 (%)"})
-        fig_hist.update_layout(height=250, margin=dict(l=50, r=20, t=10, b=20))
-        st.plotly_chart(fig_hist, width='stretch')
-
-        # --- Daily PnL table ---
-        st.subheader("📋 每日明细")
-        df_display = pd.DataFrame(df[["date", "starting_equity", "ending_equity",
-                  "realized_pnl", "unrealized_pnl", "total_fees",
-                  "trade_count", "daily_return_pct"]].copy())
-        df_display.columns = ["日期", "日初权益", "日末权益", "已实现PnL",
-                               "未实现PnL", "手续费", "交易笔数", "日收益率%"]
-        df_display["日期"] = df_display["日期"].dt.strftime("%Y-%m-%d")
-
-        # Format numbers
-        for col in ["日初权益", "日末权益", "已实现PnL", "未实现PnL", "手续费"]:
-            df_display[col] = df_display[col].map(lambda x: f"${x:,.2f}")
-        df_display["日收益率%"] = df_display["日收益率%"].map(lambda x: f"{x:.3f}%")
-
-        st.dataframe(df_display, width="stretch", hide_index=True)
-
-
-# ==========================================================================
 # PAGE: 成交历史 (Trade History)
 # ==========================================================================
 
@@ -1796,11 +1706,14 @@ elif page == "🔧 策略配置":
             with r_col1:
                 ed_testnet = st.checkbox("测试网模式", value=_exchange.get("testnet", True), help="开启后使用模拟账户，不真实下单")
                 ed_timeout = st.number_input("API 超时 (秒)", min_value=3, max_value=60, value=_exchange.get("timeout", 10), step=1)
-                ed_check_interval = st.number_input("策略循环间隔 (秒)", min_value=10, max_value=600, value=_monitor.get("check_interval_sec", 60), step=10)
-                ed_heartbeat = st.number_input("心跳间隔 (秒)", min_value=60, max_value=3600, value=_monitor.get("heartbeat_interval_sec", 300), step=60)
+                _check_interval_value = max(1, int(_monitor.get("check_interval_sec", 60) or 60))
+                _heartbeat_value = max(60, int(_monitor.get("heartbeat_interval_sec", 300) or 300))
+                ed_check_interval = st.number_input("策略循环间隔 (秒)", min_value=1, max_value=600, value=_check_interval_value, step=1)
+                ed_heartbeat = st.number_input("心跳间隔 (秒)", min_value=60, max_value=3600, value=_heartbeat_value, step=60)
 
             with r_col2:
-                ed_snapshot = st.number_input("资产快照间隔 (秒)", min_value=300, max_value=86400, value=_monitor.get("equity_snapshot_interval_sec", 3600), step=300)
+                _snapshot_value = max(300, int(_monitor.get("equity_snapshot_interval_sec", 3600) or 3600))
+                ed_snapshot = st.number_input("资产快照间隔 (秒)", min_value=300, max_value=86400, value=_snapshot_value, step=300)
                 ed_db_path = st.text_input("数据库路径", value=_storage.get("db_path", "./data/trader.db"))
                 ed_log_dir = st.text_input("日志目录", value=_storage.get("log_dir", "./logs"))
                 ed_log_level = st.selectbox("日志级别", ["DEBUG", "INFO", "WARNING", "ERROR"], index=["DEBUG", "INFO", "WARNING", "ERROR"].index(_storage.get("log_level", "INFO")))
