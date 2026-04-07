@@ -63,6 +63,15 @@ def test_simulated_account_returns_stub(default_config):
     assert account.raw["simulated"] is True
 
 
+def test_simulated_public_market_calls_do_not_hit_network(default_config):
+    client = BybitOptionsClient(default_config)
+    client.session.get = MagicMock(side_effect=AssertionError("network should not be called"))
+
+    assert client.get_spot_price("BTC") == pytest.approx(0.0)
+    assert client.get_hourly_index_prices("BTC", limit=24) == []
+    assert client.get_tickers("BTC") == []
+
+
 def test_simulated_order_book_uses_ticker(default_config):
     client = BybitOptionsClient(default_config)
     client.get_ticker = MagicMock(
@@ -111,3 +120,18 @@ def test_query_order_not_found_raises():
     with patch.object(client, "_private_get", return_value={"result": {"list": []}}):
         with pytest.raises(OrderNotFoundError):
             client.query_order("ETH-21MAR26-2000-C", client_order_id="CID-1")
+
+
+def test_private_get_signature_uses_request_param_order():
+    client = BybitOptionsClient(ExchangeConfig(api_key="key", api_secret="secret", simulate_private=False))
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"retCode": 0, "result": {"list": []}}
+
+    with patch("trader.bybit_client.time.time", return_value=1700000000.123), patch.object(client, "_sign", wraps=client._sign) as sign_mock:
+        client.session.get = MagicMock(return_value=response)
+        client._private_get("/v5/position/list", {"category": "option", "baseCoin": "BTC", "cursor": None})
+
+    sign_mock.assert_called_once_with("category=option&baseCoin=BTC", 1700000000123)
+    client.session.get.assert_called_once()
+    assert client.session.get.call_args.kwargs["params"] == {"category": "option", "baseCoin": "BTC"}

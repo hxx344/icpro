@@ -285,10 +285,11 @@ class BybitOptionsClient:
                 headers: dict[str, str] = {}
                 request_kwargs: dict[str, Any] = {"timeout": self.cfg.timeout}
                 payload = ""
+                filtered_params = {k: v for k, v in params.items() if v is not None}
                 if private:
                     timestamp_ms = int(time.time() * 1000)
                     if method.upper() == "GET":
-                        payload = urlencode(sorted((k, v) for k, v in params.items() if v is not None))
+                        payload = urlencode(list(filtered_params.items()))
                     else:
                         payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
                     headers.update(
@@ -302,7 +303,7 @@ class BybitOptionsClient:
                     )
 
                 if method.upper() == "GET":
-                    request_kwargs["params"] = params
+                    request_kwargs["params"] = filtered_params
                     resp = self.session.get(url, headers=headers, **request_kwargs)
                 elif method.upper() == "POST":
                     request_kwargs["data"] = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
@@ -386,6 +387,8 @@ class BybitOptionsClient:
         )
 
     def get_spot_price(self, underlying: str = "BTC") -> float:
+        if self.cfg.simulate_private:
+            return 0.0
         try:
             data = self._public_get(
                 "/v5/market/tickers",
@@ -400,6 +403,8 @@ class BybitOptionsClient:
         return float(item.get("lastPrice") or item.get("markPrice") or item.get("indexPrice") or 0.0)
 
     def get_hourly_index_prices(self, underlying: str = "BTC", limit: int = 25) -> list[tuple[datetime, float]]:
+        if self.cfg.simulate_private:
+            return []
         limit = max(int(limit), 3)
         try:
             data = self._public_get(
@@ -456,6 +461,8 @@ class BybitOptionsClient:
         return math.sqrt(var) * math.sqrt(24.0 * 365.25)
 
     def get_tickers(self, underlying: str = "BTC") -> list[OptionTicker]:
+        if self.cfg.simulate_private:
+            return []
         try:
             result = self._public_get(
                 "/v5/market/tickers",
