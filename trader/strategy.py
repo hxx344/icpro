@@ -3,8 +3,8 @@
 当前实盘交易端仅保留 `WeekendVolStrategy`：
 - 每周指定时间入场，持有至周日 08:00 UTC 结算
 - Delta 选短腿，可按 `wing_delta` 决定是否带保护翼
-- 支持 USD 保证金复利、篮子止损、执行风控锁
-- 适用于 Binance BTC/ETH
+- 支持 Bybit UTA 保证金估算、篮子止损、执行风控锁
+- 适用于 Bybit BTC/ETH
 """
 
 from __future__ import annotations
@@ -15,31 +15,45 @@ from typing import Any
 
 from loguru import logger
 
-from trader.binance_client import BinanceOptionsClient, OptionTicker, _parse_symbol
-from trader.config import StrategyConfig
+from trader.bybit_client import BybitOptionsClient, OptionTicker, _parse_symbol
+from trader.config import ExchangeConfig, StrategyConfig
 from trader.position_manager import PositionManager
 from trader.storage import Storage
 
 
-BINANCE_OPTION_DEFAULT_CONTRACT_UNIT = 1.0
-BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE = 0.0003
+BYBIT_OPTION_DEFAULT_CONTRACT_UNIT = 1.0
+BYBIT_OPTION_DEFAULT_TAKER_FEE_RATE = 0.0003
+BYBIT_OPTION_DEFAULT_FEE_CAP_RATIO = 0.07
+BYBIT_OPTION_DEFAULT_SHORT_MARGIN_RATIO = 0.10
+BYBIT_OPTION_DEFAULT_SHORT_OTM_DEDUCTION_RATIO = 0.08
+BYBIT_OPTION_DEFAULT_SHORT_MIN_MARGIN_RATIO = 0.05
 
 
-def _binance_option_otm_amount(index_price: float, strike: float, option_type: str) -> float:
+def _resolve_exchange_param(exchange_cfg: ExchangeConfig | None, field_name: str, default: float) -> float:
+    if exchange_cfg is None:
+        return default
+    try:
+        return float(getattr(exchange_cfg, field_name, default) or default)
+    except Exception:
+        return default
+
+
+def _bybit_option_otm_amount(index_price: float, strike: float, option_type: str) -> float:
     option_type_norm = str(option_type or "").lower()
     if option_type_norm == "call":
         return max(float(strike or 0.0) - float(index_price or 0.0), 0.0)
     return max(float(index_price or 0.0) - float(strike or 0.0), 0.0)
 
 
-def estimate_binance_option_fee(
+def estimate_bybit_option_fee(
     index_price: float,
     order_price: float,
-    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
-    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+    contract_unit: float = BYBIT_OPTION_DEFAULT_CONTRACT_UNIT,
+    transaction_fee_rate: float = BYBIT_OPTION_DEFAULT_TAKER_FEE_RATE,
+    fee_cap_ratio: float = BYBIT_OPTION_DEFAULT_FEE_CAP_RATIO,
 ) -> float:
     index_component = max(float(index_price or 0.0), 0.0) * max(float(contract_unit or 0.0), 0.0) * max(float(transaction_fee_rate or 0.0), 0.0)
-    order_component = 0.10 * max(float(order_price or 0.0), 0.0)
+    order_component = max(float(fee_cap_ratio or 0.0), 0.0) * max(float(order_price or 0.0), 0.0)
     if index_component <= 0:
         return order_component
     if order_component <= 0:
@@ -47,52 +61,65 @@ def estimate_binance_option_fee(
     return min(index_component, order_component)
 
 
-def estimate_binance_short_open_margin_per_unit(
+def estimate_bybit_short_open_margin_per_unit(
     index_price: float,
     strike: float,
     option_type: str,
     mark_price: float,
     order_price: float,
-    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
-    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+    contract_unit: float = BYBIT_OPTION_DEFAULT_CONTRACT_UNIT,
+    transaction_fee_rate: float = BYBIT_OPTION_DEFAULT_TAKER_FEE_RATE,
+    fee_cap_ratio: float = BYBIT_OPTION_DEFAULT_FEE_CAP_RATIO,
+    short_margin_ratio: float = BYBIT_OPTION_DEFAULT_SHORT_MARGIN_RATIO,
+    short_otm_deduction_ratio: float = BYBIT_OPTION_DEFAULT_SHORT_OTM_DEDUCTION_RATIO,
+    short_min_margin_ratio: float = BYBIT_OPTION_DEFAULT_SHORT_MIN_MARGIN_RATIO,
 ) -> float:
     index_price = max(float(index_price or 0.0), 0.0)
     contract_unit = max(float(contract_unit or 0.0), 0.0)
     mark_price = max(float(mark_price or 0.0), 0.0)
     order_price = max(float(order_price or 0.0), 0.0)
-    otm_amount = _binance_option_otm_amount(index_price, strike, option_type)
-    base_margin = max(0.10 * index_price, 0.15 * index_price - otm_amount) * contract_unit
-    fee = estimate_binance_option_fee(index_price, order_price, contract_unit, transaction_fee_rate)
+    otm_amount = _bybit_option_otm_amount(index_price, strike, option_type)
+    base_margin = max(
+        short_min_margin_ratio * index_price,
+        short_margin_ratio * index_price - short_otm_deduction_ratio * otm_amount,
+    ) * contract_unit
+    fee = estimate_bybit_option_fee(index_price, order_price, contract_unit, transaction_fee_rate, fee_cap_ratio)
     return max(0.0, base_margin + mark_price - order_price) + fee
 
 
-def estimate_binance_long_open_margin_per_unit(
+def estimate_bybit_long_open_margin_per_unit(
     index_price: float,
     order_price: float,
-    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
-    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+    contract_unit: float = BYBIT_OPTION_DEFAULT_CONTRACT_UNIT,
+    transaction_fee_rate: float = BYBIT_OPTION_DEFAULT_TAKER_FEE_RATE,
+    fee_cap_ratio: float = BYBIT_OPTION_DEFAULT_FEE_CAP_RATIO,
 ) -> float:
     order_price = max(float(order_price or 0.0), 0.0)
-    fee = estimate_binance_option_fee(index_price, order_price, contract_unit, transaction_fee_rate)
+    fee = estimate_bybit_option_fee(index_price, order_price, contract_unit, transaction_fee_rate, fee_cap_ratio)
     return order_price + fee
 
 
-def estimate_binance_combo_open_margin_per_unit(
+def estimate_bybit_combo_open_margin_per_unit(
     index_price: float,
     sell_call: OptionTicker | None = None,
     sell_put: OptionTicker | None = None,
     buy_call: OptionTicker | None = None,
     buy_put: OptionTicker | None = None,
-    contract_unit: float = BINANCE_OPTION_DEFAULT_CONTRACT_UNIT,
-    transaction_fee_rate: float = BINANCE_OPTION_DEFAULT_TRANSACTION_FEE_RATE,
+    exchange_cfg: ExchangeConfig | None = None,
+    contract_unit: float = BYBIT_OPTION_DEFAULT_CONTRACT_UNIT,
 ) -> float:
+    transaction_fee_rate = _resolve_exchange_param(exchange_cfg, "option_taker_fee_rate", BYBIT_OPTION_DEFAULT_TAKER_FEE_RATE)
+    fee_cap_ratio = _resolve_exchange_param(exchange_cfg, "option_fee_cap_ratio", BYBIT_OPTION_DEFAULT_FEE_CAP_RATIO)
+    short_margin_ratio = _resolve_exchange_param(exchange_cfg, "short_option_margin_ratio", BYBIT_OPTION_DEFAULT_SHORT_MARGIN_RATIO)
+    short_otm_deduction_ratio = _resolve_exchange_param(exchange_cfg, "short_option_otm_deduction_ratio", BYBIT_OPTION_DEFAULT_SHORT_OTM_DEDUCTION_RATIO)
+    short_min_margin_ratio = _resolve_exchange_param(exchange_cfg, "short_option_min_margin_ratio", BYBIT_OPTION_DEFAULT_SHORT_MIN_MARGIN_RATIO)
     total = 0.0
     for short_leg in (sell_call, sell_put):
         if short_leg is None:
             continue
         mark_price = float(short_leg.mark_price or short_leg.bid_price or short_leg.ask_price or 0.0)
         order_price = float(short_leg.bid_price or short_leg.mark_price or 0.0)
-        total += estimate_binance_short_open_margin_per_unit(
+        total += estimate_bybit_short_open_margin_per_unit(
             index_price=index_price,
             strike=float(short_leg.strike or 0.0),
             option_type=str(short_leg.option_type or ""),
@@ -100,17 +127,22 @@ def estimate_binance_combo_open_margin_per_unit(
             order_price=order_price,
             contract_unit=contract_unit,
             transaction_fee_rate=transaction_fee_rate,
+            fee_cap_ratio=fee_cap_ratio,
+            short_margin_ratio=short_margin_ratio,
+            short_otm_deduction_ratio=short_otm_deduction_ratio,
+            short_min_margin_ratio=short_min_margin_ratio,
         )
 
     for long_leg in (buy_call, buy_put):
         if long_leg is None:
             continue
         order_price = float(long_leg.ask_price or long_leg.mark_price or 0.0)
-        total += estimate_binance_long_open_margin_per_unit(
+        total += estimate_bybit_long_open_margin_per_unit(
             index_price=index_price,
             order_price=order_price,
             contract_unit=contract_unit,
             transaction_fee_rate=transaction_fee_rate,
+            fee_cap_ratio=fee_cap_ratio,
         )
     return total
 
@@ -120,7 +152,7 @@ def estimate_binance_combo_open_margin_per_unit(
 # ======================================================================
 
 class WeekendVolStrategy:
-    """Weekend volatility selling strategy on Binance.
+    """Weekend volatility selling strategy on Bybit.
 
     Strategy logic (mirrors backtest_weekend_vol.py):
     ─────────────────────────────────────────────────
@@ -131,8 +163,8 @@ class WeekendVolStrategy:
        d. Select short put:  closest strike to |delta| = target_delta
          e. Select wing call: closest strike to |delta| = wing_delta (optional protection)
          f. Select wing put: closest strike to |delta| = wing_delta (optional protection)
-       g. Compute quantity:  (balance × leverage) / spot, compounding
-                 h. Execute weekend-vol position via PositionManager
+    g. Use fixed quantity from config
+    h. Execute weekend-vol position via PositionManager
 
      2. During holding period:
          a. Monitor basket PnL using option mark prices
@@ -144,11 +176,11 @@ class WeekendVolStrategy:
     - target_delta : 0.40 (|δ| for short legs)
     - wing_delta   : 0.05 (|δ| for protection legs, 0 → strangle)
     - max_delta_diff : 0.20 (actual |δ| vs target |δ| max deviation)
-    - leverage     : 3.0
+    - leverage     : 1.0 (仅用于预览展示)
     - entry_day    : "friday"
     - entry_time_utc : "18:00"
     - underlying   : "BTC"
-    - compound     : True
+    - quantity     : fixed option size
     """
 
     DAY_MAP = {
@@ -158,7 +190,7 @@ class WeekendVolStrategy:
 
     def __init__(
         self,
-        client: BinanceOptionsClient,
+        client: BybitOptionsClient,
         position_mgr: PositionManager,
         storage: Storage,
         config: StrategyConfig,
@@ -485,7 +517,6 @@ class WeekendVolStrategy:
                     buy_put_strike=buy_put.strike,
                     quantity=quantity,
                     underlying_price=spot,
-                    execution_mode="market",
                 )
             except Exception as e:
                 self._record_live_order_failure(
@@ -511,7 +542,6 @@ class WeekendVolStrategy:
                     sell_put_strike=sell_put.strike,
                     quantity=quantity,
                     underlying_price=spot,
-                    execution_mode="market",
                 )
             except Exception as e:
                 self._record_live_order_failure(
@@ -657,7 +687,6 @@ class WeekendVolStrategy:
             )
             self.pos_mgr.close_all(
                 reason=f"weekend_vol_stop_loss_{self.cfg.stop_loss_pct:.0f}",
-                execution_mode="market",
             )
 
     def _get_entry_realized_vol(self, underlying: str) -> float | None:
@@ -852,7 +881,7 @@ class WeekendVolStrategy:
         return best
 
     # ------------------------------------------------------------------
-    # Quantity computation (3x leverage, compounding)
+    # Quantity computation (fixed size)
     # ------------------------------------------------------------------
 
     def _compute_quantity(
@@ -863,54 +892,10 @@ class WeekendVolStrategy:
         buy_call: OptionTicker | None = None,
         buy_put: OptionTicker | None = None,
     ) -> float:
-        """Compute position size with leverage + compounding.
-
-        USD margin mode:
-          qty_asset = (account_equity_usd × leverage) / spot
-          Rounded down to 0.1 underlying increments.
-        """
-        base_qty = 0.0
-        ul = self.cfg.underlying.upper()
-
-        if self.cfg.compound:
-            try:
-                account = self.client.get_account()
-                equity = account.total_balance
-                available_balance = max(float(getattr(account, "available_balance", 0.0) or 0.0), 0.0)
-                if equity > 0 and spot > 0:
-                    raw_qty = (equity * self.cfg.leverage) / spot
-                    qty = raw_qty
-                    margin_per_unit = estimate_binance_combo_open_margin_per_unit(
-                        index_price=spot,
-                        sell_call=sell_call,
-                        sell_put=sell_put,
-                        buy_call=buy_call,
-                        buy_put=buy_put,
-                    )
-                    if margin_per_unit > 0:
-                        budget = available_balance if available_balance > 0 else equity
-                        qty_by_margin = math.floor(budget / margin_per_unit * 10) / 10
-                        qty = min(qty, qty_by_margin)
-                    else:
-                        qty_by_margin = 0.0
-
-                    # Round down to 0.1 underlying units
-                    qty = math.floor(qty * 10) / 10
-                    base_qty = max(qty, 0.0)
-                    logger.info(
-                        f"[WeekendVol] qty: equity={equity:.2f} USD, "
-                        f"available_balance={available_balance:.2f} USD, "
-                        f"leverage={self.cfg.leverage}x, spot={spot:.2f}, "
-                        f"raw={raw_qty:.4f}, "
-                        f"margin_per_unit={margin_per_unit:.2f}, "
-                        f"qty_by_margin={qty_by_margin:.4f}, "
-                        f"final={base_qty:.1f} {ul}"
-                    )
-            except Exception as e:
-                logger.warning(f"[WeekendVol] Could not compute compound qty: {e}")
-        else:
-            base_qty = self.cfg.quantity
-
+        """Compute position size in fixed-size mode."""
+        del spot, sell_call, sell_put, buy_call, buy_put
+        base_qty = max(float(self.cfg.quantity or 0.0), 0.0)
+        logger.info(f"[WeekendVol] fixed quantity mode: final={base_qty:.4f} {self.cfg.underlying.upper()}")
         return base_qty
 
     # ------------------------------------------------------------------
@@ -920,7 +905,7 @@ class WeekendVolStrategy:
     def _check_settlement(self, now: datetime) -> None:
         """Check if any open position has expired and record settlement.
 
-        Binance auto-settles expired options. We detect expiry from the
+        Bybit auto-settles expired options. We detect expiry from the
         symbol and mark the position as closed.
         """
         for gid in list(self.pos_mgr.open_positions.keys()):

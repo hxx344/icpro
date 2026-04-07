@@ -136,7 +136,7 @@ class PositionManager:
         Coin margin (Deribit):
           Call intrinsic = max(0, S − K) / S
           Put  intrinsic = max(0, K − S) / S
-        USD margin (Binance):
+        USD margin mode:
           Call intrinsic = max(0, S − K)
           Put  intrinsic = max(0, K − S)
 

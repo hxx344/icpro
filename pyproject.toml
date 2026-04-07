@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "options-backtest"
 version = "0.1.0"
-description = "Binance options strategy backtesting & auto-trading system"
+description = "Bybit options strategy backtesting & auto-trading system"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

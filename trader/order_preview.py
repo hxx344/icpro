@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
-from trader.binance_client import OptionTicker
-from trader.strategy import estimate_binance_combo_open_margin_per_unit
+from trader.bybit_client import OptionTicker
+from trader.strategy import estimate_bybit_combo_open_margin_per_unit
 
 
 def compute_option_order_preview(
@@ -17,6 +16,7 @@ def compute_option_order_preview(
     equity: float = 0.0,
     available_balance: float = 0.0,
     leverage: float = 1.0,
+    exchange_cfg: Any | None = None,
     sell_call: OptionTicker,
     sell_put: OptionTicker,
     buy_call: OptionTicker | None = None,
@@ -25,27 +25,20 @@ def compute_option_order_preview(
     """Compute weekend_vol preview quantity, premium and margin metrics."""
     is_iron_condor = buy_call is not None and buy_put is not None
     quantity = float(base_quantity or 0.0)
-    equity_source = "配置基础数量"
+    equity_source = "固定数量配置"
     equity = max(float(equity or 0.0), 0.0)
     available_balance = max(float(available_balance or 0.0), 0.0)
     spot = max(float(spot or 0.0), 0.0)
 
-    margin_per_unit = estimate_binance_combo_open_margin_per_unit(
+    margin_per_unit = estimate_bybit_combo_open_margin_per_unit(
         index_price=spot,
         sell_call=sell_call,
         sell_put=sell_put,
         buy_call=buy_call,
         buy_put=buy_put,
+        exchange_cfg=exchange_cfg,
     )
-
-    if compound and equity > 0 and spot > 0:
-        raw_qty = (equity * float(leverage or 0.0)) / spot
-        quantity = math.floor(raw_qty * 10) / 10
-        if margin_per_unit > 0:
-            budget = available_balance if available_balance > 0 else equity
-            qty_by_margin = math.floor(budget / margin_per_unit * 10) / 10
-            quantity = min(quantity, qty_by_margin)
-        equity_source = f"实时权益(复利 {float(leverage or 0.0):.0f}x)"
+    del compound, leverage
 
     sc_bid = float(sell_call.bid_price or 0.0)
     sp_bid = float(sell_put.bid_price or 0.0)

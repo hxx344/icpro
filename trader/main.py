@@ -23,7 +23,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from trader.binance_client import BinanceOptionsClient
+from trader.bybit_client import BybitOptionsClient
 from trader.config import TraderConfig, load_config
 from trader.equity import EquityTracker
 from trader.position_manager import PositionManager
@@ -104,9 +104,9 @@ class TraderApp:
 
         self.storage = Storage(config.storage.db_path)
 
-        self.client = BinanceOptionsClient(config.exchange)
+        self.client = BybitOptionsClient(config.exchange)
         logger.info(
-            f"Binance client: {'TESTNET' if config.exchange.testnet else 'PRODUCTION'} "
+            f"Bybit client: {'TESTNET' if config.exchange.testnet else 'PRODUCTION'} "
             f"base={config.exchange.base_url}"
         )
 
@@ -126,7 +126,7 @@ class TraderApp:
             underlying=config.strategy.underlying,
         )
 
-        logger.info("Strategy: weekend_vol | Exchange: Binance")
+        logger.info("Strategy: weekend_vol | Exchange: Bybit")
         logger.info("All modules initialized")
 
     # ------------------------------------------------------------------
@@ -389,7 +389,7 @@ def cmd_close_all(args) -> None:
 
     app = TraderApp(cfg)
     logger.warning("CLOSING ALL POSITIONS")
-    pnl = app.pos_mgr.close_all(reason="manual_close_all", execution_mode="market")
+    pnl = app.pos_mgr.close_all(reason="manual_close_all")
     logger.info(f"All positions closed. Total PnL: {pnl:.4f}")
     app.storage.close()
 

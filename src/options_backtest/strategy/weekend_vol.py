@@ -63,11 +63,14 @@ class WeekendVolStrategy(BaseStrategy):
         self.max_positions: int = int(self.params.get("max_positions", 1))
         self.compound: bool = bool(self.params.get("compound", True))
         self.max_delta_diff: float = float(self.params.get("max_delta_diff", 0.15))
+        self.max_delta_diff_lower: float = float(self.params.get("max_delta_diff_lower", self.max_delta_diff))
+        self.max_delta_diff_upper: float = float(self.params.get("max_delta_diff_upper", self.max_delta_diff))
         self.expiry_tolerance_hours: float = float(self.params.get("expiry_tolerance_hours", 12.0))
         self.take_profit_pct: float = float(self.params.get("take_profit_pct", 0.0))
         self.stop_loss_pct: float = float(self.params.get("stop_loss_pct", 0.0))
         self.max_loss_equity_pct: float = float(self.params.get("max_loss_equity_pct", 0.0))
         self.underlying_move_stop_pct: float = float(self.params.get("underlying_move_stop_pct", 0.0))
+        self.stop_loss_underlying_move_pct: float = float(self.params.get("stop_loss_underlying_move_pct", 0.0))
         self.trail_profit_activation_pct: float = float(self.params.get("trail_profit_activation_pct", 0.0))
         self.trail_profit_giveback_pct: float = float(self.params.get("trail_profit_giveback_pct", 0.0))
         self.trail_profit_close_fraction: float = float(self.params.get("trail_profit_close_fraction", 1.0))
@@ -165,6 +168,11 @@ class WeekendVolStrategy(BaseStrategy):
         self.expire_weekday = int(expire_cfg[0])
         self.expire_hour = int(expire_cfg[1])
         self.target_hold_hours = float(expire_cfg[2])
+
+        if self.underlying_move_stop_pct > 1.0:
+            self.underlying_move_stop_pct /= 100.0
+        if self.stop_loss_underlying_move_pct > 1.0:
+            self.stop_loss_underlying_move_pct /= 100.0
 
     def _normalize_iv(self, value: Any) -> float:
         try:
@@ -389,11 +397,17 @@ class WeekendVolStrategy(BaseStrategy):
             return None
 
         delta_abs = pd.to_numeric(side_df["delta"], errors="coerce").abs()
-        diff = (delta_abs - target_abs_delta).abs()
-        best_idx = diff.idxmin()
-        if not np.isfinite(diff.loc[best_idx]) or float(diff.loc[best_idx]) > self.max_delta_diff:
+        lower_bound = max(0.0, float(target_abs_delta) - max(0.0, self.max_delta_diff_lower))
+        upper_bound = float(target_abs_delta) + max(0.0, self.max_delta_diff_upper)
+        eligible = side_df.loc[(delta_abs >= lower_bound) & (delta_abs <= upper_bound)].copy()
+        if eligible.empty:
             return None
-        return side_df.loc[best_idx]
+        eligible_delta_abs = pd.to_numeric(eligible["delta"], errors="coerce").abs()
+        diff = (eligible_delta_abs - target_abs_delta).abs()
+        best_idx = diff.idxmin()
+        if not np.isfinite(diff.loc[best_idx]):
+            return None
+        return eligible.loc[best_idx]
 
     def _compute_fallback_delta(self, row: pd.Series, spot: float, now: pd.Timestamp, option_type: str) -> float:
         exp = pd.Timestamp(row["expiration_date"])
@@ -751,6 +765,10 @@ class WeekendVolStrategy(BaseStrategy):
             return True
 
         if self.stop_loss_pct > 0 and basket_pnl_pct <= -self.stop_loss_pct:
+            if self.stop_loss_underlying_move_pct > 0 and self._active_entry_spot and self._active_entry_spot > 0:
+                spot_move = abs(float(context.underlying_price) / self._active_entry_spot - 1.0)
+                if spot_move < self.stop_loss_underlying_move_pct:
+                    return False
             self.log(
                 f"Stop loss on weekend basket: {basket_pnl_pct:.1f}% <= -{self.stop_loss_pct:.1f}%"
             )

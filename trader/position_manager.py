@@ -14,11 +14,10 @@ from typing import Any, Callable, cast
 
 from loguru import logger
 
-from trader.binance_client import (
+from trader.bybit_client import (
     OrderResult,
     _parse_symbol,
 )
-from trader.limit_chaser import ChaserConfig, LegOrder, LimitChaser
 from trader.storage import Storage
 
 
@@ -97,6 +96,31 @@ CondorLeg = PositionLeg
 IronCondorPosition = OptionPosition
 
 
+@dataclass
+class LegOrder:
+    """Tracks a single leg order through execution and reconciliation."""
+    leg_role: str
+    symbol: str
+    side: str
+    quantity: float
+    strike: float
+    option_type: str
+
+    order_id: str = ""
+    client_order_id: str = ""
+    client_order_prefix: str = ""
+    current_price: float = 0.0
+    status: str = "PENDING"
+    avg_price: float = 0.0
+    fee: float = 0.0
+    filled_qty: float = 0.0
+    current_order_filled_qty: float = 0.0
+    current_order_avg_price: float = 0.0
+    current_order_fee: float = 0.0
+    attempts: int = 0
+    start_time: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Position Manager
 # ---------------------------------------------------------------------------
@@ -113,10 +137,14 @@ class PositionManager:
     - Record all trades to persistent storage
     """
 
+    EXECUTION_MODE = "market"
     MARKET_BATCH_MAX_QTY = 1.0
     MARKET_BATCH_MAX_SPREAD_USD = 5.0
     MARKET_BATCH_SECONDARY_MAX_SPREAD_USD = 10.0
     MARKET_BATCH_RELAXED_MAX_SPREAD_USD = 15.0
+    STOP_LOSS_MARKET_BATCH_MAX_SPREAD_USD = 50.0
+    STOP_LOSS_MARKET_BATCH_SECONDARY_MAX_SPREAD_USD = 100.0
+    STOP_LOSS_MARKET_BATCH_RELAXED_MAX_SPREAD_USD = 200.0
     MARKET_BATCH_DEPTH_BUFFER_MULT = 1.5
     MARKET_BATCH_STAGE_WAIT_SEC = 300.0
     MARKET_BATCH_POLL_SEC = 0.5
@@ -128,11 +156,9 @@ class PositionManager:
         self,
         client: Any,
         storage: Storage,
-        chaser_config: ChaserConfig | None = None,
     ):
         self.client = client
         self.storage = storage
-        self.chaser = LimitChaser(client, chaser_config)
         self.open_condors: dict[str, OptionPosition] = {}  # group_id -> position
         self._load_open_positions()
 
@@ -325,7 +351,7 @@ class PositionManager:
                 "group_id": group_id,
                 "recovered_from_exchange": True,
                 "fee_estimated": True,
-                "fee_rate_used": self.DEFAULT_OPTION_TRANSACTION_FEE_RATE,
+                "fee_rate_used": self._default_option_fee_rate(),
                 "exchange_side": exchange_side,
             }
             self.storage.record_trade(
@@ -360,9 +386,6 @@ class PositionManager:
         symbol: str,
         side: str,
         quantity: float,
-        order_type: str = "MARKET",
-        price: float | None = None,
-        time_in_force: str | None = None,
         reduce_only: bool = False,
         client_order_id: str | None = None,
     ) -> OrderResult:
@@ -373,9 +396,6 @@ class PositionManager:
             symbol=symbol,
             side=side,
             quantity=quantity,
-            order_type=order_type,
-            price=price,
-            time_in_force=time_in_force,
             reduce_only=reduce_only,
             client_order_id=client_order_id,
         )
@@ -392,7 +412,7 @@ class PositionManager:
 
         message = str(exc or "")
         for pattern in (
-            r"Binance error\s+(-?\d+):\s*(.*)",
+            r"Bybit error\s+(-?\d+):\s*(.*)",
             r"code\s*[=:]\s*(-?\d+)",
         ):
             match = re.search(pattern, message, re.IGNORECASE)
@@ -426,23 +446,29 @@ class PositionManager:
     def _filled_leg_orders(results: list[LegOrder]) -> list[LegOrder]:
         return [r for r in results if float(r.filled_qty or 0.0) > 1e-9]
 
+    def _default_option_fee_rate(self) -> float:
+        try:
+            return float(getattr(self.client.cfg, "option_taker_fee_rate", self.DEFAULT_OPTION_TRANSACTION_FEE_RATE) or self.DEFAULT_OPTION_TRANSACTION_FEE_RATE)
+        except Exception:
+            return self.DEFAULT_OPTION_TRANSACTION_FEE_RATE
+
     @staticmethod
     def _has_margin_insufficient_failure(results: list[LegOrder]) -> bool:
         return any(getattr(r, "abort_reason", "") == "margin_insufficient" for r in results)
 
-    @classmethod
     def _estimate_default_option_fee(
-        cls,
+        self,
         index_price: float,
         order_price: float,
         quantity: float,
     ) -> float:
+        fee_rate = self._default_option_fee_rate()
         index_component = (
             max(float(index_price or 0.0), 0.0)
-            * cls.DEFAULT_OPTION_CONTRACT_UNIT
-            * cls.DEFAULT_OPTION_TRANSACTION_FEE_RATE
+            * self.DEFAULT_OPTION_CONTRACT_UNIT
+            * fee_rate
         )
-        order_component = 0.10 * max(float(order_price or 0.0), 0.0)
+        order_component = 0.07 * max(float(order_price or 0.0), 0.0)
         per_unit_fee = min(index_component, order_component) if index_component > 0 and order_component > 0 else max(index_component, order_component)
         return max(float(quantity or 0.0), 0.0) * per_unit_fee
 
@@ -696,6 +722,7 @@ class PositionManager:
         batch_qty: float,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
         max_spread_usd: float | None = None,
+        custom_spread_stages: list[tuple[float, float | None]] | None = None,
         wait_sec: float | None = None,
     ) -> dict[str, dict[str, float | bool | str]] | None:
         def _collect_blockers(
@@ -720,7 +747,12 @@ class PositionManager:
 
         required_depth = batch_qty * self.MARKET_BATCH_DEPTH_BUFFER_MULT
         stage_wait_sec = float(wait_sec or self.MARKET_BATCH_STAGE_WAIT_SEC)
-        if max_spread_usd is not None:
+        if custom_spread_stages is not None:
+            spread_stages = [
+                (float(stage_spread), stage_timeout)
+                for stage_spread, stage_timeout in custom_spread_stages
+            ]
+        elif max_spread_usd is not None:
             spread_stages: list[tuple[float, float | None]] = [
                 (float(max_spread_usd), stage_wait_sec),
             ]
@@ -905,7 +937,6 @@ class PositionManager:
         max_polls: int = 3,
         poll_delay_sec: float = 0.25,
         group_id: str = "",
-        execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         """Reconcile order results against live exchange positions.
@@ -990,7 +1021,7 @@ class PositionManager:
                 event_type="exchange_reconcile_adjustment",
                 message="交易所持仓复核已更新批次成交结果",
                 group_id=group_id,
-                execution_mode=execution_mode,
+                execution_mode=self.EXECUTION_MODE,
                 execution_state="partial_exposure" if remaining_exists else "opening",
                 severity="warning" if remaining_exists else "info",
                 underlying=underlying,
@@ -1011,7 +1042,6 @@ class PositionManager:
         sell_put_strike: float,
         quantity: float,
         underlying_price: float,
-        execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> OptionPosition | None:
         """Open a naked short strangle (2 legs).
@@ -1020,12 +1050,9 @@ class PositionManager:
         fill, or None on failure.
         """
         group_id = f"SS_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        execution_mode_norm = str(execution_mode or "market").strip().lower()
-        if execution_mode_norm not in {"chaser", "market"}:
-            raise ValueError(f"Unsupported execution_mode: {execution_mode}")
 
         logger.info(
-            f"Opening Short Strangle {group_id} ({execution_mode_norm}): "
+            f"Opening Short Strangle {group_id} ({self.EXECUTION_MODE}): "
             f"sell_put={sell_put_strike} "
             f"sell_call={sell_call_strike} "
             f"qty={quantity} spot={underlying_price}"
@@ -1047,9 +1074,9 @@ class PositionManager:
 
         self._emit_execution_event(
             event_type="position_open_start",
-            message=f"开始提交 Short Strangle {group_id}（{execution_mode_norm}）",
+            message=f"开始提交 Short Strangle {group_id}（{self.EXECUTION_MODE}）",
             group_id=group_id,
-            execution_mode=execution_mode_norm,
+            execution_mode=self.EXECUTION_MODE,
             execution_state="opening",
             underlying=underlying,
             legs=self._serialize_open_request_legs(leg_orders),
@@ -1057,25 +1084,28 @@ class PositionManager:
             status_callback=status_callback,
         )
 
-        if execution_mode_norm == "market":
+        try:
             results = self._execute_market_legs(
                 group_id=group_id,
                 leg_orders=leg_orders,
                 quantity=quantity,
                 status_callback=status_callback,
             )
-            if results is None:
-                return None
-        else:
-            try:
-                results = self.chaser.execute_legs(
-                    leg_orders,
-                    underlying=underlying,
-                    status_callback=status_callback,
-                )
-            except Exception as e:
-                logger.error(f"Short Strangle {group_id}: execute_legs exception: {e}")
-                return None
+        except Exception as e:
+            logger.error(f"Short Strangle {group_id}: market execution exception: {e}")
+            self._emit_execution_event(
+                event_type="position_open_error",
+                message=f"市价单执行异常: {e}",
+                group_id=group_id,
+                execution_mode=self.EXECUTION_MODE,
+                execution_state="error",
+                severity="error",
+                underlying=underlying,
+                status_callback=status_callback,
+            )
+            return None
+        if results is None:
+            return None
 
         failed = [r for r in results if r.status != "FILLED"]
         if failed:
@@ -1084,7 +1114,7 @@ class PositionManager:
                 + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
             )
             rollback_due_to_margin = self._has_margin_insufficient_failure(failed)
-            if execution_mode_norm == "market" and not rollback_due_to_margin:
+            if not rollback_due_to_margin:
                 filled_results = self._filled_leg_orders(results)
                 if filled_results:
                     try:
@@ -1107,7 +1137,7 @@ class PositionManager:
                             event_type="position_open_partial",
                             message="已有成交腿保留，未再执行回滚；剩余腿未完成",
                             group_id=group_id,
-                            execution_mode=execution_mode_norm,
+                            execution_mode=self.EXECUTION_MODE,
                             execution_state="partial_exposure",
                             severity="warning",
                             underlying=underlying,
@@ -1130,7 +1160,7 @@ class PositionManager:
                 event_type="position_open_failed",
                 message=self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
                 group_id=group_id,
-                execution_mode=execution_mode_norm,
+                execution_mode=self.EXECUTION_MODE,
                 execution_state="partial_exposure" if rollback_failures else "rolled_back",
                 severity="error" if rollback_failures else "warning",
                 underlying=underlying,
@@ -1179,7 +1209,7 @@ class PositionManager:
                 event_type="position_open_error",
                 message=_msg,
                 group_id=group_id,
-                execution_mode=execution_mode_norm,
+                execution_mode=self.EXECUTION_MODE,
                 execution_state="partial_exposure" if rollback_failures else "rolled_back",
                 severity="error",
                 underlying=underlying,
@@ -1189,7 +1219,7 @@ class PositionManager:
             return None
 
         logger.info(
-            f"Short Strangle {group_id} opened via {execution_mode_norm}. "
+            f"Short Strangle {group_id} opened via {self.EXECUTION_MODE}. "
             f"Net premium: {total_premium:.4f} USD"
         )
 
@@ -1197,7 +1227,7 @@ class PositionManager:
             event_type="position_open_success",
             message=f"Short Strangle {group_id} 已全部成交",
             group_id=group_id,
-            execution_mode=execution_mode_norm,
+            execution_mode=self.EXECUTION_MODE,
             execution_state="open",
             underlying=underlying,
             net_premium=total_premium,
@@ -1223,21 +1253,13 @@ class PositionManager:
         buy_put_strike: float,
         quantity: float,
         underlying_price: float,
-        execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> OptionPosition | None:
-        """Open a full winged position.
-
-        Default `execution_mode="market"` submits each leg as a market order.
-        `execution_mode="chaser"` remains available as an optional adaptive limit chaser.
-        """
+        """Open a full winged position using native market orders."""
         group_id = f"IC_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        execution_mode_norm = str(execution_mode or "market").strip().lower()
-        if execution_mode_norm not in {"chaser", "market"}:
-            raise ValueError(f"Unsupported execution_mode: {execution_mode}")
 
         logger.info(
-            f"Opening winged position {group_id} ({execution_mode_norm}): "
+            f"Opening winged position {group_id} ({self.EXECUTION_MODE}): "
             f"sell_put={sell_put_strike} buy_put={buy_put_strike} "
             f"sell_call={sell_call_strike} buy_call={buy_call_strike} "
             f"qty={quantity} spot={underlying_price}"
@@ -1270,9 +1292,9 @@ class PositionManager:
         underlying = self._infer_underlying(sell_call_symbol or sell_put_symbol)
         self._emit_execution_event(
             event_type="position_open_start",
-            message=f"开始提交带翼组合 {group_id}（{execution_mode_norm}）",
+            message=f"开始提交带翼组合 {group_id}（{self.EXECUTION_MODE}）",
             group_id=group_id,
-            execution_mode=execution_mode_norm,
+            execution_mode=self.EXECUTION_MODE,
             execution_state="opening",
             underlying=underlying,
             legs=self._serialize_open_request_legs(leg_orders),
@@ -1280,36 +1302,28 @@ class PositionManager:
             status_callback=status_callback,
         )
 
-        if execution_mode_norm == "market":
+        try:
             results = self._execute_market_iron_condor(
                 group_id=group_id,
                 leg_orders=leg_orders,
                 quantity=quantity,
                 status_callback=status_callback,
             )
-            if results is None:
-                return None
-        else:
-            # Execute via limit chaser (blocks up to window_seconds)
-            try:
-                results = self.chaser.execute_legs(
-                    leg_orders,
-                    underlying=underlying,
-                    status_callback=status_callback,
-                )
-            except Exception as e:
-                logger.error(f"Winged position {group_id}: execute_legs exception: {e}")
-                self._emit_execution_event(
-                    event_type="position_open_error",
-                    message=f"追单异常: {e}",
-                    group_id=group_id,
-                    execution_mode=execution_mode_norm,
-                    execution_state="error",
-                    severity="error",
-                    underlying=underlying,
-                    status_callback=status_callback,
-                )
-                return None
+        except Exception as e:
+            logger.error(f"Winged position {group_id}: market execution exception: {e}")
+            self._emit_execution_event(
+                event_type="position_open_error",
+                message=f"市价单执行异常: {e}",
+                group_id=group_id,
+                execution_mode=self.EXECUTION_MODE,
+                execution_state="error",
+                severity="error",
+                underlying=underlying,
+                status_callback=status_callback,
+            )
+            return None
+        if results is None:
+            return None
 
         # Check for failures
         failed = [r for r in results if r.status != "FILLED"]
@@ -1319,7 +1333,7 @@ class PositionManager:
                 + ", ".join(f"{r.leg_role}={r.status}" for r in failed)
             )
             rollback_due_to_margin = self._has_margin_insufficient_failure(failed)
-            if execution_mode_norm == "market" and not rollback_due_to_margin:
+            if not rollback_due_to_margin:
                 filled_results = self._filled_leg_orders(results)
                 if filled_results:
                     try:
@@ -1342,7 +1356,7 @@ class PositionManager:
                             event_type="position_open_partial",
                             message="已有成交腿保留，未再执行回滚；剩余腿未完成",
                             group_id=group_id,
-                            execution_mode=execution_mode_norm,
+                            execution_mode=self.EXECUTION_MODE,
                             execution_state="partial_exposure",
                             severity="warning",
                             underlying=underlying,
@@ -1366,7 +1380,7 @@ class PositionManager:
                 event_type="position_open_failed",
                 message=self._rollback_failure_message(rollback_due_to_margin, rollback_failures),
                 group_id=group_id,
-                execution_mode=execution_mode_norm,
+                execution_mode=self.EXECUTION_MODE,
                 execution_state="partial_exposure" if rollback_failures else "rolled_back",
                 severity="error" if rollback_failures else "warning",
                 underlying=underlying,
@@ -1415,7 +1429,7 @@ class PositionManager:
                 event_type="position_open_error",
                 message=_msg,
                 group_id=group_id,
-                execution_mode=execution_mode_norm,
+                execution_mode=self.EXECUTION_MODE,
                 execution_state="partial_exposure" if rollback_failures else "rolled_back",
                 severity="error",
                 underlying=underlying,
@@ -1425,7 +1439,7 @@ class PositionManager:
             return None
 
         logger.info(
-            f"Winged position {group_id} opened via {execution_mode_norm}. "
+            f"Winged position {group_id} opened via {self.EXECUTION_MODE}. "
             f"Net premium: {total_premium:.4f} USD"
         )
 
@@ -1433,7 +1447,7 @@ class PositionManager:
             event_type="position_open_success",
             message=f"带翼组合 {group_id} 已全部成交",
             group_id=group_id,
-            execution_mode=execution_mode_norm,
+            execution_mode=self.EXECUTION_MODE,
             execution_state="open",
             underlying=underlying,
             net_premium=total_premium,
@@ -1455,7 +1469,6 @@ class PositionManager:
         buy_put_strike: float,
         quantity: float,
         underlying_price: float,
-        execution_mode: str = "market",
         status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> OptionPosition | None:
         """Neutral alias for opening a 4-leg winged position."""
@@ -1470,7 +1483,6 @@ class PositionManager:
             buy_put_strike=buy_put_strike,
             quantity=quantity,
             underlying_price=underlying_price,
-            execution_mode=execution_mode,
             status_callback=status_callback,
         )
 
@@ -1482,6 +1494,8 @@ class PositionManager:
         status_callback: Callable[[dict[str, Any]], None] | None = None,
         reduce_only: bool = False,
         client_order_tag: str = "mkt",
+        spread_stages: list[tuple[float, float | None]] | None = None,
+        relaxed_max_spread_usd: float | None = None,
     ) -> list[LegOrder] | None:
         """Submit market legs in synchronized <=1 BTC batches after spread/depth checks."""
         if not leg_orders:
@@ -1516,7 +1530,12 @@ class PositionManager:
                 legs=pending,
                 batch_qty=batch_qty,
                 status_callback=status_callback,
-                max_spread_usd=self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD if partial_mode else None,
+                max_spread_usd=(
+                    relaxed_max_spread_usd
+                    if partial_mode and relaxed_max_spread_usd is not None
+                    else (self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD if partial_mode else None)
+                ),
+                custom_spread_stages=None if partial_mode else spread_stages,
             )
             if snapshots is None:
                 if partial_mode and completion_deadline is not None and _time.monotonic() < completion_deadline:
@@ -1565,7 +1584,6 @@ class PositionManager:
                         symbol=leg.symbol,
                         side=leg.side,
                         quantity=batch_qty,
-                        order_type="MARKET",
                         reduce_only=reduce_only,
                         client_order_id=client_order_id,
                     )
@@ -1597,7 +1615,6 @@ class PositionManager:
                 leg_orders,
                 reduce_only=reduce_only,
                 group_id=group_id,
-                execution_mode="market",
                 status_callback=status_callback,
             )
 
@@ -1666,9 +1683,35 @@ class PositionManager:
         leg_orders: list[LegOrder],
         quantity: float,
         status_callback: Callable[[dict[str, Any]], None] | None = None,
+        spread_stages: list[tuple[float, float | None]] | None = None,
+        relaxed_max_spread_usd: float | None = None,
     ) -> list[LegOrder] | None:
         """Backward-compatible wrapper for iron condor market execution."""
-        return self._execute_market_legs(group_id, leg_orders, quantity, status_callback)
+        return self._execute_market_legs(
+            group_id,
+            leg_orders,
+            quantity,
+            status_callback,
+            spread_stages=spread_stages,
+            relaxed_max_spread_usd=relaxed_max_spread_usd,
+        )
+
+    @classmethod
+    def _is_stop_loss_close_reason(cls, reason: str) -> bool:
+        return str(reason or "").startswith("weekend_vol_stop_loss_")
+
+    @classmethod
+    def _spread_stages_for_close_reason(cls, reason: str) -> tuple[list[tuple[float, float | None]] | None, float | None]:
+        if not cls._is_stop_loss_close_reason(reason):
+            return None, None
+        return (
+            [
+                (cls.STOP_LOSS_MARKET_BATCH_MAX_SPREAD_USD, cls.MARKET_BATCH_STAGE_WAIT_SEC),
+                (cls.STOP_LOSS_MARKET_BATCH_SECONDARY_MAX_SPREAD_USD, cls.MARKET_BATCH_STAGE_WAIT_SEC),
+                (cls.STOP_LOSS_MARKET_BATCH_RELAXED_MAX_SPREAD_USD, None),
+            ],
+            cls.STOP_LOSS_MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
+        )
 
     def _rollback_legs(
         self,
@@ -1687,7 +1730,6 @@ class PositionManager:
                     symbol=result.symbol,
                     side=close_side,
                     quantity=result.quantity,
-                    order_type="MARKET",
                     reduce_only=True,
                 )
                 logger.info(f"Rolled back {leg_role}")
@@ -1700,7 +1742,7 @@ class PositionManager:
     # Close a grouped position
     # ------------------------------------------------------------------
 
-    def close_iron_condor(self, group_id: str, reason: str = "", execution_mode: str = "market") -> float:
+    def close_iron_condor(self, group_id: str, reason: str = "") -> float:
         """Close all legs of a grouped position.
 
         Returns total realized PnL.
@@ -1710,12 +1752,8 @@ class PositionManager:
             logger.warning(f"Position {group_id} not found or already closed")
             return 0.0
 
-        execution_mode_norm = str(execution_mode or "market").strip().lower()
-        if execution_mode_norm not in {"chaser", "market"}:
-            raise ValueError(f"Unsupported close execution_mode: {execution_mode}")
-
         logger.info(
-            f"Closing position {group_id}, reason: {reason}, mode: {execution_mode_norm}"
+            f"Closing position {group_id}, reason: {reason}, mode: {self.EXECUTION_MODE}"
         )
 
         # Build close legs
@@ -1731,21 +1769,20 @@ class PositionManager:
                 option_type=leg.option_type,
             ))
 
-        # Execute close via limit chaser or market orders
-        underlying = self._infer_underlying(condor.legs[0].symbol) if condor.legs else "ETH"
-        if execution_mode_norm == "market":
-            for close_leg in close_legs:
-                close_leg.client_order_prefix = f"{group_id}:{close_leg.leg_role}"
-            results = self._execute_market_legs(
-                group_id=group_id,
-                leg_orders=close_legs,
-                quantity=0.0,
-                status_callback=None,
-                reduce_only=True,
-                client_order_tag="mkt_close",
-            ) or close_legs
-        else:
-            results = self.chaser.execute_legs(close_legs, underlying=underlying)
+        # Execute close via native market orders
+        for close_leg in close_legs:
+            close_leg.client_order_prefix = f"{group_id}:{close_leg.leg_role}"
+        spread_stages, relaxed_max_spread_usd = self._spread_stages_for_close_reason(reason)
+        results = self._execute_market_legs(
+            group_id=group_id,
+            leg_orders=close_legs,
+            quantity=0.0,
+            status_callback=None,
+            reduce_only=True,
+            client_order_tag="mkt_close",
+            spread_stages=spread_stages,
+            relaxed_max_spread_usd=relaxed_max_spread_usd,
+        ) or close_legs
 
         total_pnl = 0.0
         for leg, close_result in zip(condor.legs, results):
@@ -1787,11 +1824,11 @@ class PositionManager:
 
         return total_pnl
 
-    def close_position(self, group_id: str, reason: str = "", execution_mode: str = "market") -> float:
+    def close_position(self, group_id: str, reason: str = "") -> float:
         """Neutral alias for closing a live grouped position."""
-        return self.close_iron_condor(group_id, reason=reason, execution_mode=execution_mode)
+        return self.close_iron_condor(group_id, reason=reason)
 
-    def close_all(self, reason: str = "close_all", execution_mode: str = "market") -> float:
+    def close_all(self, reason: str = "close_all") -> float:
         """Close all open iron condors."""
         total = 0.0
         group_ids = list(dict.fromkeys([
@@ -1800,14 +1837,14 @@ class PositionManager:
         ]))
         for gid in group_ids:
             self._ensure_group_loaded(gid)
-            total += self.close_iron_condor(gid, reason=reason, execution_mode=execution_mode)
+            total += self.close_iron_condor(gid, reason=reason)
         return total
 
     def close_all_exchange_positions(self, underlying: str = "", reason: str = "close_all_exchange") -> float:
         """Emergency close using live exchange positions only.
 
         This path ignores local tracking for order discovery and closes whatever
-        Binance currently reports as open option positions for the target underlying.
+        Bybit currently reports as open option positions for the target underlying.
         After exchange close, local storage and in-memory groups are best-effort synced.
         """
         if not getattr(self.client, "get_positions", None):

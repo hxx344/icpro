@@ -1,6 +1,6 @@
 # IC Pro
 
-加密货币期权回测与实盘交易系统，当前实盘部分基于 Binance European Options（USD 保证金）。
+加密货币期权回测与实盘交易系统，当前实盘部分基于 Bybit Options。
 
 ## 交易程序概览
 
@@ -34,12 +34,12 @@ pip install -U -e ".[dev,trader]"
 
 ```bash
 # Windows PowerShell
-$env:BINANCE_API_KEY = "your_key"
-$env:BINANCE_API_SECRET = "your_secret"
+$env:BYBIT_API_KEY = "your_key"
+$env:BYBIT_API_SECRET = "your_secret"
 
 # Linux/macOS
-export BINANCE_API_KEY="your_key"
-export BINANCE_API_SECRET="your_secret"
+export BYBIT_API_KEY="your_key"
+export BYBIT_API_SECRET="your_secret"
 ```
 
 也可以写入 `.env`。
@@ -221,15 +221,14 @@ options-bt run --config configs/backtest/iron_condor.yaml
 | Short Put | `short_put_eth_compound.yaml` |
 | Naked Call | `nc_eth_12m.yaml` |
 
-功能：复利/非复利、周末跳过、IV 条件翼跳过、Binance 费率模型。
+功能：复利/非复利、周末跳过、IV 条件翼跳过、Bybit/通用费率模型。
 
 ## 项目结构
 
 ```
 src/options_backtest/    # 回测引擎（策略、撮合、定价、分析）
 trader/                  # 自动交易系统
-  ├── binance_client/    #   Binance API 客户端 + Greeks 获取
-  ├── limit_chaser.py    #   限价追单引擎
+  ├── bybit_client/      #   Bybit API 客户端 + Greeks 获取
   ├── position_manager.py#   仓位管理
   ├── strategy.py        #   WeekendVolStrategy（支持带翼/无翼结构）
   ├── engine.py          #   交易引擎（后台线程）

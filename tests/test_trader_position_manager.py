@@ -19,16 +19,12 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from trader.binance_client import (
-    BinanceOptionsClient,
-    OrderResult,
-    AccountInfo,
-)
+from trader.bybit_client import BybitOptionsClient, OrderResult, AccountInfo
 from trader.config import ExchangeConfig
-from trader.limit_chaser import LegOrder
 from trader.position_manager import (
     CondorLeg,
     IronCondorPosition,
+    LegOrder,
     PositionManager,
 )
 from trader.storage import Storage
@@ -81,7 +77,7 @@ def _make_leg(
 
 @pytest.fixture
 def mock_client():
-    client = MagicMock(spec=BinanceOptionsClient)
+    client = MagicMock(spec=BybitOptionsClient)
     client.place_order.return_value = _make_order_result()
     client.submit_order.side_effect = lambda **kwargs: _make_order_result(
         side=kwargs.get("side", "SELL"),
@@ -187,8 +183,9 @@ class TestIronCondorPosition:
 
 class TestOpenIronCondor:
     @staticmethod
-    def _make_filled_legs(legs: list[LegOrder], **kwargs) -> list[LegOrder]:
-        """Simulate LimitChaser filling all legs."""
+    def _make_filled_legs(*args, **kwargs) -> list[LegOrder]:
+        """Simulate native market execution filling all legs."""
+        legs = kwargs["leg_orders"]
         for leg in legs:
             leg.status = "FILLED"
             leg.avg_price = 0.03
@@ -199,7 +196,7 @@ class TestOpenIronCondor:
 
     def test_successful_open(self, pos_mgr, mock_client):
         """4 腿全部 FILLED → 返回 condor."""
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=self._make_filled_legs) as exec_mock:
+        with patch.object(pos_mgr, "_execute_market_iron_condor", side_effect=self._make_filled_legs):
             condor = pos_mgr.open_iron_condor(
                 sell_call_symbol="ETH-260321-2700-C",
                 buy_call_symbol="ETH-260321-2750-C",
@@ -211,7 +208,6 @@ class TestOpenIronCondor:
                 buy_put_strike=2250,
                 quantity=1.0,
                 underlying_price=2500.0,
-                execution_mode="chaser",
             )
 
         assert condor is not None
@@ -245,7 +241,6 @@ class TestOpenIronCondor:
             sell_put_strike=80000,
             quantity=2.0,
             underlying_price=90000.0,
-            execution_mode="market",
         )
 
         assert condor is not None
@@ -266,7 +261,6 @@ class TestOpenIronCondor:
             sell_put_strike=80000,
             quantity=0.4,
             underlying_price=90000.0,
-            execution_mode="market",
         )
 
         assert condor is not None
@@ -293,7 +287,6 @@ class TestOpenIronCondor:
             sell_put_strike=80000,
             quantity=1.0,
             underlying_price=90000.0,
-            execution_mode="market",
         )
 
         assert condor is not None
@@ -377,7 +370,6 @@ class TestOpenIronCondor:
             sell_put_strike=80000,
             quantity=1.0,
             underlying_price=90000.0,
-            execution_mode="market",
         )
 
         assert condor is not None
@@ -387,7 +379,7 @@ class TestOpenIronCondor:
     def test_market_open_rolls_back_partial_fill_on_margin_insufficient(self, pos_mgr, mock_client):
         mock_client.submit_order.side_effect = [
             _make_order_result(side="SELL", quantity=0.6, symbol="BTC-260321-80000-P"),
-            RuntimeError("Binance error -2027: Option margin is insufficient."),
+            RuntimeError("Bybit error 110044: Available margin is insufficient."),
             _make_order_result(side="BUY", quantity=0.6, symbol="BTC-260321-80000-P"),
         ]
         mock_client.get_positions.side_effect = [
@@ -403,7 +395,6 @@ class TestOpenIronCondor:
             sell_put_strike=80000,
             quantity=0.6,
             underlying_price=90000.0,
-            execution_mode="market",
         )
 
         assert condor is None
@@ -413,7 +404,7 @@ class TestOpenIronCondor:
     def test_market_open_retries_remaining_leg_instead_of_rollback(self, pos_mgr, mock_client):
         mock_client.submit_order.side_effect = [
             _make_order_result(side="SELL", quantity=0.6, symbol="BTC-260321-80000-P"),
-            RuntimeError("Binance error -1007: Timeout waiting for response from backend server."),
+            RuntimeError("Bybit error 10016: Service is restarting, please retry later."),
             _make_order_result(side="SELL", quantity=0.6, symbol="BTC-260321-100000-C"),
         ]
         mock_client.get_positions.side_effect = [
@@ -433,7 +424,6 @@ class TestOpenIronCondor:
             sell_put_strike=80000,
             quantity=0.6,
             underlying_price=90000.0,
-            execution_mode="market",
         )
 
         assert condor is not None
@@ -473,7 +463,6 @@ class TestOpenIronCondor:
             sell_put_strike=80000,
             quantity=0.6,
             underlying_price=90000.0,
-            execution_mode="market",
         )
 
         assert condor is not None
@@ -538,10 +527,11 @@ class TestOpenIronCondor:
         assert leg.filled_qty == pytest.approx(0.3)
         assert leg.status == "PARTIALLY_FILLED"
 
-    def test_failed_leg_triggers_rollback(self, pos_mgr, mock_client):
-        """某腿挂单失败时应回滚已成交的腿."""
-        def _partial_fill(legs, **kwargs):
+    def test_failed_leg_keeps_partial_live_exposure(self, pos_mgr, mock_client):
+        """市价单模式下，非保证金错误的部分成交应保留已成交腿。"""
+        def _partial_fill(*args, **kwargs):
             """前 2 腿 FILLED, 第 3 腿 FAILED."""
+            legs = kwargs["leg_orders"]
             for i, leg in enumerate(legs):
                 if i < 2:
                     leg.status = "FILLED"
@@ -559,22 +549,23 @@ class TestOpenIronCondor:
             symbol=kwargs.get("symbol", "ETH-260321-2700-C"),
         )
 
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_partial_fill):
+        with patch.object(pos_mgr, "_execute_market_iron_condor", side_effect=_partial_fill):
             condor = pos_mgr.open_iron_condor(
                 sell_call_symbol="SC", buy_call_symbol="BC",
                 sell_put_symbol="SP", buy_put_symbol="BP",
                 sell_call_strike=2700, buy_call_strike=2750,
                 sell_put_strike=2300, buy_put_strike=2250,
-                quantity=1.0, underlying_price=2500.0, execution_mode="chaser",
+                quantity=1.0, underlying_price=2500.0,
             )
 
-        assert condor is None
-        # 2 filled legs should be rolled back via market orders
-        assert mock_client.submit_order.call_count == 2
+        assert condor is not None
+        assert len(condor.legs) == 2
+        assert mock_client.submit_order.call_count == 0
 
-    def test_failed_leg_rollback_uses_actual_filled_qty(self, pos_mgr, mock_client):
-        """回滚应按已成交量，而不是原始请求量。"""
-        def _partial_fill(legs, **kwargs):
+    def test_failed_leg_partial_position_uses_actual_filled_qty(self, pos_mgr, mock_client):
+        """保留的部分成交仓位应按实际成交量入库。"""
+        def _partial_fill(*args, **kwargs):
+            legs = kwargs["leg_orders"]
             for i, leg in enumerate(legs):
                 if i < 2:
                     leg.status = "FILLED"
@@ -592,22 +583,23 @@ class TestOpenIronCondor:
             symbol=kwargs.get("symbol", "ETH-260321-2700-C"),
         )
 
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_partial_fill):
+        with patch.object(pos_mgr, "_execute_market_iron_condor", side_effect=_partial_fill):
             condor = pos_mgr.open_iron_condor(
                 sell_call_symbol="SC", buy_call_symbol="BC",
                 sell_put_symbol="SP", buy_put_symbol="BP",
                 sell_call_strike=2700, buy_call_strike=2750,
                 sell_put_strike=2300, buy_put_strike=2250,
-                quantity=1.0, underlying_price=2500.0, execution_mode="chaser",
+                quantity=1.0, underlying_price=2500.0,
             )
 
-        assert condor is None
-        quantities = [call.kwargs["quantity"] for call in mock_client.submit_order.call_args_list]
-        assert quantities == [0.4, 0.4]
+        assert condor is not None
+        assert all(leg.quantity == pytest.approx(0.4) for leg in condor.legs)
+        assert mock_client.submit_order.call_count == 0
 
     def test_successful_open_records_actual_filled_qty(self, pos_mgr, storage):
         """入库与持仓数量应以实际成交量为准。"""
-        def _filled_partial_size(legs, **kwargs):
+        def _filled_partial_size(*args, **kwargs):
+            legs = kwargs["leg_orders"]
             for leg in legs:
                 leg.status = "FILLED"
                 leg.avg_price = 0.03
@@ -616,7 +608,7 @@ class TestOpenIronCondor:
                 leg.order_id = "ORD_001"
             return legs
 
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_filled_partial_size):
+        with patch.object(pos_mgr, "_execute_market_iron_condor", side_effect=_filled_partial_size):
             condor = pos_mgr.open_iron_condor(
                 sell_call_symbol="ETH-260321-2700-C",
                 buy_call_symbol="ETH-260321-2750-C",
@@ -628,7 +620,6 @@ class TestOpenIronCondor:
                 buy_put_strike=2250,
                 quantity=1.0,
                 underlying_price=2500.0,
-                execution_mode="chaser",
             )
 
         assert condor is not None
@@ -639,13 +630,13 @@ class TestOpenIronCondor:
 
     def test_exception_triggers_rollback(self, pos_mgr, mock_client):
         """下单抛异常也应回滚."""
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=Exception("Connection error")):
+        with patch.object(pos_mgr, "_execute_market_iron_condor", side_effect=Exception("Connection error")):
             condor = pos_mgr.open_iron_condor(
                 sell_call_symbol="SC", buy_call_symbol="BC",
                 sell_put_symbol="SP", buy_put_symbol="BP",
                 sell_call_strike=2700, buy_call_strike=2750,
                 sell_put_strike=2300, buy_put_strike=2250,
-                quantity=1.0, underlying_price=2500.0, execution_mode="chaser",
+                quantity=1.0, underlying_price=2500.0,
             )
 
         assert condor is None
@@ -683,7 +674,8 @@ class TestCloseIronCondor:
     def test_close_all_legs(self, pos_mgr, mock_client, storage):
         gid = self._setup_open_condor(pos_mgr, storage)
 
-        def _fill_close_legs(legs, **kwargs):
+        def _fill_close_legs(*args, **kwargs):
+            legs = kwargs["leg_orders"]
             for leg in legs:
                 leg.status = "FILLED"
                 leg.avg_price = 0.0
@@ -692,8 +684,8 @@ class TestCloseIronCondor:
                 leg.order_id = "CLOSE_ORD"
             return legs
 
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_fill_close_legs):
-            pnl = pos_mgr.close_iron_condor(gid, reason="test", execution_mode="chaser")
+        with patch.object(pos_mgr, "_execute_market_legs", side_effect=_fill_close_legs):
+            pnl = pos_mgr.close_iron_condor(gid, reason="test")
         assert gid not in pos_mgr.open_condors
 
     def test_close_nonexistent(self, pos_mgr):
@@ -703,7 +695,8 @@ class TestCloseIronCondor:
     def test_close_all(self, pos_mgr, mock_client, storage):
         gid1 = self._setup_open_condor(pos_mgr, storage)
 
-        def _fill_close_legs(legs, **kwargs):
+        def _fill_close_legs(*args, **kwargs):
+            legs = kwargs["leg_orders"]
             for leg in legs:
                 leg.status = "FILLED"
                 leg.avg_price = 0.0
@@ -712,9 +705,47 @@ class TestCloseIronCondor:
                 leg.order_id = "CLOSE_ORD"
             return legs
 
-        with patch.object(pos_mgr.chaser, "execute_legs", side_effect=_fill_close_legs):
-            total = pos_mgr.close_all(reason="emergency", execution_mode="chaser")
+        with patch.object(pos_mgr, "_execute_market_legs", side_effect=_fill_close_legs):
+            total = pos_mgr.close_all(reason="emergency")
         assert len(pos_mgr.open_condors) == 0
+
+    def test_stop_loss_close_uses_wider_spread_stages(self, pos_mgr, storage):
+        gid = self._setup_open_condor(pos_mgr, storage)
+
+        def _fill_close_legs(*args, **kwargs):
+            assert kwargs["spread_stages"] == [
+                (50.0, pos_mgr.MARKET_BATCH_STAGE_WAIT_SEC),
+                (100.0, pos_mgr.MARKET_BATCH_STAGE_WAIT_SEC),
+                (200.0, None),
+            ]
+            assert kwargs["relaxed_max_spread_usd"] == 200.0
+            legs = kwargs["leg_orders"]
+            for leg in legs:
+                leg.status = "FILLED"
+                leg.avg_price = 0.0
+                leg.fee = 0.0
+                leg.filled_qty = leg.quantity
+            return legs
+
+        with patch.object(pos_mgr, "_execute_market_legs", side_effect=_fill_close_legs):
+            pos_mgr.close_iron_condor(gid, reason="weekend_vol_stop_loss_30")
+
+    def test_non_stop_loss_close_keeps_default_spread_stages(self, pos_mgr, storage):
+        gid = self._setup_open_condor(pos_mgr, storage)
+
+        def _fill_close_legs(*args, **kwargs):
+            assert kwargs["spread_stages"] is None
+            assert kwargs["relaxed_max_spread_usd"] is None
+            legs = kwargs["leg_orders"]
+            for leg in legs:
+                leg.status = "FILLED"
+                leg.avg_price = 0.0
+                leg.fee = 0.0
+                leg.filled_qty = leg.quantity
+            return legs
+
+        with patch.object(pos_mgr, "_execute_market_legs", side_effect=_fill_close_legs):
+            pos_mgr.close_iron_condor(gid, reason="manual_close")
 
     def test_market_close_splits_into_one_btc_batches(self, pos_mgr, mock_client, storage):
         gid = self._setup_open_condor(pos_mgr, storage, qty=2.0)
@@ -740,7 +771,7 @@ class TestCloseIronCondor:
             [],
         ]
 
-        pnl = pos_mgr.close_iron_condor(gid, reason="test_market", execution_mode="market")
+        pnl = pos_mgr.close_iron_condor(gid, reason="test_market")
 
         assert gid not in pos_mgr.open_condors
         assert mock_client.submit_order.call_count == 8
@@ -776,12 +807,24 @@ class TestCloseIronCondor:
             [],
         ]
 
-        pnl = pos_mgr.close_iron_condor(gid, reason="supplement_close", execution_mode="market")
+        pnl = pos_mgr.close_iron_condor(gid, reason="supplement_close")
 
         assert gid not in pos_mgr.open_condors
         assert [call.kwargs["symbol"] for call in mock_client.submit_order.call_args_list].count("BP") == 2
         assert any(float(call.kwargs["quantity"]) == 0.4 for call in mock_client.submit_order.call_args_list)
         assert mock_client.cancel_order.call_count >= 1
+
+    def test_open_short_strangle_rejects_legacy_execution_mode_kw(self, pos_mgr):
+        with pytest.raises(TypeError):
+            pos_mgr.open_short_strangle(
+                sell_call_symbol="BTC-260321-100000-C",
+                sell_put_symbol="BTC-260321-80000-P",
+                sell_call_strike=100000,
+                sell_put_strike=80000,
+                quantity=1.0,
+                underlying_price=90000.0,
+                execution_mode="market",
+            )
 
     def test_emergency_close_all_exchange_positions_splits_batches(self, pos_mgr, mock_client, storage):
         gid = self._setup_open_condor(pos_mgr, storage, qty=2.0)

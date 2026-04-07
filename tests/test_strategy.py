@@ -25,11 +25,26 @@ class TestShortStrangle:
         s = ShortStrangleStrategy()
         assert s.name == "ShortStrangle"
         assert s.target_delta == 0.25
+        assert s.selection_mode == "otm"
+        assert s.entry_weekdays == []
 
     def test_custom_params(self):
-        s = ShortStrangleStrategy(params={"target_delta": 0.15, "stop_loss_pct": 300})
+        s = ShortStrangleStrategy(params={
+            "target_delta": 0.15,
+            "target_call_delta": 0.18,
+            "target_put_delta": 0.12,
+            "max_delta_diff": 0.05,
+            "selection_mode": "delta",
+            "stop_loss_pct": 300,
+            "entry_weekdays": [0, 2, 4],
+        })
         assert s.target_delta == 0.15
+        assert s.target_call_delta == 0.18
+        assert s.target_put_delta == 0.12
+        assert s.max_delta_diff == 0.05
+        assert s.selection_mode == "delta"
         assert s.stop_loss_pct == 300
+        assert s.entry_weekdays == [0, 2, 4]
 
 
 class TestIronCondor:

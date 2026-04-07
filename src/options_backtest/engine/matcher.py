@@ -2,7 +2,7 @@
 
 Uses top-of-book bid/ask fills when available.
 Falls back to mark-price fill with fixed slippage when the book is unavailable.
-Supports both coin-margined (Deribit) and USD-margined (Binance) fee models.
+Supports both coin-margined (Deribit) and USD-margined fee models.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ class Matcher:
     ) -> Fill | None:
         """Try to fill *order* and return a Fill, or ``None`` if unfillable.
 
-        Prices are in coin (Deribit) or USD (Binance) depending on margin mode.
+        Prices are in coin (Deribit) or USD depending on margin mode.
         """
         # Determine execution price.
         # When a valid top-of-book exists, use the touch price directly:

@@ -1,12 +1,12 @@
 # ============================================================
-# Weekend Volatility Selling — BTC (Binance USD)
+# Weekend Volatility Selling — BTC (Bybit Options)
 # ============================================================
 # 策略: 每周五 18:00 UTC 执行 BTC weekend vol
 # 当前默认结构为裸双卖（`wing_delta: 0.0`）
 #   - Short delta ≈ 0.45 (call + put)
 #   - No wings (裸双卖)
 #   - RV24 <= 1.2 才允许入场
-#   - 3x USD 杠杆, 复利
+#   - 固定张数下单
 #   - 篮子止损: -200%
 #   - 仅当 BTC 较开仓价单边波动 >= 5% 时才允许触发止损
 #   - 持有至周日 08:00 UTC 自动结算
@@ -16,16 +16,22 @@
 #   Sharpe 3.69 |  Win Rate 81.4%
 # ============================================================
 
-name: Weekend Vol BTC (Binance 3x USD)
+name: Weekend Vol BTC (Bybit Fixed Size)
 
 exchange:
-  api_key: ''                  # 或设置环境变量 BINANCE_API_KEY
-  api_secret: ''               # 或设置环境变量 BINANCE_API_SECRET
+  api_key: ''                  # 或设置环境变量 BYBIT_API_KEY
+  api_secret: ''               # 或设置环境变量 BYBIT_API_SECRET
   testnet: false
-  base_url: ''                 # 留空自动选择 (prod: eapi.binance.com)
+  base_url: ''                 # 留空自动选择 (prod: api.bybit.com)
   timeout: 15
   account_currency: USDT
   simulate_private: false      # 真实私有接口模式
+  option_maker_fee_rate: 0.0002
+  option_taker_fee_rate: 0.0003
+  option_fee_cap_ratio: 0.07
+  short_option_margin_ratio: 0.10
+  short_option_otm_deduction_ratio: 0.08
+  short_option_min_margin_ratio: 0.05
 
 strategy:
   mode: weekend_vol
@@ -46,10 +52,10 @@ strategy:
   entry_time_utc: '18:00'      # Friday 18:00 UTC (optimized entry)
 
   # Position sizing
-  leverage: 3.0                # 3x notional leverage
-  quantity: 0.01               # 仅在 compound=false 时使用
+  leverage: 1.0                # 预览显示字段，固定数量模式下不再按权益放大
+  quantity: 5.0                # 固定下单数量（张）
   max_positions: 1
-  compound: true               # scale qty to account equity
+  compound: false              # 兼容保留字段；当前仅固定数量模式
 
 storage:
   db_path: ./data/trader_weekend_vol.db
@@ -62,11 +68,3 @@ monitor:
   check_interval_sec: 5        # 每 5 秒检查一次
   heartbeat_interval_sec: 300  # 每 5 分钟心跳
   equity_snapshot_interval_sec: 1800  # 每 30 分钟快照 (周末交易时间短)
-
-chaser:
-  window_seconds: 600          # 10 分钟追单窗口 (周末期权流动性一般)
-  poll_interval_sec: 30        # 每 30 秒检查盘口
-  tick_size_usdt: 5.0          # Binance 期权价格最小跳动 (USD)
-  market_fallback_sec: 60      # 兼容保留字段（当前策略主要按 window_seconds 截止）
-  market_trigger_spread_ticks: 1  # 所有腿 spread <= 1 tick(5刀) 时同时发市价单
-  max_amend_attempts: 30

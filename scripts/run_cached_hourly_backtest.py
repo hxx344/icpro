@@ -179,6 +179,7 @@ def _map_trader_config_to_backtest(trader_config_path: Path) -> Config:
         "entry_realized_vol_lookback_hours": int(trader_cfg.strategy.entry_realized_vol_lookback_hours),
         "entry_realized_vol_max": float(trader_cfg.strategy.entry_realized_vol_max),
         "stop_loss_pct": float(trader_cfg.strategy.stop_loss_pct),
+        "stop_loss_underlying_move_pct": float(trader_cfg.strategy.stop_loss_underlying_move_pct),
     }
 
     cfg.report.output_dir = f"./reports/{trader_config_path.stem}_hourly_backtest"

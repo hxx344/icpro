@@ -228,8 +228,7 @@ class DeribitOptionsClient:
         symbol: str,
         side: str,
         quantity: float,
-        order_type: str = "MARKET",
-        price: float | None = None,
+        *,
         reduce_only: bool = False,
         client_order_id: str | None = None,
     ) -> OrderResult:
@@ -241,8 +240,8 @@ class DeribitOptionsClient:
                 symbol=symbol,
                 side=side_norm,
                 quantity=quantity,
-                price=price or 0.0,
-                avg_price=price or 0.0,
+                price=0.0,
+                avg_price=0.0,
                 status="FILLED",
                 fee=0.0,
                 raw={"simulated": True},
@@ -252,11 +251,9 @@ class DeribitOptionsClient:
         params: dict[str, Any] = {
             "instrument_name": symbol,
             "amount": quantity,
-            "type": "market" if order_type.upper() == "MARKET" else "limit",
+            "type": "market",
             "reduce_only": bool(reduce_only),
         }
-        if price is not None and order_type.upper() == "LIMIT":
-            params["price"] = float(price)
         if client_order_id:
             params["label"] = client_order_id
 
@@ -284,8 +281,7 @@ class DeribitOptionsClient:
         symbol: str,
         side: str,
         quantity: float,
-        order_type: str = "MARKET",
-        price: float | None = None,
+        *,
         reduce_only: bool = False,
         client_order_id: str | None = None,
     ) -> OrderResult:
@@ -293,8 +289,6 @@ class DeribitOptionsClient:
             symbol=symbol,
             side=side,
             quantity=quantity,
-            order_type=order_type,
-            price=price,
             reduce_only=reduce_only,
             client_order_id=client_order_id,
         )
@@ -305,12 +299,11 @@ class DeribitOptionsClient:
             symbol=symbol,
             side=close_side,
             quantity=quantity,
-            order_type="MARKET",
             reduce_only=True,
         )
 
     # ------------------------------------------------------------------
-    # Additional methods for LimitChaser / PositionManager compatibility
+    # Additional methods for PositionManager compatibility
     # ------------------------------------------------------------------
 
     def get_ticker(self, symbol: str) -> OptionTicker | None:

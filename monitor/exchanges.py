@@ -1,6 +1,6 @@
 """Exchange API clients for options data.
 
-Fetches real-time option quotes from Deribit, OKX, and Binance,
+Fetches real-time option quotes from Deribit and OKX,
 normalises them into a unified OptionQuote format for comparison.
 """
 
@@ -29,7 +29,7 @@ MONTH_MAP = {
 class OptionQuote:
     """Normalised option quote across exchanges."""
 
-    exchange: str           # "Deribit" / "OKX" / "Binance"
+    exchange: str           # "Deribit" / "OKX"
     underlying: str         # "BTC" / "ETH"
     instrument: str         # exchange-native instrument name
     option_type: str        # "call" / "put"
@@ -371,104 +371,6 @@ def fetch_okx(underlying: str = "BTC", timeout: int = 10) -> list[OptionQuote]:
 
 
 # ---------------------------------------------------------------------------
-# Binance
-# ---------------------------------------------------------------------------
-
-BINANCE_EAPI = "https://eapi.binance.com"
-BINANCE_RE = re.compile(
-    r"^(?P<ul>[A-Z]+)-(?P<date>\d{6})-(?P<strike>\d+)-(?P<cp>[CP])$"
-)
-
-
-def _parse_binance_name(symbol: str) -> dict | None:
-    m = BINANCE_RE.match(symbol)
-    if not m:
-        return None
-    date_str = m.group("date")  # YYMMDD
-    yr = 2000 + int(date_str[:2])
-    mon = int(date_str[2:4])
-    day = int(date_str[4:6])
-    expiry = datetime(yr, mon, day, 8, 0, 0, tzinfo=timezone.utc)
-    return {
-        "underlying": m.group("ul"),
-        "expiry": expiry,
-        "strike": float(m.group("strike")),
-        "option_type": "call" if m.group("cp") == "C" else "put",
-    }
-
-
-def fetch_binance(underlying: str = "BTC", timeout: int = 10) -> list[OptionQuote]:
-    """Fetch Binance European options tickers."""
-    quotes: list[OptionQuote] = []
-    now = datetime.now(timezone.utc)
-    ul = underlying.upper()
-
-    # Get spot price from Binance spot API
-    spot_price = 0.0
-    try:
-        resp = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": f"{ul}USDT"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        spot_price = float(resp.json().get("price", 0))
-    except Exception as e:
-        logger.warning(f"Binance spot {ul} fetch failed: {e}")
-
-    # Get option tickers
-    url = f"{BINANCE_EAPI}/eapi/v1/ticker"
-    try:
-        resp = requests.get(url, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.warning(f"Binance options fetch failed: {e}")
-        return quotes
-
-    for item in data:
-        symbol = item.get("symbol", "")
-        if not symbol.startswith(ul):
-            continue
-
-        parsed = _parse_binance_name(symbol)
-        if not parsed:
-            continue
-
-        dte_hours = (parsed["expiry"] - now).total_seconds() / 3600
-        if dte_hours < 0:
-            continue
-
-        bid = float(item.get("bidPrice") or 0)
-        ask = float(item.get("askPrice") or 0)
-        mark = float(item.get("markPrice") or 0)
-        # Binance provides exercisePrice = underlying index price
-        ul_price = float(item.get("exercisePrice") or 0)
-        if ul_price <= 0:
-            ul_price = spot_price
-
-        quotes.append(OptionQuote(
-            exchange="Binance",
-            underlying=parsed["underlying"],
-            instrument=symbol,
-            option_type=parsed["option_type"],
-            strike=parsed["strike"],
-            expiry=parsed["expiry"],
-            dte_hours=dte_hours,
-            bid_usd=bid,
-            ask_usd=ask,
-            mark_usd=mark,
-            underlying_price=ul_price,
-            iv=0,
-            volume_24h=float(item.get("volume") or 0),
-            open_interest=float(item.get("openInterest") or 0),
-        ))
-
-    logger.info(f"Binance {ul}: {len(quotes)} option quotes")
-    return quotes
-
-
-# ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
 
@@ -482,20 +384,19 @@ def fetch_all_quotes(
     Parameters
     ----------
     underlyings : list of "BTC", "ETH" etc. Default: ["BTC", "ETH"]
-    exchanges : list of "Deribit", "OKX", "Binance". Default: all.
+    exchanges : list of "Deribit", "OKX". Default: all.
     timeout : HTTP request timeout in seconds.
     """
     if underlyings is None:
         underlyings = ["BTC", "ETH"]
     if exchanges is None:
-        exchanges = ["Deribit", "OKX", "Binance"]
+        exchanges = ["Deribit", "OKX"]
 
     all_quotes: list[OptionQuote] = []
 
     fetchers = {
         "Deribit": fetch_deribit,
         "OKX": fetch_okx,
-        "Binance": fetch_binance,
     }
 
     for exch_name in exchanges:

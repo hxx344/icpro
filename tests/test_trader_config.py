@@ -45,7 +45,7 @@ class TestExchangeConfig:
 
     def test_prod_url(self):
         cfg = ExchangeConfig(testnet=False)
-        assert "eapi.binance.com" in cfg.base_url
+        assert "api.bybit.com" in cfg.base_url
 
     def test_custom_base_url_not_overwritten(self):
         """显式指定 base_url 时不被 __post_init__ 覆盖."""
@@ -53,17 +53,17 @@ class TestExchangeConfig:
         assert cfg.base_url == "https://custom.api.com"
 
     def test_env_vars_override(self, monkeypatch):
-        """环境变量 BINANCE_API_KEY / BINANCE_API_SECRET 应覆盖字段."""
-        monkeypatch.setenv("BINANCE_API_KEY", "env_key_123")
-        monkeypatch.setenv("BINANCE_API_SECRET", "env_secret_456")
+        """环境变量 BYBIT_API_KEY / BYBIT_API_SECRET 应覆盖字段."""
+        monkeypatch.setenv("BYBIT_API_KEY", "env_key_123")
+        monkeypatch.setenv("BYBIT_API_SECRET", "env_secret_456")
         cfg = ExchangeConfig(api_key="yaml_key", api_secret="yaml_secret")
         assert cfg.api_key == "env_key_123"
         assert cfg.api_secret == "env_secret_456"
 
     def test_env_vars_not_set(self, monkeypatch):
         """环境变量不存在时保留 YAML 值."""
-        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
-        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+        monkeypatch.delenv("BYBIT_API_KEY", raising=False)
+        monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
         cfg = ExchangeConfig(api_key="from_yaml", api_secret="from_yaml_secret")
         assert cfg.api_key == "from_yaml"
         assert cfg.api_secret == "from_yaml_secret"
@@ -82,7 +82,7 @@ class TestStrategyConfig:
         assert cfg.target_delta == 0.45
         assert cfg.wing_delta == 0.0
         assert cfg.entry_time_utc == "18:00"
-        assert cfg.compound is True
+        assert cfg.compound is False
 
 
 class TestStorageConfig:
@@ -119,18 +119,18 @@ class TestLoadConfig:
     def test_load_none(self):
         """path=None 返回全部默认值."""
         cfg = load_config(None)
-        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
+        assert cfg.name == "Weekend Vol BTC (Bybit Fixed Size)"
         assert cfg.exchange.testnet is False
 
     def test_load_missing_file(self, tmp_path):
         """文件不存在时使用默认值 (不报错)."""
         cfg = load_config(tmp_path / "nonexistent.yaml")
-        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
+        assert cfg.name == "Weekend Vol BTC (Bybit Fixed Size)"
 
     def test_load_yaml(self, tmp_path, monkeypatch):
         """从 YAML 加载配置并合并."""
-        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
-        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+        monkeypatch.delenv("BYBIT_API_KEY", raising=False)
+        monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
 
         config_data = {
             "name": "Test Strategy",
@@ -153,7 +153,7 @@ class TestLoadConfig:
         assert cfg.name == "Test Strategy"
         assert cfg.exchange.api_key == "yaml_key"
         assert cfg.exchange.testnet is False
-        assert "eapi.binance.com" in cfg.exchange.base_url
+        assert "api.bybit.com" in cfg.exchange.base_url
         assert cfg.strategy.underlying == "BTC"
         assert cfg.strategy.target_delta == 0.35
 
@@ -162,12 +162,12 @@ class TestLoadConfig:
         yaml_path = tmp_path / "empty.yaml"
         yaml_path.write_text("")
         cfg = load_config(yaml_path)
-        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
+        assert cfg.name == "Weekend Vol BTC (Bybit Fixed Size)"
 
     def test_all_sections_merge(self, tmp_path, monkeypatch):
         """所有配置节都能正确合并."""
-        monkeypatch.delenv("BINANCE_API_KEY", raising=False)
-        monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+        monkeypatch.delenv("BYBIT_API_KEY", raising=False)
+        monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
 
         config_data = {
             "strategy": {"quantity": 0.5, "max_positions": 3},
@@ -189,8 +189,7 @@ class TestLoadConfig:
         [
             ({"strategy": {"mode": "bad_mode"}}, "strategy.mode"),
             ({"strategy": {"entry_time_utc": "25:00"}}, "entry_time_utc"),
-            ({"strategy": {"compound": False, "quantity": 0}}, "strategy.quantity"),
-            ({"chaser": {"window_seconds": 10, "market_fallback_sec": 10}}, "market_fallback_sec"),
+            ({"strategy": {"quantity": 0}}, "strategy.quantity"),
         ],
     )
     def test_invalid_config_raises(self, tmp_path, config_data, expected_message):

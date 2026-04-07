@@ -6,7 +6,6 @@ Tests cover:
   - PositionManager: open/close condors, strangle, PnL tracking
     - Strategy: WeekendVolStrategy entry logic
   - EquityTracker: snapshot, daily PnL, day rollover
-  - LimitChaser: price computation, leg execution
   - Engine: init, start/stop lifecycle, status
 """
 
@@ -31,25 +30,18 @@ from trader.config import (
     StrategyConfig,
     StorageConfig,
     MonitorConfig,
-    ChaserConfig as ChaserCfgDataclass,
     TraderConfig,
     load_config,
     _merge_section,
 )
 from trader.storage import Storage
-from trader.binance_client import (
-    OptionTicker,
-    OrderResult,
-    AccountInfo,
-    BinanceOptionsClient,
-    _parse_symbol,
-)
+from trader.bybit_client import OptionTicker, OrderResult, AccountInfo, BybitOptionsClient, _parse_symbol
 from trader.position_manager import (
     CondorLeg,
     IronCondorPosition,
+    LegOrder,
     PositionManager,
 )
-from trader.limit_chaser import ChaserConfig, LegOrder, LimitChaser
 from trader.equity import EquityTracker
 from trader.strategy import WeekendVolStrategy
 
@@ -112,7 +104,7 @@ def _make_ticker(
 
 
 class MockClient:
-    """Mock Binance client for testing."""
+    """Mock Bybit client for testing."""
 
     def __init__(self, spot=87000.0, equity=10000.0):
         self._spot = spot
@@ -120,6 +112,42 @@ class MockClient:
         self._tickers: list[OptionTicker] = []
         self._positions: list[dict] = []
         self._order_counter = 0
+
+    def _upsert_position(self, symbol: str, side: str, delta_qty: float, entry_price: float) -> None:
+        if delta_qty <= 1e-9:
+            return
+        symbol_norm = str(symbol or "").upper()
+        side_norm = str(side or "").upper()
+        for pos in self._positions:
+            if str(pos.get("symbol") or "").upper() == symbol_norm and str(pos.get("side") or "").upper() == side_norm:
+                new_qty = float(pos.get("quantity") or 0.0) + delta_qty
+                if new_qty <= 1e-9:
+                    self._positions.remove(pos)
+                else:
+                    pos["quantity"] = new_qty
+                    pos["entryPrice"] = entry_price
+                return
+        self._positions.append({
+            "symbol": symbol_norm,
+            "side": side_norm,
+            "quantity": delta_qty,
+            "entryPrice": entry_price,
+        })
+
+    def _reduce_position(self, symbol: str, side: str, delta_qty: float) -> None:
+        if delta_qty <= 1e-9:
+            return
+        symbol_norm = str(symbol or "").upper()
+        side_norm = str(side or "").upper()
+        for pos in list(self._positions):
+            if str(pos.get("symbol") or "").upper() != symbol_norm or str(pos.get("side") or "").upper() != side_norm:
+                continue
+            new_qty = float(pos.get("quantity") or 0.0) - delta_qty
+            if new_qty <= 1e-9:
+                self._positions.remove(pos)
+            else:
+                pos["quantity"] = new_qty
+            return
 
     def get_spot_price(self, underlying="BTC"):
         return self._spot
@@ -145,30 +173,43 @@ class MockClient:
     def get_positions(self, underlying="BTC"):
         return self._positions
 
-    def place_order(self, symbol, side, quantity, order_type="MARKET",
-                    price=None, reduce_only=False, client_order_id=None):
+    def place_order(self, symbol, side, quantity,
+                    reduce_only=False, client_order_id=None):
         self._order_counter += 1
         oid = f"TEST-{self._order_counter}"
+        fill_price = 100.0
+        qty = float(quantity or 0.0)
+        side_norm = str(side or "").upper()
+
+        if reduce_only:
+            if side_norm == "BUY":
+                self._reduce_position(symbol, "SHORT", qty)
+            else:
+                self._reduce_position(symbol, "LONG", qty)
+        else:
+            if side_norm == "SELL":
+                self._upsert_position(symbol, "SHORT", qty, fill_price)
+            else:
+                self._upsert_position(symbol, "LONG", qty, fill_price)
+
         return OrderResult(
             order_id=oid,
             symbol=symbol,
             side=side,
             quantity=quantity,
-            price=price or 100.0,
-            avg_price=price or 100.0,
+            price=fill_price,
+            avg_price=fill_price,
             status="FILLED",
             fee=0.01,
             raw={"test": True},
         )
 
-    def submit_order(self, symbol, side, quantity, order_type="MARKET",
-                     price=None, time_in_force=None, reduce_only=False, client_order_id=None):
+    def submit_order(self, symbol, side, quantity,
+                     reduce_only=False, client_order_id=None):
         return self.place_order(
             symbol=symbol,
             side=side,
             quantity=quantity,
-            order_type=order_type,
-            price=price,
             reduce_only=reduce_only,
             client_order_id=client_order_id,
         )
@@ -211,16 +252,16 @@ class TestExchangeConfig:
         assert cfg.account_currency == "USDT"
         assert cfg.simulate_private is False
 
-    def test_post_init_binance_url(self):
+    def test_post_init_bybit_url(self):
         cfg = ExchangeConfig(testnet=False)
-        assert "eapi.binance.com" in cfg.base_url
+        assert "api.bybit.com" in cfg.base_url
 
     def test_post_init_testnet_url(self):
         cfg = ExchangeConfig(testnet=True)
         assert "testnet" in cfg.base_url
 
     def test_env_var_override(self):
-        with patch.dict(os.environ, {"BINANCE_API_KEY": "test_key", "BINANCE_API_SECRET": "test_secret"}):
+        with patch.dict(os.environ, {"BYBIT_API_KEY": "test_key", "BYBIT_API_SECRET": "test_secret"}):
             cfg = ExchangeConfig()
             assert cfg.api_key == "test_key"
             assert cfg.api_secret == "test_secret"
@@ -247,7 +288,7 @@ class TestStrategyConfig:
 class TestTraderConfig:
     def test_default_construction(self):
         cfg = TraderConfig()
-        assert cfg.name == "Weekend Vol BTC (Binance 3x USD)"
+        assert cfg.name == "Weekend Vol BTC (Bybit Fixed Size)"
         assert isinstance(cfg.exchange, ExchangeConfig)
         assert isinstance(cfg.strategy, StrategyConfig)
 
@@ -410,7 +451,7 @@ class TestStorage:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: Binance Client symbol parsing
+# Test: Bybit Client symbol parsing
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestParseSymbol:
@@ -513,73 +554,6 @@ class TestIronCondorPosition:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Test: LimitChaser
-# ═══════════════════════════════════════════════════════════════════════
-
-class TestLimitChaser:
-    def test_compute_limit_price_sell_initial(self):
-        client = MockClient()
-        chaser = LimitChaser(client, ChaserConfig(tick_size_usdt=1.0))
-
-        leg = LegOrder("sell_call", "SYM1", "SELL", 1.0, 90000, "call")
-        quote = _make_ticker(bid_price=100.0, ask_price=120.0)
-
-        price = chaser._compute_limit_price(leg, quote, elapsed_ratio=0.0)
-        # At t=0, SELL starts at ask - tick = 119
-        assert price == pytest.approx(119.0)
-
-    def test_compute_limit_price_buy_initial(self):
-        client = MockClient()
-        chaser = LimitChaser(client, ChaserConfig(tick_size_usdt=1.0))
-
-        leg = LegOrder("buy_put", "SYM2", "BUY", 1.0, 80000, "put")
-        quote = _make_ticker(bid_price=100.0, ask_price=120.0)
-
-        price = chaser._compute_limit_price(leg, quote, elapsed_ratio=0.0)
-        # At t=0, BUY starts at bid + tick = 101
-        assert price == pytest.approx(101.0)
-
-    def test_compute_limit_price_sell_at_deadline(self):
-        client = MockClient()
-        chaser = LimitChaser(client, ChaserConfig(tick_size_usdt=1.0))
-
-        leg = LegOrder("sell_call", "SYM1", "SELL", 1.0, 90000, "call")
-        quote = _make_ticker(bid_price=100.0, ask_price=120.0)
-
-        price = chaser._compute_limit_price(leg, quote, elapsed_ratio=1.0)
-        # At deadline, SELL should be at bid
-        assert price == pytest.approx(100.0)
-
-    def test_compute_limit_price_buy_at_deadline(self):
-        client = MockClient()
-        chaser = LimitChaser(client, ChaserConfig(tick_size_usdt=1.0))
-
-        leg = LegOrder("buy_put", "SYM2", "BUY", 1.0, 80000, "put")
-        quote = _make_ticker(bid_price=100.0, ask_price=120.0)
-
-        price = chaser._compute_limit_price(leg, quote, elapsed_ratio=1.0)
-        # At deadline, BUY should be at ask
-        assert price == pytest.approx(120.0)
-
-    def test_execute_legs_all_fill(self):
-        client = MockClient()
-        chaser = LimitChaser(client, ChaserConfig(
-            window_seconds=2,
-            poll_interval_sec=0.1,
-            market_fallback_sec=1,
-        ))
-
-        legs = [
-            LegOrder("sell_call", "SYM1", "SELL", 1.0, 90000, "call"),
-            LegOrder("sell_put", "SYM2", "SELL", 1.0, 85000, "put"),
-        ]
-
-        results = chaser.execute_legs(legs)
-        assert all(r.status == "FILLED" for r in results)
-        assert results[0].order_id != ""
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # Test: PositionManager
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -595,7 +569,6 @@ class TestPositionManager:
             sell_put_strike=85000,
             quantity=0.1,
             underlying_price=87000,
-            execution_mode="chaser",
         )
         assert condor is not None
         assert condor.is_open
@@ -617,7 +590,6 @@ class TestPositionManager:
             buy_put_strike=80000,
             quantity=0.1,
             underlying_price=87000,
-            execution_mode="chaser",
         )
         assert condor is not None
         assert condor.is_open
@@ -639,11 +611,10 @@ class TestPositionManager:
             buy_put_strike=80000,
             quantity=0.1,
             underlying_price=87000,
-            execution_mode="chaser",
         )
         assert condor is not None
 
-        pnl = pm.close_iron_condor(condor.group_id, reason="test", execution_mode="chaser")
+        pnl = pm.close_iron_condor(condor.group_id, reason="test")
         assert pm.open_position_count == 0
         # PnL is some value (depends on mock fills)
         assert isinstance(pnl, float)
@@ -654,15 +625,13 @@ class TestPositionManager:
 
         pm.open_short_strangle(
             "SYM1", "SYM2", 90000, 85000, 0.1, 87000,
-            execution_mode="chaser",
         )
         pm.open_short_strangle(
             "SYM3", "SYM4", 91000, 84000, 0.1, 87000,
-            execution_mode="chaser",
         )
         assert pm.open_position_count == 2
 
-        total = pm.close_all("test_close", execution_mode="chaser")
+        total = pm.close_all("test_close")
         assert pm.open_position_count == 0
         assert isinstance(total, float)
 
@@ -673,7 +642,6 @@ class TestPositionManager:
         condor = pm.open_short_strangle(
             "BTC-260328-90000-C", "BTC-260328-85000-P",
             90000, 85000, 1.0, 87000,
-            execution_mode="chaser",
         )
         assert condor is not None
 
@@ -689,7 +657,7 @@ class TestPositionManager:
         client = MockClient()
         pm = PositionManager(client, storage)
 
-        pm.open_short_strangle("S1", "S2", 90000, 85000, 0.1, 87000, execution_mode="chaser")
+        pm.open_short_strangle("S1", "S2", 90000, 85000, 0.1, 87000)
         summary = pm.summary()
         assert summary["open_condors"] == 1
         assert "condors" in summary
@@ -701,7 +669,6 @@ class TestPositionManager:
 
         condor = pm.open_short_strangle(
             "SYM1", "SYM2", 90000, 85000, 0.1, 87000,
-            execution_mode="chaser",
         )
         assert condor is not None
         gid = condor.group_id
@@ -710,6 +677,21 @@ class TestPositionManager:
         pm2 = PositionManager(client, storage)
         assert pm2.open_position_count == 1
         assert gid in pm2.open_condors
+
+    def test_open_short_strangle_rejects_legacy_execution_mode_kw(self, storage):
+        client = MockClient()
+        pm = PositionManager(client, storage)
+
+        with pytest.raises(TypeError):
+            pm.open_short_strangle(
+                "BTC-260328-90000-C",
+                "BTC-260328-85000-P",
+                90000,
+                85000,
+                0.1,
+                87000,
+                execution_mode="market",
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -816,7 +798,7 @@ class TestWeekendVolStrategy:
         assert len(open_trades) == 2
         assert {t["symbol"] for t in open_trades} == {"BTC-260405-67000-C", "BTC-260405-66500-P"}
         assert all(json.loads(t["meta"]).get("recovered_from_exchange") is True for t in open_trades)
-        assert {round(float(t["fee"]), 4) for t in open_trades} == {8.6, 10.44}
+        assert {round(float(t["fee"]), 4) for t in open_trades} == {6.02, 7.98}
         assert all(json.loads(t["meta"]).get("fee_estimated") is True for t in open_trades)
 
     def test_init_replaces_conflicting_local_open_trades_with_exchange_positions(self, storage):
@@ -979,9 +961,7 @@ class TestWeekendVolStrategy:
 
         strategy = WeekendVolStrategy(client, pm, storage, cfg)
         qty = strategy._compute_quantity(87000)
-        # (50000 * 3) / 87000 ≈ 1.72, floor to 1.7
-        assert qty >= 1.0
-        assert qty == pytest.approx(1.7, abs=0.2)
+        assert qty == pytest.approx(0.1)
 
     def test_compute_quantity_compound_caps_by_official_margin_formula(self, storage):
         client = MockClient(spot=87000, equity=10000)
@@ -1016,7 +996,7 @@ class TestWeekendVolStrategy:
 
         strategy = WeekendVolStrategy(client, pm, storage, cfg)
         qty = strategy._compute_quantity(87000, sell_call=sell_call, sell_put=sell_put)
-        assert qty == pytest.approx(0.4, abs=0.11)
+        assert qty == pytest.approx(0.1)
 
     def test_compute_quantity_no_compound(self, storage):
         client = MockClient()
@@ -1043,7 +1023,6 @@ class TestWeekendVolStrategy:
         condor = pm.open_short_strangle(
             "BTC-260322-90000-C", "BTC-260322-85000-P",
             90000, 85000, 0.1, 87000,
-            execution_mode="chaser",
         )
         assert condor is not None
         assert pm.open_position_count == 1
@@ -1064,7 +1043,6 @@ class TestWeekendVolStrategy:
         condor = pm.open_short_strangle(
             "BTC-260329-90000-C", "BTC-260329-85000-P",
             90000, 85000, 0.1, 87000,
-            execution_mode="chaser",
         )
         assert pm.open_position_count == 1
 

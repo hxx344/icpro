@@ -36,6 +36,11 @@ reports/
 sandbox/
 .benchmark_tmp/
 
+# Non-trader scripts and backtesting code
+scripts/
+src/options_backtest/
+configs/backtest/
+
 # Logs
 logs/
 test_logs/
@@ -46,8 +51,6 @@ coverage.xml
 htmlcov/
 
 # Checkpoints & temp
-scripts/.cdd_0dte_checkpoint.json
-!scripts/build_hourly_parquet.py
 *.db
 *.db-shm
 *.db-wal
@@ -71,18 +74,6 @@ tmp/
 
 # Streamlit local secrets
 .streamlit/secrets.toml
-
-# Local research / diagnostic scripts
-scripts/check_original_backtest.py
-scripts/compare_*.py
-scripts/debug_*.py
-scripts/diagnose_*.py
-scripts/profile_*.py
-scripts/test_*.py
-scripts/insert_demo.py
-scripts/optimize_weekend_vol.py
-scripts/explore_weekend_vol_*.py
-scripts/extend_underlying_from_options_hourly.py
 
 tools/
 1024

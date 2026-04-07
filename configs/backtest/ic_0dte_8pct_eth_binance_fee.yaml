@@ -1,6 +1,6 @@
-# Iron Condor 0DTE ±8% ETH — Binance 费率
+# Iron Condor 0DTE ±8% ETH — USD 费率对照
 backtest:
-  name: "ETH IC 0DTE ±8% (Binance Fee)"
+  name: "ETH IC 0DTE ±8% (USD Fee Compare)"
   start_date: "2025-03-14"
   end_date: "2026-03-14"
   time_step: "1h"
@@ -43,4 +43,4 @@ strategy:
     wait_for_midpoint: false
 
 report:
-  output_dir: "./reports/ic_0dte_eth_fee_compare/binance"
+  output_dir: "./reports/ic_0dte_eth_fee_compare/usd_fee"

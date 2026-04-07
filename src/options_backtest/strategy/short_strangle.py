@@ -13,6 +13,10 @@ Drawdown-reduction features (all optional, disabled by default):
   - equity_ma:    only trade when equity > N-day moving average of equity
   - progressive_dd: linearly scale down position as drawdown deepens
   - single_leg:  sell only call/put when trend detected (instead of both)
+
+Additional scheduling parameters:
+    - entry_hour: open at specified UTC hour
+    - entry_weekdays: optional allowed entry weekdays (Mon=0 ... Sun=6)
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import math
 from collections import deque
 from typing import Any
 
+from options_backtest.pricing.black76 import delta as bs_delta
 from options_backtest.strategy.base import BaseStrategy
 
 
@@ -32,6 +37,9 @@ class ShortStrangleStrategy(BaseStrategy):
     def __init__(self, params: dict[str, Any] | None = None):
         super().__init__(params)
         self.target_delta: float = self.params.get("target_delta", 0.25)
+        self.target_call_delta: float = self.params.get("target_call_delta", self.target_delta)
+        self.target_put_delta: float = self.params.get("target_put_delta", self.target_delta)
+        self.max_delta_diff: float = self.params.get("max_delta_diff", 0.10)
         self.min_days_to_expiry: float = self.params.get("min_days_to_expiry", 14)
         self.max_days_to_expiry: float = self.params.get("max_days_to_expiry", 45)
         self.roll_days_before_expiry: float = self.params.get("roll_days_before_expiry", 3)
@@ -42,10 +50,16 @@ class ShortStrangleStrategy(BaseStrategy):
 
         # OTM offset: fraction of underlying price (0.05 = 5% OTM)
         self.otm_pct: float = self.params.get("otm_pct", 0.10)
+        self.selection_mode: str = str(self.params.get("selection_mode", "otm")).lower()
+        self.default_iv: float = float(self.params.get("default_iv", 0.60))
 
         # Daily rolling mode (for 0DTE)
         self.roll_daily: bool = self.params.get("roll_daily", False)
         self.entry_hour: int = self.params.get("entry_hour", 8)
+        self.entry_weekdays: list[int] = [
+            int(d) for d in self.params.get("entry_weekdays", [])
+            if 0 <= int(d) <= 6
+        ]
         self.compound: bool = self.params.get("compound", False)
 
         # --- Drawdown-reduction parameters ---
@@ -117,6 +131,7 @@ class ShortStrangleStrategy(BaseStrategy):
     def on_step(self, context) -> None:
         positions = context.positions
         price = context.underlying_price
+        current_dow = context.current_time.weekday()
 
         # Track price history for vol computation
         self._price_history.append(price)
@@ -167,9 +182,13 @@ class ShortStrangleStrategy(BaseStrategy):
 
             # --- Skip weekends (Saturday=5, Sunday=6 in UTC) ---
             if self.skip_weekends:
-                dow = context.current_time.weekday()
-                if dow >= 5:  # Saturday or Sunday
+                if current_dow >= 5:  # Saturday or Sunday
                     return
+
+            # --- Optional weekday filter ---
+            if self.entry_weekdays and current_dow not in self.entry_weekdays:
+                self._last_trade_date = current_date
+                return
 
             # --- Entry window logic ---
             if self.wait_for_midpoint:
@@ -257,10 +276,28 @@ class ShortStrangleStrategy(BaseStrategy):
         if n_pairs >= self.max_positions:
             return
 
+        current_date = context.current_time.strftime("%Y-%m-%d")
+        current_hour = context.current_time.hour
+        is_new_day = current_date != self._last_trade_date
+
+        if self.entry_weekdays:
+            if not is_new_day or current_hour != self.entry_hour:
+                return
+            if self.skip_weekends and current_dow >= 5:
+                self._last_trade_date = current_date
+                return
+            if current_dow not in self.entry_weekdays:
+                self._last_trade_date = current_date
+                return
+
         chain = context.option_chain
         if chain.empty:
+            if self.entry_weekdays:
+                self._last_trade_date = current_date
             return
         self._open_strangle(context, chain)
+        if self.entry_weekdays:
+            self._last_trade_date = current_date
 
     # ------------------------------------------------------------------
 
@@ -487,15 +524,40 @@ class ShortStrangleStrategy(BaseStrategy):
         if len(call_local_idx) == 0 or len(put_local_idx) == 0:
             return
 
-        # Pick nearest to target offset
+        # Pick legs either by OTM percent or target delta
         target_offset = self._get_effective_otm()
-        call_offsets = (exp_strikes[call_local_idx] - F) / F
-        call_dist = np.abs(call_offsets - target_offset)
-        best_call_li = call_local_idx[np.argmin(call_dist)]
+        delta_mode = self.selection_mode == "delta"
+        best_call_li = None
+        best_put_li = None
 
-        put_offsets = (F - exp_strikes[put_local_idx]) / F
-        put_dist = np.abs(put_offsets - target_offset)
-        best_put_li = put_local_idx[np.argmin(put_dist)]
+        if delta_mode:
+            expiry_chain = chain.iloc[exp_idx].copy()
+            best_call_li = self._select_delta_leg_local_index(
+                expiry_chain,
+                exp_names,
+                F,
+                context.current_time,
+                "call",
+                self.target_call_delta,
+            )
+            best_put_li = self._select_delta_leg_local_index(
+                expiry_chain,
+                exp_names,
+                F,
+                context.current_time,
+                "put",
+                self.target_put_delta,
+            )
+            if best_call_li is None or best_put_li is None:
+                return
+        else:
+            call_offsets = (exp_strikes[call_local_idx] - F) / F
+            call_dist = np.abs(call_offsets - target_offset)
+            best_call_li = call_local_idx[np.argmin(call_dist)]
+
+            put_offsets = (F - exp_strikes[put_local_idx]) / F
+            put_dist = np.abs(put_offsets - target_offset)
+            best_put_li = put_local_idx[np.argmin(put_dist)]
 
         call_name = str(exp_names[best_call_li])
         put_name = str(exp_names[best_put_li])
@@ -507,6 +569,8 @@ class ShortStrangleStrategy(BaseStrategy):
         call_strike = exp_strikes[best_call_li]
         put_strike = exp_strikes[best_put_li]
         call_dte = exp_dte[best_call_li]
+        call_delta = self._compute_leg_delta(chain.iloc[exp_idx[best_call_li]], F, context.current_time, "call")
+        put_delta = self._compute_leg_delta(chain.iloc[exp_idx[best_put_li]], F, context.current_time, "put")
 
         # Compound sizing
         if self.compound:
@@ -521,13 +585,22 @@ class ShortStrangleStrategy(BaseStrategy):
         else:
             sell_qty = self.quantity
 
-        self.log(
-            f"Opening Short Strangle: "
-            f"Call {call_name} (K={call_strike}), "
-            f"Put {put_name} (K={put_strike}), "
-            f"DTE={call_dte:.1f}, qty={sell_qty:.4f}, "
-            f"otm={target_offset*100:.2f}%, legs={legs}"
-        )
+        if delta_mode:
+            self.log(
+                f"Opening Short Strangle: "
+                f"Call {call_name} (K={call_strike}, |Δ|={abs(call_delta):.3f}), "
+                f"Put {put_name} (K={put_strike}, |Δ|={abs(put_delta):.3f}), "
+                f"DTE={call_dte:.1f}, qty={sell_qty:.4f}, "
+                f"targetΔ={self.target_call_delta:.2f}/{self.target_put_delta:.2f}, legs={legs}"
+            )
+        else:
+            self.log(
+                f"Opening Short Strangle: "
+                f"Call {call_name} (K={call_strike}), "
+                f"Put {put_name} (K={put_strike}), "
+                f"DTE={call_dte:.1f}, qty={sell_qty:.4f}, "
+                f"otm={target_offset*100:.2f}%, legs={legs}"
+            )
 
         if legs in ("both", "call_only"):
             context.sell(call_name, sell_qty)
@@ -570,3 +643,93 @@ class ShortStrangleStrategy(BaseStrategy):
                         if long_put_name not in context.positions:
                             context.buy(long_put_name, sell_qty)
                             self.log(f"  Hedge: Buy Put {long_put_name} (K={exp_strikes[lp_li]})")
+
+    def _select_delta_leg_local_index(
+        self,
+        expiry_chain,
+        exp_names,
+        spot: float,
+        now,
+        option_type: str,
+        target_abs_delta: float,
+    ) -> int | None:
+        import numpy as np
+        import pandas as pd
+
+        if expiry_chain.empty:
+            return None
+
+        opt_mask = expiry_chain["option_type"].astype(str).str.lower().str.startswith(option_type[0])
+        side_df = expiry_chain.loc[opt_mask].copy()
+        if side_df.empty:
+            return None
+
+        if option_type == "call":
+            side_df = side_df.loc[pd.to_numeric(side_df["strike_price"], errors="coerce") > spot]
+        else:
+            side_df = side_df.loc[pd.to_numeric(side_df["strike_price"], errors="coerce") < spot]
+        if side_df.empty:
+            return None
+
+        deltas = pd.to_numeric(side_df.get("delta"), errors="coerce")
+        bad_delta = ~np.isfinite(deltas.to_numpy(dtype=float, na_value=np.nan))
+        if bad_delta.any():
+            side_df.loc[bad_delta, "delta"] = side_df.loc[bad_delta].apply(
+                lambda row: self._compute_fallback_delta(row, spot, now, option_type),
+                axis=1,
+            )
+            deltas = pd.to_numeric(side_df.get("delta"), errors="coerce")
+
+        side_df = side_df.loc[np.isfinite(deltas)]
+        if side_df.empty:
+            return None
+
+        delta_abs = pd.to_numeric(side_df["delta"], errors="coerce").abs()
+        diff = (delta_abs - target_abs_delta).abs()
+        best_idx = diff.idxmin()
+        if not np.isfinite(diff.loc[best_idx]) or float(diff.loc[best_idx]) > self.max_delta_diff:
+            return None
+
+        best_name = str(side_df.loc[best_idx, "instrument_name"])
+        matches = np.flatnonzero(exp_names.astype(str) == best_name)
+        if len(matches) == 0:
+            return None
+        return int(matches[0])
+
+    def _compute_leg_delta(self, row, spot: float, now, option_type: str) -> float:
+        try:
+            raw_delta = float(row.get("delta", float("nan")))
+            if math.isfinite(raw_delta):
+                return raw_delta
+        except Exception:
+            pass
+        return self._compute_fallback_delta(row, spot, now, option_type)
+
+    def _compute_fallback_delta(self, row, spot: float, now, option_type: str) -> float:
+        import pandas as pd
+
+        exp = pd.Timestamp(row["expiration_date"])
+        if exp.tzinfo is None:
+            exp = exp.tz_localize("UTC")
+        else:
+            exp = exp.tz_convert("UTC")
+        if getattr(now, "tzinfo", None) is None:
+            now = pd.Timestamp(now, tz="UTC")
+        else:
+            now = pd.Timestamp(now).tz_convert("UTC")
+
+        t_years = max((exp.value - now.value) / (365.25 * 86_400_000_000_000.0), 1e-6)
+        strike = float(row["strike_price"])
+        iv = row.get("mark_iv", self.default_iv)
+        try:
+            iv = float(iv)
+        except Exception:
+            iv = self.default_iv
+        if not math.isfinite(iv) or iv <= 0:
+            iv = self.default_iv
+        if iv > 3.0:
+            iv /= 100.0
+        try:
+            return float(bs_delta(spot, strike, t_years, sigma=iv, option_type=option_type, r=0.0))
+        except Exception:
+            return float("nan")

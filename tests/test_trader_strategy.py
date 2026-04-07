@@ -7,11 +7,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from trader.binance_client import AccountInfo, BinanceOptionsClient, OptionTicker
-from trader.config import StrategyConfig
+from trader.bybit_client import AccountInfo, BybitOptionsClient, OptionTicker
+from trader.config import ExchangeConfig, StrategyConfig
 from trader.position_manager import PositionManager
 from trader.storage import Storage
-from trader.strategy import WeekendVolStrategy
+from trader.strategy import WeekendVolStrategy, estimate_bybit_combo_open_margin_per_unit
 
 
 def _make_ticker(
@@ -54,7 +54,7 @@ def storage(tmp_path):
 
 @pytest.fixture
 def client():
-    c = MagicMock(spec=BinanceOptionsClient)
+    c = MagicMock(spec=BybitOptionsClient)
     c.get_positions.return_value = []
     c.get_account.return_value = AccountInfo(
         total_balance=10000.0,
@@ -90,16 +90,28 @@ class TestWeekendVolStrategy:
         now = datetime(2026, 3, 27, 16, 30, tzinfo=timezone.utc)
         assert strategy._should_enter(now) is False
 
-    def test_compute_quantity_uses_leverage_and_margin_cap(self, client, pos_mgr, storage):
-        cfg = StrategyConfig(underlying="BTC", leverage=6.0, compound=True)
+    def test_compute_quantity_uses_fixed_quantity(self, client, pos_mgr, storage):
+        cfg = StrategyConfig(underlying="BTC", quantity=5.0, leverage=6.0, compound=False)
         strategy = WeekendVolStrategy(client, pos_mgr, storage, cfg)
 
-        sell_call = _make_ticker("BTC-260329-96000-C", 96000.0, "call", bid=90.0, ask=100.0, mark=95.0)
-        sell_put = _make_ticker("BTC-260329-84000-P", 84000.0, "put", bid=95.0, ask=105.0, mark=100.0)
+        sell_call = _make_ticker("BTC-29MAR26-96000-C", 96000.0, "call", bid=90.0, ask=100.0, mark=95.0)
+        sell_put = _make_ticker("BTC-29MAR26-84000-P", 84000.0, "put", bid=95.0, ask=105.0, mark=100.0)
 
         qty = strategy._compute_quantity(90000.0, sell_call=sell_call, sell_put=sell_put)
-        assert qty > 0
-        assert qty <= 0.7
+        assert qty == pytest.approx(5.0)
+
+    def test_margin_estimator_uses_exchange_config(self):
+        sell_call = _make_ticker("BTC-29MAR26-96000-C", 96000.0, "call", bid=90.0, ask=100.0, mark=95.0)
+        sell_put = _make_ticker("BTC-29MAR26-84000-P", 84000.0, "put", bid=95.0, ask=105.0, mark=100.0)
+        exchange_cfg = ExchangeConfig()
+
+        margin = estimate_bybit_combo_open_margin_per_unit(
+            index_price=90000.0,
+            sell_call=sell_call,
+            sell_put=sell_put,
+            exchange_cfg=exchange_cfg,
+        )
+        assert margin > 0
 
     def test_status_reports_weekend_vol_fields(self, client, pos_mgr, storage):
         cfg = StrategyConfig(underlying="BTC", target_delta=0.45, wing_delta=0.0)

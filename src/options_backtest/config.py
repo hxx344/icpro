@@ -17,7 +17,7 @@ class BacktestConfig(BaseModel):
     end_date: str = "2025-12-31"
     time_step: str = "1h"
     underlying: str = "BTC"
-    margin_mode: str = "USD"  # "USD" (Binance USDT) | "coin" (Deribit inverse)
+    margin_mode: str = "USD"  # "USD" (USDT-style margin) | "coin" (Deribit inverse)
     use_bs_only: bool = False
     option_data_source: str = "auto"  # auto | market_data | options_hourly
     option_snapshot_pick: str = "close"  # open | close

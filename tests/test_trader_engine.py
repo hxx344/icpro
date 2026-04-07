@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from trader.binance_client import BinanceOptionsClient, AccountInfo
+from trader.bybit_client import BybitOptionsClient, AccountInfo
 from trader.config import TraderConfig, ExchangeConfig, StrategyConfig, StorageConfig, MonitorConfig
 from trader.engine import TradingEngine, get_engine, reset_engine
 from trader.equity import EquityTracker
@@ -65,7 +65,7 @@ def storage(tmp_path):
 
 @pytest.fixture
 def mock_client():
-    client = MagicMock(spec=BinanceOptionsClient)
+    client = MagicMock(spec=BybitOptionsClient)
     client.get_account.return_value = AccountInfo(
         total_balance=10.0, available_balance=8.0,
         unrealized_pnl=0.0, raw={"simulated": True},
@@ -201,7 +201,7 @@ class TestTradingEngine:
 
     def test_shutdown_cleans_resources_on_snapshot_error(self, sim_config):
         engine = TradingEngine(sim_config)
-        engine.client = MagicMock(spec=BinanceOptionsClient)
+        engine.client = MagicMock(spec=BybitOptionsClient)
         engine.client.get_account.return_value = AccountInfo(
             total_balance=10.0,
             available_balance=8.0,
@@ -385,7 +385,7 @@ class TestEngineEquityIntegration:
         sim_config.storage.db_path = str(tmp_path / "recover.db")
         sim_config.strategy.underlying = "ETH"
 
-        client = MagicMock(spec=BinanceOptionsClient)
+        client = MagicMock(spec=BybitOptionsClient)
         client.get_account.return_value = AccountInfo(
             total_balance=10.0,
             available_balance=8.0,
@@ -401,7 +401,7 @@ class TestEngineEquityIntegration:
             {"symbol": f"ETH-{expiry_code}-2300-P", "side": "SHORT", "quantity": -0.5, "entryPrice": 50.0, "unrealizedPnl": 1.0},
         ]
 
-        with patch("trader.engine.BinanceOptionsClient", return_value=client):
+        with patch("trader.engine.BybitOptionsClient", return_value=client):
             engine = TradingEngine(sim_config)
             assert engine.start() is True
             time.sleep(0.5)

@@ -14,10 +14,9 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from trader.binance_client import BinanceOptionsClient
+from trader.bybit_client import BybitOptionsClient
 from trader.config import TraderConfig
 from trader.equity import EquityTracker
-from trader.limit_chaser import ChaserConfig as _ChaserConfig
 from trader.position_manager import PositionManager
 from trader.storage import Storage
 from trader.strategy import WeekendVolStrategy
@@ -58,8 +57,8 @@ class TradingEngine:
         self._last_error: Optional[str] = None
         self._error_count = 0
 
-        # Exchange client (Binance USD margin)
-        self.client: Optional[BinanceOptionsClient] = None
+        # Exchange client (Bybit Unified options)
+        self.client: Optional[BybitOptionsClient] = None
         self.pos_mgr: Optional[PositionManager] = None
         self.strategy: Optional[Any] = None
         self.equity_tracker: Optional[EquityTracker] = None
@@ -211,22 +210,15 @@ class TradingEngine:
 
         self.storage = Storage(self.cfg.storage.db_path)
 
-        self.client = BinanceOptionsClient(self.cfg.exchange)
+        self.client = BybitOptionsClient(self.cfg.exchange)
         logger.info(
-            f"Binance client: "
+            f"Bybit client: "
             f"{'TESTNET' if self.cfg.exchange.testnet else 'PRODUCTION'}"
         )
 
         self.pos_mgr = PositionManager(
             self.client,
             self.storage,
-            chaser_config=_ChaserConfig(
-                window_seconds=self.cfg.chaser.window_seconds,
-                poll_interval_sec=self.cfg.chaser.poll_interval_sec,
-                tick_size_usdt=self.cfg.chaser.tick_size_usdt,
-                market_fallback_sec=self.cfg.chaser.market_fallback_sec,
-                max_amend_attempts=self.cfg.chaser.max_amend_attempts,
-            ),
         )
 
         self.strategy = WeekendVolStrategy(

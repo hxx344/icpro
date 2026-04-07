@@ -92,7 +92,7 @@ def _auto_load_dotenv(config_path: Path | None) -> None:
 
 @dataclass
 class ExchangeConfig:
-    """Exchange API connection settings (Binance USD margin)."""
+    """Exchange API connection settings (Bybit Unified options)."""
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = False
@@ -100,15 +100,21 @@ class ExchangeConfig:
     timeout: int = 15
     account_currency: str = "USDT"
     simulate_private: bool = False
+    option_maker_fee_rate: float = 0.0002
+    option_taker_fee_rate: float = 0.0003
+    option_fee_cap_ratio: float = 0.07
+    short_option_margin_ratio: float = 0.10
+    short_option_otm_deduction_ratio: float = 0.08
+    short_option_min_margin_ratio: float = 0.05
 
     def __post_init__(self):
-        self.api_key = os.environ.get("BINANCE_API_KEY", self.api_key)
-        self.api_secret = os.environ.get("BINANCE_API_SECRET", self.api_secret)
+        self.api_key = os.environ.get("BYBIT_API_KEY", self.api_key)
+        self.api_secret = os.environ.get("BYBIT_API_SECRET", self.api_secret)
         if not self.base_url:
             self.base_url = (
-                "https://testnet.binancefuture.com"
+                "https://api-testnet.bybit.com"
                 if self.testnet
-                else "https://eapi.binance.com"
+                else "https://api.bybit.com"
             )
 
 
@@ -127,7 +133,7 @@ class StrategyConfig:
     target_delta: float = 0.45           # |delta| for short legs
     wing_delta: float = 0.0              # |delta| for protection legs (0 = no wings)
     max_delta_diff: float = 0.15         # max allowed |actual_delta-target_delta|
-    leverage: float = 3.0                # notional leverage multiplier
+    leverage: float = 1.0                # preview-only leverage label, fixed-size mode no longer compounds
     entry_day: str = "friday"           # day of week to enter (lowercase)
     default_iv: float = 0.60             # fallback IV if mark_iv unavailable
     entry_realized_vol_lookback_hours: int = 24  # realized vol lookback in hours (0=off)
@@ -135,9 +141,9 @@ class StrategyConfig:
     stop_loss_pct: float = 200.0         # close all when basket pnl% <= -stop_loss_pct
     stop_loss_underlying_move_pct: float = 5.0  # require one-way underlying move >= pct before stop loss can fire
     entry_time_utc: str = "18:00"       # entry at HH:MM UTC
-    quantity: float = 0.01               # used when compound=False
+    quantity: float = 5.0                # fixed option size, editable in dashboard
     max_positions: int = 1               # max concurrent positions
-    compound: bool = True                # scale quantity to equity
+    compound: bool = False               # deprecated: fixed-size mode only
 
 
 @dataclass
@@ -159,25 +165,13 @@ class MonitorConfig:
 
 
 @dataclass
-class ChaserConfig:
-    """Spread-gated market execution settings."""
-    window_seconds: int = 600           # 10 minutes total window
-    poll_interval_sec: int = 30         # check / amend every 30 seconds
-    tick_size_usdt: float = 5.0         # min price increment in USD
-    market_fallback_sec: int = 60       # switch to market order last N seconds
-    market_trigger_spread_ticks: int = 1  # trigger market when all legs spread <= N ticks
-    max_amend_attempts: int = 30        # safety cap on re-pricing loops
-
-
-@dataclass
 class TraderConfig:
     """Top-level trader configuration."""
-    name: str = "Weekend Vol BTC (Binance 3x USD)"
+    name: str = "Weekend Vol BTC (Bybit Fixed Size)"
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
-    chaser: ChaserConfig = field(default_factory=ChaserConfig)
 
 
 
@@ -217,8 +211,8 @@ def _validate_config(cfg: TraderConfig) -> None:
         raise ValueError("strategy.leverage must be > 0")
     if cfg.strategy.quantity < 0:
         raise ValueError("strategy.quantity must be >= 0")
-    if not cfg.strategy.compound and cfg.strategy.quantity <= 0:
-        raise ValueError("strategy.quantity must be > 0 when strategy.compound is false")
+    if cfg.strategy.quantity <= 0:
+        raise ValueError("strategy.quantity must be > 0 in fixed-size mode")
     if cfg.strategy.max_positions < 1:
         raise ValueError("strategy.max_positions must be >= 1")
     if cfg.strategy.default_iv <= 0:
@@ -236,27 +230,24 @@ def _validate_config(cfg: TraderConfig) -> None:
 
     if cfg.exchange.timeout < 1:
         raise ValueError("exchange.timeout must be >= 1")
+    if cfg.exchange.option_maker_fee_rate < 0:
+        raise ValueError("exchange.option_maker_fee_rate must be >= 0")
+    if cfg.exchange.option_taker_fee_rate < 0:
+        raise ValueError("exchange.option_taker_fee_rate must be >= 0")
+    if cfg.exchange.option_fee_cap_ratio <= 0:
+        raise ValueError("exchange.option_fee_cap_ratio must be > 0")
+    if cfg.exchange.short_option_margin_ratio <= 0:
+        raise ValueError("exchange.short_option_margin_ratio must be > 0")
+    if cfg.exchange.short_option_otm_deduction_ratio < 0:
+        raise ValueError("exchange.short_option_otm_deduction_ratio must be >= 0")
+    if cfg.exchange.short_option_min_margin_ratio < 0:
+        raise ValueError("exchange.short_option_min_margin_ratio must be >= 0")
     if cfg.monitor.check_interval_sec < 1:
         raise ValueError("monitor.check_interval_sec must be >= 1")
     if cfg.monitor.heartbeat_interval_sec < 1:
         raise ValueError("monitor.heartbeat_interval_sec must be >= 1")
     if cfg.monitor.equity_snapshot_interval_sec < 1:
         raise ValueError("monitor.equity_snapshot_interval_sec must be >= 1")
-
-    if cfg.chaser.window_seconds <= 0:
-        raise ValueError("chaser.window_seconds must be > 0")
-    if cfg.chaser.poll_interval_sec <= 0:
-        raise ValueError("chaser.poll_interval_sec must be > 0")
-    if cfg.chaser.tick_size_usdt <= 0:
-        raise ValueError("chaser.tick_size_usdt must be > 0")
-    if cfg.chaser.market_fallback_sec < 0:
-        raise ValueError("chaser.market_fallback_sec must be >= 0")
-    if cfg.chaser.market_fallback_sec >= cfg.chaser.window_seconds:
-        raise ValueError("chaser.market_fallback_sec must be smaller than window_seconds")
-    if cfg.chaser.market_trigger_spread_ticks < 1:
-        raise ValueError("chaser.market_trigger_spread_ticks must be >= 1")
-    if cfg.chaser.max_amend_attempts < 1:
-        raise ValueError("chaser.max_amend_attempts must be >= 1")
 
     if not str(cfg.storage.db_path).strip():
         raise ValueError("storage.db_path must not be empty")
@@ -294,7 +285,6 @@ def load_config(path: str | Path | None = None) -> TraderConfig:
             _merge_section(cfg.strategy, raw.get("strategy"))
             _merge_section(cfg.storage, raw.get("storage"))
             _merge_section(cfg.monitor, raw.get("monitor"))
-            _merge_section(cfg.chaser, raw.get("chaser"))
 
             # If YAML did not explicitly set base_url, clear it so
             # __post_init__ recalculates from the (possibly changed) testnet flag.

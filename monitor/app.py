@@ -1,6 +1,6 @@
 """Options Monitor Dashboard – 期权行情监控面板.
 
-实时监控 Deribit / OKX / Binance 的期权行情，
+实时监控 Deribit / OKX 的期权行情，
 标记最高 APR 的 Short Put (SP) 和 Covered Call (CC) 机会，
 并给出收益预估。
 
@@ -142,8 +142,8 @@ def main() -> None:
     )
     sel_exchanges = st.sidebar.multiselect(
         "交易所",
-        ["Deribit", "OKX", "Binance"],
-        default=["Deribit", "OKX", "Binance"],
+        ["Deribit", "OKX"],
+        default=["Deribit", "OKX"],
     )
     sel_strategy = st.sidebar.selectbox(
         "策略类型",
@@ -186,7 +186,7 @@ def main() -> None:
     )
 
     st.title("📊 期权行情监控面板")
-    st.caption("实时对比 Deribit / OKX / Binance 期权，寻找最佳 CC/SP 机会")
+    st.caption("实时对比 Deribit / OKX 期权，寻找最佳 CC/SP 机会")
 
     col_fetch, col_time = st.columns([1, 3])
     with col_fetch:

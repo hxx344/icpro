@@ -65,9 +65,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from trader.config import load_config
 from trader.storage import Storage
 from trader.engine import get_engine, reset_engine, TradingEngine
-from trader.binance_client import BinanceOptionsClient, OptionTicker
+from trader.bybit_client import BybitOptionsClient, OptionTicker
 from trader.position_manager import PositionManager, OptionPosition, PositionLeg
-from trader.limit_chaser import ChaserConfig as DashboardChaserConfig
 from trader.order_preview import compute_option_order_preview
 
 # ---------------------------------------------------------------------------
@@ -423,7 +422,6 @@ def _start_test_order_task(
     task_id: str,
     exchange_cfg,
     storage: Storage,
-    chaser_cfg,
     order_params: dict,
     engine_ref: TradingEngine,
     attach_to_engine_for_stop_loss: bool = False,
@@ -537,23 +535,15 @@ def _start_test_order_task(
                 message="正在初始化测试下单任务",
                 percent=0,
             )
-            task_client = BinanceOptionsClient(exchange_cfg)
+            task_client = BybitOptionsClient(exchange_cfg)
             task_pos_mgr = PositionManager(
                 task_client,
                 storage,
-                chaser_config=DashboardChaserConfig(
-                    window_seconds=chaser_cfg.window_seconds,
-                    poll_interval_sec=chaser_cfg.poll_interval_sec,
-                    tick_size_usdt=chaser_cfg.tick_size_usdt,
-                    market_fallback_sec=chaser_cfg.market_fallback_sec,
-                    max_amend_attempts=chaser_cfg.max_amend_attempts,
-                ),
             )
 
             _is_strangle = not order_params.get("buy_call_symbol") and not order_params.get("buy_put_symbol")
             if _is_strangle:
                 position = task_pos_mgr.open_short_strangle(
-                    execution_mode="market",
                     status_callback=_on_progress,
                     sell_call_symbol=order_params["sell_call_symbol"],
                     sell_put_symbol=order_params["sell_put_symbol"],
@@ -564,7 +554,6 @@ def _start_test_order_task(
                 )
             else:
                 position = task_pos_mgr.open_winged_position(
-                    execution_mode="market",
                     status_callback=_on_progress,
                     **order_params,
                 )
@@ -886,8 +875,8 @@ if page == "📊 总览":
     st.title("📊 策略总览")
 
     @st.cache_resource
-    def _get_client(_exchange_cfg) -> BinanceOptionsClient:
-        return BinanceOptionsClient(_exchange_cfg)
+    def _get_client(_exchange_cfg) -> BybitOptionsClient:
+        return BybitOptionsClient(_exchange_cfg)
 
     client = _get_client(cfg.exchange)
 
@@ -1191,8 +1180,8 @@ elif page == "📈 资产曲线":
 
     # 手动刷新实时权益快照；避免每次切页都同步请求交易所导致页面卡顿
     @st.cache_resource
-    def _get_client_eq(_exchange_cfg) -> BinanceOptionsClient:
-        return BinanceOptionsClient(_exchange_cfg)
+    def _get_client_eq(_exchange_cfg) -> BybitOptionsClient:
+        return BybitOptionsClient(_exchange_cfg)
 
     _eq_client = _get_client_eq(cfg.exchange)
     _eq_has_creds = bool(cfg.exchange.api_key and cfg.exchange.api_secret)
@@ -1658,13 +1647,20 @@ elif page == "🔧 策略配置":
                 ed_entry_time = st.time_input("开仓时间 (UTC)", value=_entry_time, step=_dt.timedelta(minutes=1), help="每周 weekend_vol 开仓的 UTC 时间（精确到分钟）")
 
             with s_col2:
-                ed_quantity = st.number_input("基础数量", min_value=0.0, max_value=100.0, value=float(_strategy.get("quantity", 0.01)), step=0.01, format="%.3f", help="仅在关闭复利时使用")
-                st.caption("复利模式开启时，该值仅作为展示，不参与 weekend_vol 实盘仓位计算。")
+                ed_quantity = st.number_input("固定数量 (张)", min_value=0.0, max_value=100.0, value=float(_strategy.get("quantity", 5.0)), step=0.1, format="%.3f", help="Bybit 实盘固定下单数量，可直接在前端修改")
+                st.caption("当前策略已改为固定数量模式，前端修改后保存即可生效。")
                 ed_max_pos = st.number_input("最大持仓组数", min_value=1, max_value=20, value=_strategy.get("max_positions", 1), step=1)
 
             with s_col3:
-                ed_compound = st.checkbox("复利模式", value=_strategy.get("compound", True), help="根据账户权益自动调整下单数量")
-                st.caption("开启复利后，数量按 实时权益 × 杠杆 ÷ 现货价格 估算，并受保证金上限约束。")
+                st.info("固定数量模式")
+                st.caption("复利已停用；仓位大小完全由“固定数量 (张)”控制。")
+                st.markdown("**▸ Bybit 手续费 / 保证金参数**")
+                ed_maker_fee_rate = st.number_input("Maker 费率", min_value=0.0, max_value=0.01, value=float(_exchange.get("option_maker_fee_rate", 0.0002)), step=0.0001, format="%.4f")
+                ed_taker_fee_rate = st.number_input("Taker 费率", min_value=0.0, max_value=0.01, value=float(_exchange.get("option_taker_fee_rate", 0.0003)), step=0.0001, format="%.4f")
+                ed_fee_cap_ratio = st.number_input("手续费上限系数", min_value=0.0, max_value=1.0, value=float(_exchange.get("option_fee_cap_ratio", 0.07)), step=0.01, format="%.2f")
+                ed_short_margin_ratio = st.number_input("空头保证金比率", min_value=0.0, max_value=1.0, value=float(_exchange.get("short_option_margin_ratio", 0.10)), step=0.01, format="%.2f")
+                ed_short_otm_deduction_ratio = st.number_input("OTM 抵扣比率", min_value=0.0, max_value=1.0, value=float(_exchange.get("short_option_otm_deduction_ratio", 0.08)), step=0.01, format="%.2f")
+                ed_short_min_margin_ratio = st.number_input("最小保证金比率", min_value=0.0, max_value=1.0, value=float(_exchange.get("short_option_min_margin_ratio", 0.05)), step=0.01, format="%.2f")
 
             st.divider()
             st.subheader("🔌 API & 运行参数")
@@ -1702,6 +1698,12 @@ elif page == "🔧 策略配置":
                     "timeout": ed_timeout,
                     "account_currency": _exchange.get("account_currency", "USDT"),
                     "simulate_private": _exchange.get("simulate_private", False),
+                    "option_maker_fee_rate": round(float(ed_maker_fee_rate), 6),
+                    "option_taker_fee_rate": round(float(ed_taker_fee_rate), 6),
+                    "option_fee_cap_ratio": round(float(ed_fee_cap_ratio), 4),
+                    "short_option_margin_ratio": round(float(ed_short_margin_ratio), 4),
+                    "short_option_otm_deduction_ratio": round(float(ed_short_otm_deduction_ratio), 4),
+                    "short_option_min_margin_ratio": round(float(ed_short_min_margin_ratio), 4),
                 },
                 "strategy": {
                     "mode": "weekend_vol",
@@ -1718,7 +1720,7 @@ elif page == "🔧 策略配置":
                     "entry_time_utc": ed_entry_time.strftime("%H:%M"),
                     "quantity": round(float(ed_quantity), 4),
                     "max_positions": ed_max_pos,
-                    "compound": ed_compound,
+                    "compound": False,
                 },
                 "storage": {
                     "db_path": ed_db_path,
@@ -1760,8 +1762,8 @@ elif page == "🔧 策略配置":
     st.subheader(f"📋 下单预览 ({_pv_mode_label})（实时行情）")
 
     @st.cache_resource
-    def _get_client_preview(_exchange_cfg) -> BinanceOptionsClient:
-        return BinanceOptionsClient(_exchange_cfg)
+    def _get_client_preview(_exchange_cfg) -> BybitOptionsClient:
+        return BybitOptionsClient(_exchange_cfg)
 
     _pv_client = _get_client_preview(cfg.exchange)
 
@@ -1904,32 +1906,32 @@ elif page == "🔧 策略配置":
                 _base_qty = float(getattr(cfg.strategy, "quantity", 0.0) or 0.0)
                 _pv_equity = 0.0
                 _pv_available = 0.0
-                _pv_equity_src = "自动仓位" if cfg.strategy.compound else "配置基础数量"
-                if cfg.strategy.compound:
-                    try:
-                        _pv_acct = _pv_client.get_account()
-                        _pv_equity = _pv_acct.total_balance
-                        _pv_available = max(float(getattr(_pv_acct, "available_balance", 0.0) or 0.0), 0.0)
-                    except Exception:
-                        _pv_equity_src = "权益获取失败, 用基础数量"
+                _pv_equity_src = "固定数量配置"
+                try:
+                    _pv_acct = _pv_client.get_account()
+                    _pv_equity = _pv_acct.total_balance
+                    _pv_available = max(float(getattr(_pv_acct, "available_balance", 0.0) or 0.0), 0.0)
+                except Exception:
+                    pass
 
                 _preview = compute_option_order_preview(
                     spot=_pv_spot,
                     base_quantity=_base_qty,
-                    compound=cfg.strategy.compound,
+                    compound=False,
                     equity=_pv_equity,
                     available_balance=_pv_available,
                     leverage=getattr(cfg.strategy, "leverage", 1.0),
+                    exchange_cfg=cfg.exchange,
                     sell_call=_sell_call_t,
                     sell_put=_sell_put_t,
                     buy_call=_buy_call_t,
                     buy_put=_buy_put_t,
                 )
                 _pv_qty = float(_preview["quantity"])
-                _pv_equity_src = _preview["equity_source"] if _pv_equity_src != "权益获取失败, 用基础数量" else _pv_equity_src
+                _pv_equity_src = _preview["equity_source"]
                 _margin_per = float(_preview["margin_per_unit"])
 
-                # Prices in USD (Binance option native quote unit)
+                # Prices in USD (Bybit option native quote unit)
                 _preview_fallback_iv = getattr(cfg.strategy, "default_iv", 0.60)
                 _sc_bid = _sell_call_t.bid_price
                 _sc_ask = _sell_call_t.ask_price
@@ -1983,7 +1985,7 @@ elif page == "🔧 策略配置":
                 _pv_ok = True
 
                 # ---- Display ----
-                st.caption(f"数据来源: Binance 实时行情 | {_pv_equity_src} | {_dte_label_str}")
+                st.caption(f"数据来源: Bybit 实时行情 | {_pv_equity_src} | {_dte_label_str}")
 
                 # KPI row
                 kc1, kc2, kc3, kc4 = st.columns(4)
@@ -2172,7 +2174,6 @@ elif page == "🔧 策略配置":
                         _new_task_id,
                         cfg.exchange,
                         storage,
-                        cfg.chaser,
                         {
                             "sell_call_symbol": _sell_call.symbol,
                             "buy_call_symbol": _buy_call.symbol if _buy_call else None,
@@ -2518,7 +2519,7 @@ elif page == "🔧 策略配置":
                             f"Short Put:  {_sell_put.symbol}  K=${_sell_put.strike:,.0f}\n"
                             f"Short Call: {_sell_call.symbol}  K=${_sell_call.strike:,.0f}\n"
                             f"───────────────────────────────\n"
-                            f"数量: {_pv_qty:.2f} 张  (base={_base_qty}, compound={cfg.strategy.compound})\n"
+                            f"数量: {_pv_qty:.2f} 张  (fixed={_base_qty})\n"
                             f"权益: ${_pv_equity:,.2f}  leverage: {getattr(cfg.strategy, 'leverage', 1.0):.1f}x\n"
                             f"估算保证金: ${_margin_used:,.0f}\n"
                             f"───────────────────────────────\n"
@@ -2548,7 +2549,7 @@ elif page == "🔧 策略配置":
                             f"Put侧翼宽:  ${_put_width:,.0f}\n"
                             f"Call侧翼宽: ${_call_width:,.0f}\n"
                             f"───────────────────────────────\n"
-                            f"数量: {_pv_qty:.2f} 张  (base={_base_qty}, compound={cfg.strategy.compound})\n"
+                            f"数量: {_pv_qty:.2f} 张  (fixed={_base_qty})\n"
                             f"权益: ${_pv_equity:,.2f}  leverage: {getattr(cfg.strategy, 'leverage', 1.0):.1f}x\n"
                             f"保证金: ${_margin_used:,.0f}{_margin_pct_str}\n"
                             f"───────────────────────────────\n"
@@ -2917,7 +2918,7 @@ elif page == "🖥 引擎状态":
     run_info = {
         "配置项": [
             "策略名", "模式", "结构", "标的", "短腿 |Δ|", "翼 |Δ|",
-            "杠杆", "开仓日/时间", "RV过滤", "止损", "基础数量", "复利", "API环境", "检查间隔",
+            "杠杆", "开仓日/时间", "RV过滤", "止损", "固定数量", "模式", "API环境", "检查间隔",
         ],
         "值": [
             cfg.name,
@@ -2945,7 +2946,7 @@ elif page == "🖥 引擎状态":
                 else "关闭"
             ),
             str(cfg.strategy.quantity),
-            "✅" if cfg.strategy.compound else "❌",
+            "固定数量",
             "测试网" if cfg.exchange.testnet else "正式环境",
             f"{cfg.monitor.check_interval_sec}s",
         ],
