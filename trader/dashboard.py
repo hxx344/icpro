@@ -1793,6 +1793,27 @@ elif page == "🔧 策略配置":
         _active_dte_label_str = _active_expiry_target.label
         _test_order_used_friday_fallback = _active_expiry_target.is_fallback and bool(_active_expiry_target.tickers)
 
+        def _render_available_expiry_panel() -> None:
+            with st.expander("查看 Bybit 当前可用到期日", expanded=True):
+                st.caption(f"Bybit 返回期权 ticker 数量: {len(_pv_tickers)}")
+                if _available_expiry_summaries:
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "到期日": _row.label,
+                                    "合约数量": _row.contract_count,
+                                }
+                                for _row in _available_expiry_summaries
+                            ]
+                        ),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                else:
+                    st.warning("当前未从 Bybit 获取到任何可用期权到期日。")
+                    st.caption("这通常表示：接口没返回期权 ticker、网络受限、API 网关异常，或当前标的没有拉到期权行情。")
+
         if _pv_spot > 0 and _pv_today:
             # --- Strike selection ---
             _sell_call: OptionTicker | None = None
@@ -1997,23 +2018,7 @@ elif page == "🔧 策略配置":
                     f"原始周日目标: {_dte_label_str}"
                 )
                 st.caption(f"数据来源: Bybit 实时行情 | {_pv_equity_src} | {_active_dte_label_str}")
-                with st.expander("查看 Bybit 当前可用到期日", expanded=False):
-                    if _available_expiry_summaries:
-                        st.dataframe(
-                            pd.DataFrame(
-                                [
-                                    {
-                                        "到期日": _row.label,
-                                        "合约数量": _row.contract_count,
-                                    }
-                                    for _row in _available_expiry_summaries
-                                ]
-                            ),
-                            width="stretch",
-                            hide_index=True,
-                        )
-                    else:
-                        st.caption("当前未从 Bybit 获取到可用期权到期日。")
+                _render_available_expiry_panel()
 
                 # KPI row
                 kc1, kc2, kc3, kc4 = st.columns(4)
@@ -2597,11 +2602,7 @@ elif page == "🔧 策略配置":
                     )
                 else:
                     st.warning(f"⚠️ 无法找到完整的合约腿 ({_active_dte_label_str}，共 {len(_pv_today)} 个 ticker)")
-                if _available_expiry_summaries:
-                    st.caption(
-                        "Bybit 当前可用到期日: "
-                        + " | ".join(f"{_row.label} × {_row.contract_count}" for _row in _available_expiry_summaries[:8])
-                    )
+                _render_available_expiry_panel()
         else:
             if _pv_spot <= 0:
                 st.warning("⚠️ 无法获取现货价格")
@@ -2615,11 +2616,7 @@ elif page == "🔧 策略配置":
                     st.warning(
                         f"⚠️ 目标合约不可用 ({_dte_label_str})，且最近周五到期合约也不可用"
                     )
-                if _available_expiry_summaries:
-                    st.caption(
-                        "Bybit 当前可用到期日: "
-                        + " | ".join(f"{_row.label} × {_row.contract_count}" for _row in _available_expiry_summaries[:8])
-                    )
+                _render_available_expiry_panel()
     except Exception as _pv_ex:
         st.error(f"下单预览失败: {_pv_ex}")
         import traceback

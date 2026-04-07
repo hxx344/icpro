@@ -116,7 +116,7 @@ MONTH_MAP = {
 }
 
 BYBIT_SYMBOL_RE = re.compile(
-    r"^(?P<ul>[A-Z]+)-(?P<day>\d{1,2})(?P<mon>[A-Z]{3})(?P<yy>\d{2})-(?P<strike>\d+(?:\.\d+)?)-(?P<cp>[CP])$"
+    r"^(?P<ul>[A-Z]+)-(?P<day>\d{1,2})(?P<mon>[A-Z]{3})(?P<yy>\d{2})-(?P<strike>\d+(?:\.\d+)?)-(?P<cp>[CP])(?:-(?P<settle>[A-Z]+))?$"
 )
 
 LEGACY_SYMBOL_RE = re.compile(

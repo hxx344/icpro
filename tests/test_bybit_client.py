@@ -37,12 +37,29 @@ def test_parse_symbol_put():
     assert result["option_type"] == "put"
 
 
+def test_parse_symbol_with_usdt_suffix():
+    result = _parse_symbol("BTC-10APR26-71500-C-USDT")
+    assert result is not None
+    assert result["underlying"] == "BTC"
+    assert result["strike"] == 71500.0
+    assert result["option_type"] == "call"
+
+
 def test_symbol_regex_matches_bybit_format():
     match = BYBIT_SYMBOL_RE.match("ETH-21MAR26-2000-C")
     assert match is not None
     assert match.group("day") == "21"
     assert match.group("mon") == "MAR"
     assert match.group("yy") == "26"
+
+
+def test_symbol_regex_matches_bybit_usdt_suffix_format():
+    match = BYBIT_SYMBOL_RE.match("BTC-10APR26-71500-C-USDT")
+    assert match is not None
+    assert match.group("day") == "10"
+    assert match.group("mon") == "APR"
+    assert match.group("yy") == "26"
+    assert match.group("settle") == "USDT"
 
 
 def test_default_base_url(default_config):
@@ -135,3 +152,37 @@ def test_private_get_signature_uses_request_param_order():
     sign_mock.assert_called_once_with("category=option&baseCoin=BTC", 1700000000123)
     client.session.get.assert_called_once()
     assert client.session.get.call_args.kwargs["params"] == {"category": "option", "baseCoin": "BTC"}
+
+
+def test_get_tickers_parses_bybit_symbols_with_usdt_suffix():
+    client = BybitOptionsClient(ExchangeConfig(api_key="", api_secret="", simulate_private=False))
+    with patch.object(
+        client,
+        "_public_get",
+        return_value={
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "symbol": "BTC-10APR26-71500-C-USDT",
+                        "bid1Price": "210",
+                        "ask1Price": "215",
+                        "lastPrice": "225",
+                        "markPrice": "211.42504496",
+                        "indexPrice": "68487.87279437",
+                        "markIv": "0.466",
+                        "underlyingPrice": "68490.28",
+                        "openInterest": "18.22",
+                        "volume24h": "28.18",
+                        "delta": "0.14951735",
+                    }
+                ]
+            },
+        },
+    ):
+        tickers = client.get_tickers("BTC")
+
+    assert len(tickers) == 1
+    assert tickers[0].symbol == "BTC-10APR26-71500-C-USDT"
+    assert tickers[0].strike == pytest.approx(71500.0)
+    assert tickers[0].underlying == "BTC"
