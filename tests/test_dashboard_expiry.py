@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from trader.bybit_client import OptionTicker
-from trader.dashboard_expiry import nearest_weekday_expiry, resolve_test_order_expiry_target
+from trader.dashboard_expiry import nearest_weekday_expiry, resolve_test_order_expiry_target, summarize_available_expiries
 
 
 def _make_ticker(symbol: str, expiry: datetime) -> OptionTicker:
@@ -73,3 +73,19 @@ def test_resolve_test_order_expiry_target_uses_nearest_available_friday_expiry()
     assert selected.expiry == later_friday_expiry
     assert friday_target.expiry == later_friday_expiry
     assert selected.tickers[0].symbol == "BTC-16JAN26-100000-C"
+
+
+def test_summarize_available_expiries_returns_sorted_counts() -> None:
+    first_expiry = datetime(2026, 1, 9, 8, 0, tzinfo=timezone.utc)
+    second_expiry = datetime(2026, 1, 11, 8, 0, tzinfo=timezone.utc)
+    tickers = [
+        _make_ticker("BTC-11JAN26-100000-C", second_expiry),
+        _make_ticker("BTC-09JAN26-90000-P", first_expiry),
+        _make_ticker("BTC-09JAN26-100000-C", first_expiry),
+    ]
+
+    rows = summarize_available_expiries(tickers)
+
+    assert [row.expiry for row in rows] == [first_expiry, second_expiry]
+    assert [row.contract_count for row in rows] == [2, 1]
+    assert rows[0].label.startswith("2026-01-09 08:00 UTC")

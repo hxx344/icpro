@@ -14,6 +14,13 @@ class ExpiryTickerTarget:
     is_fallback: bool = False
 
 
+@dataclass(frozen=True)
+class ExpirySummary:
+    expiry: datetime
+    label: str
+    contract_count: int
+
+
 def nearest_weekday_expiry(now_utc: datetime, weekday: int, hour_utc: int = 8) -> datetime:
     """Return the nearest upcoming weekday expiry timestamp at the given UTC hour."""
     if now_utc.tzinfo is None:
@@ -43,6 +50,21 @@ def _distinct_expiries(tickers: list[OptionTicker]) -> list[datetime]:
     for ticker in tickers:
         seen.setdefault(ticker.expiry, None)
     return sorted(seen)
+
+
+def summarize_available_expiries(tickers: list[OptionTicker]) -> list[ExpirySummary]:
+    counts: dict[datetime, int] = {}
+    for ticker in tickers:
+        counts[ticker.expiry] = counts.get(ticker.expiry, 0) + 1
+
+    return [
+        ExpirySummary(
+            expiry=expiry,
+            label=f"{expiry.strftime('%Y-%m-%d %H:%M')} UTC ({expiry.strftime('%A')})",
+            contract_count=counts[expiry],
+        )
+        for expiry in sorted(counts)
+    ]
 
 
 def _nearest_available_expiry(
