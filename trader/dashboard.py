@@ -2305,6 +2305,25 @@ elif page == "🔧 策略配置":
                                         for item in _blockers[:3]
                                     )
                                 )
+                            _market_snapshots = _progress.get("market_snapshots") or []
+                            if _market_snapshots:
+                                st.dataframe(
+                                    pd.DataFrame(
+                                        [
+                                            {
+                                                "腿": item.get("leg_role") or "-",
+                                                "合约": item.get("symbol") or "-",
+                                                "方向": item.get("side") or "-",
+                                                "当前价差": f"{float(item.get('spread') or 0.0):.1f}",
+                                                "当前深度": f"{float(item.get('available_qty') or 0.0):.3f}",
+                                                "状态": "阻塞中" if item.get("blocked") else "已满足",
+                                            }
+                                            for item in _market_snapshots
+                                        ]
+                                    ),
+                                    width="stretch",
+                                    hide_index=True,
+                                )
                         if _state in {"queued", "running"}:
                             st.info(_message)
                         elif _state == "success":
@@ -2841,6 +2860,25 @@ elif page == "🖥 引擎状态":
                         f"{blocker.get('symbol')}: 价差 {float(blocker.get('spread') or 0.0):.1f} / 深度 {float(blocker.get('available_qty') or 0.0):.3f}"
                         for blocker in blockers[:3]
                     )
+                )
+            market_snapshots = meta.get("market_snapshots") or []
+            if market_snapshots:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "腿": item.get("leg_role") or "-",
+                                "合约": item.get("symbol") or "-",
+                                "方向": item.get("side") or "-",
+                                "当前价差": f"{float(item.get('spread') or 0.0):.1f}",
+                                "当前深度": f"{float(item.get('available_qty') or 0.0):.3f}",
+                                "状态": "阻塞中" if item.get("blocked") else "已满足",
+                            }
+                            for item in market_snapshots
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
                 )
 
     _render_live_wait_progress()

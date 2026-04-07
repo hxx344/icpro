@@ -949,6 +949,10 @@ class TestCloseIronCondor:
         latest_wait = wait_events[-1]
         assert float(latest_wait.get("wait_progress_pct") or 0.0) >= 0.0
         assert int(latest_wait.get("blockers_count") or 0) == 1
+        snapshots = latest_wait.get("market_snapshots") or []
+        assert snapshots
+        assert snapshots[0]["symbol"] == "BTC-10APR26-68000-P-USDT"
+        assert snapshots[0]["blocked"] is True
 
 
 # ======================================================================

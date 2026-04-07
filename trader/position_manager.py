@@ -776,6 +776,18 @@ class PositionManager:
         while True:
             poll_idx += 1
             blockers, snapshots = _collect_blockers(current_max_spread)
+            market_snapshots = [
+                {
+                    "symbol": leg.symbol,
+                    "leg_role": leg.leg_role,
+                    "side": leg.side,
+                    "spread": float((snapshots.get(leg.symbol) or {}).get("spread") or 0.0),
+                    "available_qty": float((snapshots.get(leg.symbol) or {}).get("available_qty") or 0.0),
+                    "valid": bool((snapshots.get(leg.symbol) or {}).get("valid")),
+                    "blocked": any(str(item.get("symbol") or "") == leg.symbol for item in blockers),
+                }
+                for leg in legs
+            ]
 
             if not blockers:
                 return snapshots
@@ -854,6 +866,7 @@ class PositionManager:
                     poll_index=poll_idx,
                     blockers=blockers,
                     blockers_count=len(blockers),
+                    market_snapshots=market_snapshots,
                     wait_progress_pct=wait_progress_pct,
                     elapsed_wait_sec=elapsed_wait_sec,
                     stage_wait_sec=current_wait_sec,
