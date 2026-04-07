@@ -57,3 +57,19 @@ def test_resolve_test_order_expiry_target_falls_back_to_friday_when_sunday_missi
     assert selected.expiry == friday_expiry
     assert selected.tickers == friday_target.tickers
     assert selected.tickers[0].symbol == "BTC-09JAN26-100000-P"
+
+
+def test_resolve_test_order_expiry_target_uses_nearest_available_friday_expiry() -> None:
+    now_utc = datetime(2026, 1, 6, 10, 0, tzinfo=timezone.utc)  # Tuesday
+    later_friday_expiry = datetime(2026, 1, 16, 8, 0, tzinfo=timezone.utc)
+    tickers = [
+        _make_ticker("BTC-16JAN26-100000-C", later_friday_expiry),
+    ]
+
+    selected, sunday_target, friday_target = resolve_test_order_expiry_target(tickers, now_utc)
+
+    assert sunday_target.tickers == []
+    assert selected.is_fallback
+    assert selected.expiry == later_friday_expiry
+    assert friday_target.expiry == later_friday_expiry
+    assert selected.tickers[0].symbol == "BTC-16JAN26-100000-C"

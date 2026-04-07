@@ -38,6 +38,32 @@ def filter_tickers_for_expiry(
     ]
 
 
+def _distinct_expiries(tickers: list[OptionTicker]) -> list[datetime]:
+    seen: dict[datetime, None] = {}
+    for ticker in tickers:
+        seen.setdefault(ticker.expiry, None)
+    return sorted(seen)
+
+
+def _nearest_available_expiry(
+    tickers: list[OptionTicker],
+    *,
+    target_expiry: datetime,
+    weekday: int,
+) -> datetime | None:
+    candidates = [expiry for expiry in _distinct_expiries(tickers) if expiry.weekday() == weekday]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda expiry: (
+            abs((expiry - target_expiry).total_seconds()),
+            0 if expiry <= target_expiry else 1,
+            expiry,
+        ),
+    )
+
+
 def resolve_test_order_expiry_target(
     tickers: list[OptionTicker],
     now_utc: datetime,
@@ -51,10 +77,14 @@ def resolve_test_order_expiry_target(
         is_fallback=False,
     )
 
-    friday_expiry = nearest_weekday_expiry(now_utc, weekday=4)
+    friday_expiry = _nearest_available_expiry(
+        tickers,
+        target_expiry=sunday_expiry,
+        weekday=4,
+    ) or nearest_weekday_expiry(now_utc, weekday=4)
     friday_target = ExpiryTickerTarget(
         expiry=friday_expiry,
-        label=f"最近周五到期 ({friday_expiry.strftime('%Y-%m-%d %H:%M')} UTC)",
+        label=f"最近可用周五到期 ({friday_expiry.strftime('%Y-%m-%d %H:%M')} UTC)",
         tickers=filter_tickers_for_expiry(tickers, friday_expiry, tolerance_hours=tolerance_hours),
         is_fallback=True,
     )
