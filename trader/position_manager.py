@@ -1496,6 +1496,7 @@ class PositionManager:
         client_order_tag: str = "mkt",
         spread_stages: list[tuple[float, float | None]] | None = None,
         relaxed_max_spread_usd: float | None = None,
+        skip_market_checks: bool = False,
     ) -> list[LegOrder] | None:
         """Submit market legs in synchronized <=1 BTC batches after spread/depth checks."""
         if not leg_orders:
@@ -1525,39 +1526,44 @@ class PositionManager:
                 self.MARKET_BATCH_MAX_QTY,
                 min(self._remaining_leg_qty(leg) for leg in pending),
             )
-            snapshots = self._wait_until_market_batch_ready(
-                group_id=group_id,
-                legs=pending,
-                batch_qty=batch_qty,
-                status_callback=status_callback,
-                max_spread_usd=(
-                    relaxed_max_spread_usd
-                    if partial_mode and relaxed_max_spread_usd is not None
-                    else (self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD if partial_mode else None)
-                ),
-                custom_spread_stages=None if partial_mode else spread_stages,
-            )
-            if snapshots is None:
-                if partial_mode and completion_deadline is not None and _time.monotonic() < completion_deadline:
-                    self._emit_execution_event(
-                        event_type="market_batch_retry_pending",
-                        message=f"已有单腿成交，继续放宽条件补齐剩余腿：批次={batch_qty:.4f}",
-                        group_id=group_id,
-                        execution_mode="market",
-                        execution_state="partial_exposure",
-                        severity="warning",
-                        batch_index=batch_index,
-                        batch_qty=batch_qty,
-                        max_spread_usd=self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
-                        retry_window_sec=self.MARKET_PARTIAL_RETRY_WINDOW_SEC,
-                        legs=[self._serialize_leg_status(leg) for leg in leg_orders],
-                        status_callback=status_callback,
-                    )
-                    continue
-                for leg in pending:
-                    if self._remaining_leg_qty(leg) > 1e-9:
-                        leg.status = "FAILED"
-                break
+            snapshots: dict[str, dict[str, float | bool | str]] = {}
+            if skip_market_checks:
+                snapshots = {}
+            else:
+                wait_snapshots = self._wait_until_market_batch_ready(
+                    group_id=group_id,
+                    legs=pending,
+                    batch_qty=batch_qty,
+                    status_callback=status_callback,
+                    max_spread_usd=(
+                        relaxed_max_spread_usd
+                        if partial_mode and relaxed_max_spread_usd is not None
+                        else (self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD if partial_mode else None)
+                    ),
+                    custom_spread_stages=None if partial_mode else spread_stages,
+                )
+                if wait_snapshots is None:
+                    if partial_mode and completion_deadline is not None and _time.monotonic() < completion_deadline:
+                        self._emit_execution_event(
+                            event_type="market_batch_retry_pending",
+                            message=f"已有单腿成交，继续放宽条件补齐剩余腿：批次={batch_qty:.4f}",
+                            group_id=group_id,
+                            execution_mode="market",
+                            execution_state="partial_exposure",
+                            severity="warning",
+                            batch_index=batch_index,
+                            batch_qty=batch_qty,
+                            max_spread_usd=self.MARKET_BATCH_RELAXED_MAX_SPREAD_USD,
+                            retry_window_sec=self.MARKET_PARTIAL_RETRY_WINDOW_SEC,
+                            legs=[self._serialize_leg_status(leg) for leg in leg_orders],
+                            status_callback=status_callback,
+                        )
+                        continue
+                    for leg in pending:
+                        if self._remaining_leg_qty(leg) > 1e-9:
+                            leg.status = "FAILED"
+                    break
+                snapshots = wait_snapshots
 
             self._emit_execution_event(
                 event_type="market_batch_submit",
@@ -1699,6 +1705,10 @@ class PositionManager:
     @classmethod
     def _is_stop_loss_close_reason(cls, reason: str) -> bool:
         return str(reason or "").startswith("weekend_vol_stop_loss_")
+
+    @classmethod
+    def _is_manual_close_all_reason(cls, reason: str) -> bool:
+        return str(reason or "") == "manual_close_all"
 
     @classmethod
     def _spread_stages_for_close_reason(cls, reason: str) -> tuple[list[tuple[float, float | None]] | None, float | None]:
@@ -1884,7 +1894,8 @@ class PositionManager:
                     continue
                 attempted_symbols.add(symbol)
                 close_side = "SELL" if side == "LONG" else "BUY"
-                option_type = "call" if symbol.upper().endswith("-C") else "put"
+                parsed = _parse_symbol(symbol)
+                option_type = str((parsed or {}).get("option_type") or ("call" if "-C" in symbol.upper() else "put"))
                 close_legs.append(LegOrder(
                     leg_role=f"closeall_{attempt}_{symbol}",
                     symbol=symbol,
@@ -1909,6 +1920,7 @@ class PositionManager:
                 status_callback=None,
                 reduce_only=True,
                 client_order_tag="mkt_closeall",
+                skip_market_checks=self._is_manual_close_all_reason(reason),
             ) or close_legs
 
             for close_leg in results:

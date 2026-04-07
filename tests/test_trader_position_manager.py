@@ -871,6 +871,28 @@ class TestCloseIronCondor:
         quantities = [float(call.kwargs["quantity"]) for call in mock_client.submit_order.call_args_list]
         assert quantities == [1.0] * 8
 
+    def test_manual_close_all_skips_market_book_checks_and_parses_usdt_symbols(self, pos_mgr, mock_client):
+        mock_client.get_order_book.side_effect = AssertionError("manual close-all should not wait on books")
+        mock_client.get_positions.side_effect = [
+            [
+                {"symbol": "BTC-10APR26-69000-C-USDT", "side": "SHORT", "quantity": 0.01, "entryPrice": 123.0},
+                {"symbol": "BTC-10APR26-68000-P-USDT", "side": "SHORT", "quantity": 0.01, "entryPrice": 111.0},
+            ],
+            [
+                {"symbol": "BTC-10APR26-69000-C-USDT", "side": "SHORT", "quantity": 0.01, "entryPrice": 123.0},
+                {"symbol": "BTC-10APR26-68000-P-USDT", "side": "SHORT", "quantity": 0.01, "entryPrice": 111.0},
+            ],
+            [],
+            [],
+            [],
+        ]
+
+        pos_mgr.close_all_exchange_positions(underlying="BTC", reason="manual_close_all")
+
+        assert mock_client.submit_order.call_count == 2
+        submitted_symbols = [call.kwargs["symbol"] for call in mock_client.submit_order.call_args_list]
+        assert submitted_symbols == ["BTC-10APR26-69000-C-USDT", "BTC-10APR26-68000-P-USDT"]
+
 
 # ======================================================================
 # 4. Unrealized PnL
