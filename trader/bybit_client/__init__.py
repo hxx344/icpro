@@ -784,7 +784,7 @@ class BybitOptionsClient:
         else:
             raise ValueError("Either order_id or client_order_id is required")
         try:
-            self._private_post("/v5/order/cancel", body)
+            self._request_json("POST", "/v5/order/cancel", body=body, private=True)
             return True
         except Exception as e:
             code, msg = self._extract_api_error(e)

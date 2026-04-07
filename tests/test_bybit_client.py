@@ -200,3 +200,16 @@ def test_get_tickers_parses_bybit_symbols_with_usdt_suffix():
     assert tickers[0].symbol == "BTC-10APR26-71500-C-USDT"
     assert tickers[0].strike == pytest.approx(71500.0)
     assert tickers[0].underlying == "BTC"
+
+
+def test_cancel_order_ignores_missing_order_without_raising():
+    client = BybitOptionsClient(ExchangeConfig(api_key="key", api_secret="secret", simulate_private=False))
+
+    with patch.object(
+        client,
+        "_request_json",
+        side_effect=RuntimeError("Bybit error 110001: The order does not exist."),
+    ):
+        ok = client.cancel_order("BTC-10APR26-68000-P-USDT", client_order_id="cid-1")
+
+    assert ok is False
