@@ -202,7 +202,13 @@ class BybitOptionsClient:
         normalized = re.sub(r"[^A-Za-z0-9_-]+", "-", str(client_order_id)).strip("-")
         if not normalized:
             normalized = f"oid-{uuid.uuid4().hex[:20]}"
-        return normalized[:36]
+        if len(normalized) <= 36:
+            return normalized
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+        prefix_len = 20
+        suffix_len = 7
+        compressed = f"{normalized[:prefix_len]}-{digest}-{normalized[-suffix_len:]}"
+        return compressed[:36]
 
     def _sign(self, payload: str, timestamp_ms: int) -> str:
         origin = f"{timestamp_ms}{self.cfg.api_key}{self.RECV_WINDOW}{payload}"

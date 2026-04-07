@@ -62,6 +62,20 @@ def test_symbol_regex_matches_bybit_usdt_suffix_format():
     assert match.group("settle") == "USDT"
 
 
+def test_normalize_client_order_id_keeps_long_ids_unique():
+    first = BybitOptionsClient._normalize_client_order_id(
+        "closeall:manual_close_all:ebb29b53:1:BTC-10APR26-68000-P-USDT:mkt_closeall:01"
+    )
+    second = BybitOptionsClient._normalize_client_order_id(
+        "closeall:manual_close_all:ebb29b53:1:BTC-10APR26-69000-C-USDT:mkt_closeall:01"
+    )
+
+    assert first is not None and second is not None
+    assert len(first) <= 36
+    assert len(second) <= 36
+    assert first != second
+
+
 def test_default_base_url(default_config):
     client = BybitOptionsClient(default_config)
     assert "api.bybit.com" in client._base
