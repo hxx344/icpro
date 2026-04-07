@@ -27,6 +27,7 @@ BYBIT_OPTION_DEFAULT_FEE_CAP_RATIO = 0.07
 BYBIT_OPTION_DEFAULT_SHORT_MARGIN_RATIO = 0.10
 BYBIT_OPTION_DEFAULT_SHORT_OTM_DEDUCTION_RATIO = 0.08
 BYBIT_OPTION_DEFAULT_SHORT_MIN_MARGIN_RATIO = 0.05
+WEEKEND_VOL_ENTRY_RETRY_WINDOW_MINUTES = 10
 
 
 def _resolve_exchange_param(exchange_cfg: ExchangeConfig | None, field_name: str, default: float) -> float:
@@ -339,8 +340,8 @@ class WeekendVolStrategy:
         if now_min < entry_min:
             return False
 
-        # Too late? (max 2 hours after entry)
-        if now_min > entry_min + 120:
+        # Too late? (fixed 10-minute retry window after entry)
+        if now_min > entry_min + WEEKEND_VOL_ENTRY_RETRY_WINDOW_MINUTES:
             return False
 
         # Already traded this week?

@@ -79,15 +79,22 @@ class TestWeekendVolStrategy:
         cfg = StrategyConfig(underlying="BTC", entry_day="friday", entry_time_utc="16:00")
         strategy = WeekendVolStrategy(client, pos_mgr, storage, cfg)
 
-        now = datetime(2026, 3, 27, 16, 30, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 27, 16, 10, tzinfo=timezone.utc)
         assert strategy._should_enter(now) is True
+
+    def test_should_not_enter_after_10_minute_entry_window(self, client, pos_mgr, storage):
+        cfg = StrategyConfig(underlying="BTC", entry_day="friday", entry_time_utc="16:00")
+        strategy = WeekendVolStrategy(client, pos_mgr, storage, cfg)
+
+        now = datetime(2026, 3, 27, 16, 11, tzinfo=timezone.utc)
+        assert strategy._should_enter(now) is False
 
     def test_should_not_enter_when_risk_lock_active(self, client, pos_mgr, storage):
         cfg = StrategyConfig(underlying="BTC", entry_day="friday", entry_time_utc="16:00")
         strategy = WeekendVolStrategy(client, pos_mgr, storage, cfg)
         strategy._set_execution_risk_lock("test", event_type="position_open_partial", group_id="G1")
 
-        now = datetime(2026, 3, 27, 16, 30, tzinfo=timezone.utc)
+        now = datetime(2026, 3, 27, 16, 10, tzinfo=timezone.utc)
         assert strategy._should_enter(now) is False
 
     def test_compute_quantity_uses_fixed_quantity(self, client, pos_mgr, storage):
