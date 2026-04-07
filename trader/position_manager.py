@@ -1875,6 +1875,7 @@ class PositionManager:
 
         total_pnl = 0.0
         affected_groups: set[str] = set()
+        operation_id = uuid.uuid4().hex[:8]
 
         attempted_symbols: set[str] = set()
         symbol_close_prices: dict[str, float] = {}
@@ -1903,7 +1904,7 @@ class PositionManager:
                     quantity=qty,
                     strike=0.0,
                     option_type=option_type,
-                    client_order_prefix=f"closeall:{reason}:{attempt}:{symbol}",
+                    client_order_prefix=f"closeall:{reason}:{operation_id}:{attempt}:{symbol}",
                 ))
                 logger.warning(
                     f"Exchange-driven close-all: pass={attempt}/{max_passes} queued {symbol} "
@@ -1914,7 +1915,7 @@ class PositionManager:
                 break
 
             results = self._execute_market_legs(
-                group_id=f"closeall:{reason}:{attempt}",
+                group_id=f"closeall:{reason}:{operation_id}:{attempt}",
                 leg_orders=close_legs,
                 quantity=0.0,
                 status_callback=None,

@@ -893,6 +893,32 @@ class TestCloseIronCondor:
         submitted_symbols = [call.kwargs["symbol"] for call in mock_client.submit_order.call_args_list]
         assert submitted_symbols == ["BTC-10APR26-69000-C-USDT", "BTC-10APR26-68000-P-USDT"]
 
+    def test_manual_close_all_uses_unique_client_order_ids_per_invocation(self, pos_mgr, mock_client):
+        _live_position = [{"symbol": "BTC-10APR26-68000-P-USDT", "side": "SHORT", "quantity": 0.01, "entryPrice": 111.0}]
+        mock_client.get_positions.side_effect = [
+            _live_position,
+            _live_position,
+            [],
+            [],
+            _live_position,
+            _live_position,
+            [],
+            [],
+        ]
+        prefixes: list[str] = []
+
+        def _capture_execute_market_legs(**kwargs):
+            leg_orders = kwargs["leg_orders"]
+            prefixes.append(leg_orders[0].client_order_prefix)
+            return leg_orders
+
+        with patch.object(pos_mgr, "_execute_market_legs", side_effect=_capture_execute_market_legs):
+            pos_mgr.close_all_exchange_positions(underlying="BTC", reason="manual_close_all")
+            pos_mgr.close_all_exchange_positions(underlying="BTC", reason="manual_close_all")
+
+        assert len(prefixes) == 2
+        assert prefixes[0] != prefixes[1]
+
 
 # ======================================================================
 # 4. Unrealized PnL
