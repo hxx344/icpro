@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import platform
 import sys
@@ -1616,6 +1617,11 @@ elif page == "🔧 策略配置":
     _exchange = _raw_yaml.get("exchange", {})
     _storage = _raw_yaml.get("storage", {})
     _monitor = _raw_yaml.get("monitor", {})
+    _pv_margin_per_unit = 0.0
+    _pv_available = 0.0
+    _pv_max_open_quantity = 0.0
+    _pv_max_open_groups = 0.0
+    _pv_margin_hint = "当前无法根据实时行情估算最大可开仓位"
 
     def _render_strategy_form() -> None:
         with st.form("config_editor", border=True):
@@ -1650,6 +1656,10 @@ elif page == "🔧 策略配置":
             with s_col2:
                 ed_quantity = st.number_input("固定数量 (张)", min_value=0.0, max_value=100.0, value=float(_strategy.get("quantity", 5.0)), step=0.1, format="%.3f", help="Bybit 实盘固定下单数量，可直接在前端修改")
                 st.caption("当前策略已改为固定数量模式，前端修改后保存即可生效。")
+                if _pv_ok and _pv_margin_per_unit > 0:
+                    st.caption(_pv_margin_hint)
+                else:
+                    st.caption("当前无法根据实时行情估算最大可开仓位，请先确认下方下单预览可正常获取行情。")
                 ed_max_pos = st.number_input("最大持仓组数", min_value=1, max_value=20, value=_strategy.get("max_positions", 1), step=1)
 
             with s_col3:
@@ -1953,6 +1963,20 @@ elif page == "🔧 策略配置":
                 _pv_qty = float(_preview["quantity"])
                 _pv_equity_src = _preview["equity_source"]
                 _margin_per = float(_preview["margin_per_unit"])
+                _pv_margin_per_unit = _margin_per
+                if _margin_per > 0 and _pv_available > 0:
+                    _pv_max_open_quantity = math.floor((_pv_available / _margin_per) * 1000.0) / 1000.0
+                    if _pv_qty > 0:
+                        _pv_max_open_groups = math.floor((_pv_available / (_margin_per * _pv_qty)) * 1000.0) / 1000.0
+                    _pv_margin_hint = (
+                        f"按当前实时盘口估算：可用保证金约 ${_pv_available:,.0f}，"
+                        f"每组保证金约 ${_margin_per:,.0f}（每腿 1 张），最多可开约 {_pv_max_open_quantity:.3f} 组。"
+                    )
+                elif _margin_per > 0:
+                    _pv_margin_hint = (
+                        f"按当前实时盘口估算：每组保证金约 ${_margin_per:,.0f}（每腿 1 张），"
+                        "但当前未获取到可用保证金余额。"
+                    )
 
                 # Prices in USD (Bybit option native quote unit)
                 _preview_fallback_iv = getattr(cfg.strategy, "default_iv", 0.60)
