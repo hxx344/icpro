@@ -66,6 +66,7 @@ from trader.config import load_config
 from trader.storage import Storage
 from trader.engine import get_engine, reset_engine, TradingEngine
 from trader.bybit_client import BybitOptionsClient, OptionTicker
+from trader.dashboard_expiry import resolve_test_order_expiry_target
 from trader.position_manager import PositionManager, OptionPosition, PositionLeg
 from trader.order_preview import compute_option_order_preview
 
@@ -1777,20 +1778,19 @@ elif page == "🔧 策略配置":
             _prices = [t.underlying_price for t in _pv_tickers if t.underlying_price > 0]
             _pv_spot = _prices[0] if _prices else 0
 
-        # --- Weekend vol expiry filter: nearest Sunday 08:00 UTC ---
-        from datetime import timedelta as _td
         _now_utc = datetime.now(timezone.utc)
-        _days_to_sunday = (6 - _now_utc.weekday()) % 7
-        if _days_to_sunday == 0 and _now_utc.hour >= 8:
-            _days_to_sunday = 7
-        _sunday_exp = _now_utc.replace(hour=8, minute=0, second=0, microsecond=0) + _td(days=_days_to_sunday)
         _tolerance_h = 2.0
-        _pv_today = [
-            t for t in _pv_tickers
-            if abs((t.expiry - _sunday_exp).total_seconds()) < _tolerance_h * 3600
-        ]
+        _active_expiry_target, _sunday_expiry_target, _friday_expiry_target = resolve_test_order_expiry_target(
+            _pv_tickers,
+            _now_utc,
+            tolerance_hours=_tolerance_h,
+        )
+        _sunday_exp = _sunday_expiry_target.expiry
+        _pv_today = list(_active_expiry_target.tickers)
         _target_dte_days = round((_sunday_exp - _now_utc).total_seconds() / 86400, 1)
-        _dte_label_str = f"周日到期 ({_sunday_exp.strftime('%Y-%m-%d %H:%M')} UTC)"
+        _dte_label_str = _sunday_expiry_target.label
+        _active_dte_label_str = _active_expiry_target.label
+        _test_order_used_friday_fallback = _active_expiry_target.is_fallback and bool(_active_expiry_target.tickers)
 
         if _pv_spot > 0 and _pv_today:
             # --- Strike selection ---
@@ -1865,7 +1865,8 @@ elif page == "🔧 策略配置":
             except Exception:
                 pass
 
-            _T_years = max((_sunday_exp - _now_utc).total_seconds() / (365.25 * 86400), 1e-6)
+            _active_expiry = _active_expiry_target.expiry
+            _T_years = max((_active_expiry - _now_utc).total_seconds() / (365.25 * 86400), 1e-6)
             _tgt_delta = getattr(cfg.strategy, "target_delta", 0.40)
             _wing_d = getattr(cfg.strategy, "wing_delta", 0.05)
             _def_iv = getattr(cfg.strategy, "default_iv", 0.60)
@@ -1985,7 +1986,12 @@ elif page == "🔧 策略配置":
                 _pv_ok = True
 
                 # ---- Display ----
-                st.caption(f"数据来源: Bybit 实时行情 | {_pv_equity_src} | {_dte_label_str}")
+                if _test_order_used_friday_fallback:
+                    st.warning(
+                        f"⚠️ 周日到期合约当前不可用，以下合约已仅为测试下单自动切换到 {_active_dte_label_str}。"
+                        "此回退不会影响正式策略实际选腿。"
+                    )
+                st.caption(f"数据来源: Bybit 实时行情 | {_pv_equity_src} | {_active_dte_label_str}")
 
                 # KPI row
                 kc1, kc2, kc3, kc4 = st.columns(4)
@@ -2562,12 +2568,26 @@ elif page == "🔧 策略配置":
                             language=None,
                         )
             else:
-                st.warning(f"⚠️ 无法找到完整的合约腿 ({_dte_label_str}，共 {len(_pv_today)} 个 ticker)")
+                if _test_order_used_friday_fallback:
+                    st.warning(
+                        f"⚠️ 周日到期合约不可用，已尝试回退到 {_active_dte_label_str}，"
+                        f"但仍无法找到完整的合约腿（共 {len(_pv_today)} 个 ticker）。"
+                    )
+                else:
+                    st.warning(f"⚠️ 无法找到完整的合约腿 ({_active_dte_label_str}，共 {len(_pv_today)} 个 ticker)")
         else:
             if _pv_spot <= 0:
                 st.warning("⚠️ 无法获取现货价格")
             else:
-                st.warning(f"⚠️ 目标合约不可用 ({_dte_label_str})")
+                if _friday_expiry_target.tickers:
+                    st.warning(
+                        f"⚠️ 周日到期合约不可用 ({_dte_label_str})；"
+                        f"可在测试下单时自动切换到 {_friday_expiry_target.label}。"
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ 目标合约不可用 ({_dte_label_str})，且最近周五到期合约也不可用"
+                    )
     except Exception as _pv_ex:
         st.error(f"下单预览失败: {_pv_ex}")
         import traceback
