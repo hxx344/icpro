@@ -764,12 +764,14 @@ class PositionManager:
             ]
         stage_index = 0
         current_max_spread, current_wait_sec = spread_stages[stage_index]
+        stage_started_at = _time.monotonic()
         deadline = (
             _time.monotonic() + current_wait_sec
             if current_wait_sec is not None
             else None
         )
         poll_idx = 0
+        last_wait_progress_emit_at = 0.0
 
         while True:
             poll_idx += 1
@@ -789,6 +791,7 @@ class PositionManager:
                         if current_wait_sec is not None
                         else None
                     )
+                    stage_started_at = now
                     logger.warning(
                         f"Market batch {group_id} timed out at spread<={prev_max_spread:.2f}; "
                         f"relaxing to spread<={current_max_spread:.2f} for batch_qty={batch_qty:.4f}"
@@ -823,18 +826,40 @@ class PositionManager:
                 )
                 return None
 
-            if status_callback is not None:
-                status_callback({
-                    "event": "market_batch_wait",
-                    "message": f"等待盘口满足批量下单：批次={batch_qty:.4f}",
-                    "group_id": group_id,
-                    "execution_mode": "market",
-                    "batch_qty": batch_qty,
-                    "required_depth": required_depth,
-                    "max_spread_usd": current_max_spread,
-                    "poll_index": poll_idx,
-                    "blockers": blockers,
-                    "legs": [
+            if now - last_wait_progress_emit_at >= 1.0 or poll_idx == 1:
+                elapsed_wait_sec = max(now - stage_started_at, 0.0)
+                if current_wait_sec is not None and current_wait_sec > 0:
+                    wait_progress_pct = min(max((elapsed_wait_sec / current_wait_sec) * 100.0, 0.0), 100.0)
+                else:
+                    wait_progress_pct = 100.0
+                blockers_summary = ", ".join(
+                    f"{item.get('symbol')}:价差{float(item.get('spread') or 0.0):.1f}/深度{float(item.get('available_qty') or 0.0):.3f}"
+                    for item in blockers[:3]
+                )
+                logger.info(
+                    f"Market wait {group_id}: stage={stage_index + 1}/{len(spread_stages)} "
+                    f"progress={wait_progress_pct:.0f}% spread<={current_max_spread:.2f} "
+                    f"batch_qty={batch_qty:.4f} blockers={len(blockers)} {blockers_summary}"
+                )
+                self._emit_execution_event(
+                    event_type="market_batch_wait",
+                    message=f"等待盘口满足批量下单：批次={batch_qty:.4f} | 进度 {wait_progress_pct:.0f}%",
+                    group_id=group_id,
+                    execution_mode="market",
+                    execution_state="partial_exposure" if self._filled_leg_count(legs) > 0 else "opening",
+                    severity="info",
+                    batch_qty=batch_qty,
+                    required_depth=required_depth,
+                    max_spread_usd=current_max_spread,
+                    poll_index=poll_idx,
+                    blockers=blockers,
+                    blockers_count=len(blockers),
+                    wait_progress_pct=wait_progress_pct,
+                    elapsed_wait_sec=elapsed_wait_sec,
+                    stage_wait_sec=current_wait_sec,
+                    stage_index=stage_index + 1,
+                    stage_total=len(spread_stages),
+                    legs=[
                         {
                             "leg_role": leg.leg_role,
                             "symbol": leg.symbol,
@@ -847,7 +872,9 @@ class PositionManager:
                         }
                         for leg in legs
                     ],
-                })
+                    status_callback=status_callback,
+                )
+                last_wait_progress_emit_at = now
             _time.sleep(self.MARKET_BATCH_POLL_SEC)
 
     def _refresh_order_result(

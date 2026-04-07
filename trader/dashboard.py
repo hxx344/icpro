@@ -768,6 +768,28 @@ def _rerun_preserve_nav_page(current_page: str | None = None) -> None:
     st.session_state["nav_page"] = current_page or st.session_state.get("nav_page", "📊 总览")
     st.rerun()
 
+
+def _extract_active_wait_events(recent_execution_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now_utc = datetime.now(timezone.utc)
+    latest_by_group: dict[str, dict[str, Any]] = {}
+    for item in recent_execution_events:
+        group_id = str(item.get("group_id") or "") or f"evt:{item.get('id') or ''}"
+        if group_id not in latest_by_group:
+            latest_by_group[group_id] = item
+
+    active_waits: list[dict[str, Any]] = []
+    for item in latest_by_group.values():
+        if str(item.get("event_type") or "") != "market_batch_wait":
+            continue
+        try:
+            ts = datetime.fromisoformat(str(item.get("timestamp") or ""))
+        except Exception:
+            continue
+        if (now_utc - ts).total_seconds() > 15:
+            continue
+        active_waits.append(item)
+    return sorted(active_waits, key=lambda item: str(item.get("timestamp") or ""), reverse=True)
+
 if not is_trade_mode:
     # Readonly mode: show status only, no engine controls
     if engine.is_running:
@@ -2266,6 +2288,23 @@ elif page == "🔧 策略配置":
                         _runtime = _get_test_stop_loss_runtime(_task, engine)
 
                         st.progress(max(0, min(_percent, 100)), text=f"测试下单进度：{_percent}% | {_message}")
+                        if str(_progress.get("event") or "") == "market_batch_wait":
+                            _wait_pct = int(max(0, min(float(_progress.get("wait_progress_pct") or 0.0), 100.0)))
+                            _wait_meta = (
+                                f"阶段 {int(_progress.get('stage_index') or 0)}/{int(_progress.get('stage_total') or 0)} | "
+                                f"最大价差 {float(_progress.get('max_spread_usd') or 0.0):.0f} USD | "
+                                f"阻塞腿数 {int(_progress.get('blockers_count') or 0)}"
+                            )
+                            st.progress(_wait_pct, text=f"盘口等待进度：{_wait_pct}% | {_wait_meta}")
+                            _blockers = _progress.get("blockers") or []
+                            if _blockers:
+                                st.caption(
+                                    "当前阻塞: "
+                                    + " | ".join(
+                                        f"{item.get('symbol')}: 价差 {float(item.get('spread') or 0.0):.1f} / 深度 {float(item.get('available_qty') or 0.0):.3f}"
+                                        for item in _blockers[:3]
+                                    )
+                                )
                         if _state in {"queued", "running"}:
                             st.info(_message)
                         elif _state == "success":
@@ -2771,6 +2810,40 @@ elif page == "🖥 引擎状态":
         st.metric("API 环境", env)
 
     strategy_status = es.get("strategy_status") or {}
+
+    @st.fragment(run_every=1)
+    def _render_live_wait_progress() -> None:
+        _status = engine.status()
+        _active_waits = _extract_active_wait_events(_status.get("recent_execution_events") or [])
+        if not _active_waits:
+            return
+        st.markdown("##### ⏳ 当前盘口等待进度")
+        for item in _active_waits[:3]:
+            meta = item.get("meta") or {}
+            wait_pct = int(max(0, min(float(meta.get("wait_progress_pct") or 0.0), 100.0)))
+            group_id = str(item.get("group_id") or "-")
+            max_spread = float(meta.get("max_spread_usd") or 0.0)
+            blockers_count = int(meta.get("blockers_count") or 0)
+            stage_index = int(meta.get("stage_index") or 0)
+            stage_total = int(meta.get("stage_total") or 0)
+            st.progress(
+                wait_pct,
+                text=(
+                    f"{group_id} | 进度 {wait_pct}% | 阶段 {stage_index}/{stage_total} | "
+                    f"最大价差 {max_spread:.0f} USD | 阻塞腿数 {blockers_count}"
+                ),
+            )
+            blockers = meta.get("blockers") or []
+            if blockers:
+                st.caption(
+                    "当前阻塞: "
+                    + " | ".join(
+                        f"{blocker.get('symbol')}: 价差 {float(blocker.get('spread') or 0.0):.1f} / 深度 {float(blocker.get('available_qty') or 0.0):.3f}"
+                        for blocker in blockers[:3]
+                    )
+                )
+
+    _render_live_wait_progress()
     if strategy_status.get("position_source") == "exchange":
         _symbols = strategy_status.get("exchange_position_symbols") or []
         st.caption(f"当前持仓组数按交易所实时持仓兜底显示；本地数据库为空，交易所合约: {', '.join(_symbols) if _symbols else '-'}")

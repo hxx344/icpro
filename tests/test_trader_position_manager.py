@@ -311,7 +311,7 @@ class TestOpenIronCondor:
             "asks": [(110.0, 1.0)],
         }
 
-        with patch("trader.position_manager._time.monotonic", side_effect=[0.0, 301.0]):
+        with patch("trader.position_manager._time.monotonic", side_effect=[0.0, 0.0, 301.0, 301.0, 301.0]):
             snapshots = pos_mgr._wait_until_market_batch_ready(
                 group_id="TEST_RELAX",
                 legs=[leg],
@@ -918,6 +918,37 @@ class TestCloseIronCondor:
 
         assert len(prefixes) == 2
         assert prefixes[0] != prefixes[1]
+
+    def test_wait_until_market_batch_ready_emits_wait_progress(self, pos_mgr, mock_client):
+        leg = LegOrder(
+            leg_role="sell_put",
+            symbol="BTC-10APR26-68000-P-USDT",
+            side="SELL",
+            quantity=0.01,
+            strike=68000.0,
+            option_type="put",
+        )
+        mock_client.get_order_book.side_effect = [
+            {"bids": [(100.0, 0.001)], "asks": [(110.0, 10.0)]},
+            {"bids": [(100.0, 10.0)], "asks": [(103.0, 10.0)]},
+        ]
+        progress_events: list[dict] = []
+
+        with patch("trader.position_manager._time.sleep", return_value=None):
+            snapshots = pos_mgr._wait_until_market_batch_ready(
+                group_id="TEST_WAIT",
+                legs=[leg],
+                batch_qty=0.01,
+                status_callback=progress_events.append,
+                custom_spread_stages=[(5.0, 2.0)],
+            )
+
+        assert snapshots is not None
+        wait_events = [event for event in progress_events if event.get("event") == "market_batch_wait"]
+        assert wait_events
+        latest_wait = wait_events[-1]
+        assert float(latest_wait.get("wait_progress_pct") or 0.0) >= 0.0
+        assert int(latest_wait.get("blockers_count") or 0) == 1
 
 
 # ======================================================================
