@@ -1969,12 +1969,12 @@ elif page == "🔧 策略配置":
                     if _pv_qty > 0:
                         _pv_max_open_groups = math.floor((_pv_available / (_margin_per * _pv_qty)) * 1000.0) / 1000.0
                     _pv_margin_hint = (
-                        f"按当前实时盘口估算：可用保证金约 ${_pv_available:,.0f}，"
-                        f"每组保证金约 ${_margin_per:,.0f}（每腿 1 张），最多可开约 {_pv_max_open_quantity:.3f} 组。"
+                        f"按当前实时盘口估算：可用保证金约 USD {_pv_available:,.0f}，"
+                        f"每组保证金约 USD {_margin_per:,.0f}（每腿 1 张），最多可开约 {_pv_max_open_quantity:.3f} 组。"
                     )
                 elif _margin_per > 0:
                     _pv_margin_hint = (
-                        f"按当前实时盘口估算：每组保证金约 ${_margin_per:,.0f}（每腿 1 张），"
+                        f"按当前实时盘口估算：每组保证金约 USD {_margin_per:,.0f}（每腿 1 张），"
                         "但当前未获取到可用保证金余额。"
                     )
 
