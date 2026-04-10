@@ -451,6 +451,13 @@ class WeekendVolStrategy:
             logger.warning("[WeekendVol] Could not find both short legs by delta")
             return
 
+        if sell_call.strike <= spot or sell_put.strike >= spot:
+            logger.warning(
+                f"[WeekendVol] Reject non-OTM short legs: "
+                f"call K={sell_call.strike} spot={spot}, put K={sell_put.strike} spot={spot}"
+            )
+            return
+
         # Validate liquidity
         if sell_call.bid_price <= 0 or sell_put.bid_price <= 0:
             logger.warning("[WeekendVol] Short legs have no bid – skipping")
@@ -460,8 +467,10 @@ class WeekendVolStrategy:
         buy_call = None
         buy_put = None
         if self.cfg.wing_delta > 0:
-            buy_call = self._find_by_delta(calls, spot, T_years, self.cfg.wing_delta, "call")
-            buy_put = self._find_by_delta(puts, spot, T_years, self.cfg.wing_delta, "put")
+            wing_calls = [t for t in calls if float(t.strike) > float(sell_call.strike)]
+            wing_puts = [t for t in puts if float(t.strike) < float(sell_put.strike)]
+            buy_call = self._find_by_delta(wing_calls, spot, T_years, self.cfg.wing_delta, "call")
+            buy_put = self._find_by_delta(wing_puts, spot, T_years, self.cfg.wing_delta, "put")
 
             if not buy_call or not buy_put:
                 logger.warning("[WeekendVol] Could not find wing legs by delta")
@@ -834,6 +843,13 @@ class WeekendVolStrategy:
         used_exchange = False
 
         for t in tickers:
+            if option_type == "call":
+                if float(t.strike) <= float(spot):
+                    continue
+            else:
+                if float(t.strike) >= float(spot):
+                    continue
+
             # Prefer exchange delta
             if t.delta != 0.0:
                 abs_d = abs(t.delta)

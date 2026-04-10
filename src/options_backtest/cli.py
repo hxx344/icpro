@@ -122,6 +122,7 @@ STRATEGY_MAP = {
 # Register new strategies here
 STRATEGY_MAP.update({
     "nakedcall": "options_backtest.strategy.naked_call.NakedCallStrategy",
+    "intradaymovefade0dte": "options_backtest.strategy.intraday_move_fade_0dte.IntradayMoveFade0DTEStrategy",
     "weekendvol": "options_backtest.strategy.weekend_vol.WeekendVolStrategy",
     "weekendvolbacktest": "options_backtest.strategy.weekend_vol_backtest.WeekendVolBacktestStrategy",
     "longstrangle": "options_backtest.strategy.long_strangle.LongStrangleStrategy",

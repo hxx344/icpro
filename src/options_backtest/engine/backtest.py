@@ -622,7 +622,13 @@ class BacktestEngine:
 
         for order in self._pending_orders:
             # Look up current bid / ask / mark for the instrument
-            bid, ask, mark = self._get_quotes_fast(order.instrument_name, ts_np, underlying_price, price_field=price_field)
+            bid, ask, mark = self._get_quotes_fast(
+                order.instrument_name,
+                ts_np,
+                underlying_price,
+                price_field=price_field,
+                for_execution=True,
+            )
             if mark is None or mark <= 0:
                 logger.warning(f"No quote for {order.instrument_name}, skipping order")
                 continue
@@ -632,6 +638,14 @@ class BacktestEngine:
                 bid, ask, mark, underlying_price,
             )
             if fill is None:
+                if bool(getattr(self.config.execution, "require_touch_quote", False)):
+                    side = "ask" if order.direction == Direction.LONG else "bid"
+                    logger.info(
+                        "Skip order {} at {}: missing executable {} quote",
+                        order.instrument_name,
+                        pd.Timestamp(ts_np),
+                        side,
+                    )
                 continue
 
             self.position_mgr.apply_fill(fill)
@@ -648,13 +662,22 @@ class BacktestEngine:
 
         self._pending_orders.clear()
 
-    def _get_quotes_fast(self, instrument_name: str, ts_np, underlying_price: float = 0.0, price_field: str = "close"):
+    def _get_quotes_fast(
+        self,
+        instrument_name: str,
+        ts_np,
+        underlying_price: float = 0.0,
+        price_field: str = "close",
+        *,
+        for_execution: bool = False,
+    ):
         """Return (bid, ask, mark) using pre-indexed OHLCV + searchsorted.
 
         Falls back to Black-76 when no OHLCV data is available.
         Returns prices in coin or USD depending on margin_mode.
         """
         margin_usd = self._margin_usd
+        require_real_quote_source = bool(getattr(self.config.execution, "require_real_quote_source", False)) and for_execution
         if self._option_data_source == "options_hourly" and self._options_hourly_store is not None:
             pick = "open" if price_field == "open" else "close"
             bid, ask, mark = self._options_hourly_store.get_quote(instrument_name, ts_np, pick=pick)
@@ -666,7 +689,11 @@ class BacktestEngine:
                     ask = ask * underlying_price if ask is not None else None
                     mark = mark * underlying_price
                 return bid, ask, mark
+            if require_real_quote_source:
+                return None, None, None
         if not self.config.backtest.use_bs_only:
+            if require_real_quote_source:
+                return None, None, None
             # O(1) arithmetic index for regular grids
             arith = self._ohlcv_arith.get(instrument_name)
             if arith is not None:
@@ -705,6 +732,8 @@ class BacktestEngine:
                     return bid, ask, mark
 
         # Synthetic pricing
+        if require_real_quote_source:
+            return None, None, None
         if underlying_price <= 0:
             return None, None, None
 

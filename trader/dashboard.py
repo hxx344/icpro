@@ -1855,6 +1855,10 @@ elif page == "🔧 策略配置":
             def _best_by_delta(tks, otype, target_delta, spot_val, T_yr, fallback_iv):
                 """Delta-based: find closest |delta| to target."""
                 cs = [t for t in tks if t.option_type == otype]
+                if otype == "call":
+                    cs = [t for t in cs if float(t.strike) > float(spot_val)]
+                else:
+                    cs = [t for t in cs if float(t.strike) < float(spot_val)]
                 if not cs:
                     return None
                 best_t = None
@@ -1929,8 +1933,10 @@ elif page == "🔧 策略配置":
             _sell_put = _best_by_delta(_pv_today, "put", _tgt_delta, _pv_spot, _T_years, _def_iv)
 
             if _wing_d > 0:
-                _buy_call = _best_by_delta(_pv_today, "call", _wing_d, _pv_spot, _T_years, _def_iv)
-                _buy_put = _best_by_delta(_pv_today, "put", _wing_d, _pv_spot, _T_years, _def_iv)
+                _wing_calls = [t for t in _pv_today if t.option_type == "call" and float(t.strike) > float(_sell_call.strike)] if _sell_call else []
+                _wing_puts = [t for t in _pv_today if t.option_type == "put" and float(t.strike) < float(_sell_put.strike)] if _sell_put else []
+                _buy_call = _best_by_delta(_wing_calls, "call", _wing_d, _pv_spot, _T_years, _def_iv)
+                _buy_put = _best_by_delta(_wing_puts, "put", _wing_d, _pv_spot, _T_years, _def_iv)
 
             _is_ic = _pv_is_ic
 

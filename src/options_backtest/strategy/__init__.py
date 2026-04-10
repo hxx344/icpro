@@ -5,6 +5,7 @@ from options_backtest.strategy.call_spread_cc import CallSpreadCCStrategy
 from options_backtest.strategy.covered_call import CoveredCallStrategy
 from options_backtest.strategy.dual_invest import DualInvestStrategy
 from options_backtest.strategy.iron_condor import IronCondorStrategy
+from options_backtest.strategy.intraday_move_fade_0dte import IntradayMoveFade0DTEStrategy
 from options_backtest.strategy.long_call import LongCallStrategy
 from options_backtest.strategy.long_strangle import LongStrangleStrategy
 from options_backtest.strategy.short_put import ShortPutStrategy
@@ -15,6 +16,7 @@ __all__ = [
 	"CallSpreadCCStrategy",
 	"CoveredCallStrategy",
 	"DualInvestStrategy",
+	"IntradayMoveFade0DTEStrategy",
 	"LongCallStrategy",
 	"LongStrangleStrategy",
 	"ShortPutStrategy",

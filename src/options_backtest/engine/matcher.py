@@ -33,27 +33,39 @@ class Matcher:
 
         Prices are in coin (Deribit) or USD depending on margin mode.
         """
-        # Determine execution price.
-        # When a valid top-of-book exists, use the touch price directly:
-        #   - LONG  -> ask
-        #   - SHORT -> bid
-        # This is more conservative than midpoint execution and better matches
-        # immediate marketable fills in the hourly snapshot backtest.
-        if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0:
+        require_touch_quote = bool(getattr(self.cfg, "require_touch_quote", False))
+
+        if require_touch_quote:
             if order.direction == Direction.LONG:
+                if ask_price is None or ask_price <= 0:
+                    return None
                 fill_price = ask_price
             else:
+                if bid_price is None or bid_price <= 0:
+                    return None
                 fill_price = bid_price
         else:
-            mid = mark_price
-            if mid <= 0:
-                return None
-
-            # Apply slippage only when we have to fall back to mark pricing.
-            if order.direction == Direction.LONG:
-                fill_price = mid + self.cfg.slippage
+            # Determine execution price.
+            # When a valid top-of-book exists, use the touch price directly:
+            #   - LONG  -> ask
+            #   - SHORT -> bid
+            # This is more conservative than midpoint execution and better matches
+            # immediate marketable fills in the hourly snapshot backtest.
+            if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0:
+                if order.direction == Direction.LONG:
+                    fill_price = ask_price
+                else:
+                    fill_price = bid_price
             else:
-                fill_price = max(mid - self.cfg.slippage, 0.0001)
+                mid = mark_price
+                if mid <= 0:
+                    return None
+
+                # Apply slippage only when we have to fall back to mark pricing.
+                if order.direction == Direction.LONG:
+                    fill_price = mid + self.cfg.slippage
+                else:
+                    fill_price = max(mid - self.cfg.slippage, 0.0001)
 
         if fill_price <= 0:
             return None
