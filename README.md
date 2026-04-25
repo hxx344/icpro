@@ -58,6 +58,74 @@ python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 
 ## 推荐实盘策略
 
+### BTC 7 因子分层 Delta Covered Call / Collar（研究 + 推荐面板）
+
+新增的 BTC 期权覆盖性卖 Call / Collar 研究策略，用于在持有 BTC 底仓的同时，根据多因子牛熊强弱动态调整卖 Call 的目标 Delta，并在弱势阶段买入保护性 Put。
+
+> 当前实现是**行情推荐与回测研究面板**，不会自动下单；实盘执行前仍需人工确认流动性、保证金、滑点和风控。
+
+核心结构：
+
+- `1x BTC` 现货/线性底仓敞口
+- `2x short call`，目标 Delta 由牛熊强弱分层决定
+- `2x protective put`，弱势/回撤条件下买入保护性 Put
+- Delta 选合约方式：`at_least_target`，即优先选择不低于目标 Delta 的最近合约
+- USD margin 口径，包含期权手续费与交割费估算
+
+7 个牛熊投票因子：
+
+| 因子 | 含义 |
+|---|---|
+| `rsi_14d_gt_50_lt_80` | 14 日 RSI 在 50~80，过滤弱势与过热 |
+| `price_gt_sma_30d` | BTC 价格高于 30 日均线 |
+| `roc_30d_gt_-5%` | 30 日涨跌幅大于 -5% |
+| `onchain_sopr_proxy_155d_0p95_to_1p5` | SOPR 代理：价格 / 155 日前价格，位于 0.95~1.5 |
+| `fear_greed_25_to_80` | 恐惧贪婪指数在 25~80 |
+| `roc_730d_gt_+0%` | 两年动量为正 |
+| `onchain_mvrv_1_to_3p5` | CoinMetrics MVRV 位于 1~3.5 |
+
+投票强弱与卖 Call Delta 分层：
+
+| 投票数量 | 状态 | 目标 Call Delta |
+|---:|---|---:|
+| 7/7 | 极强牛 | `0.01` |
+| 6/7 | 牛市 | `0.01` |
+| 4~5/7 | 中性偏弱 | `0.30` |
+| 0~3/7 | 弱势/熊市 | `0.48` |
+
+主要文件：
+
+| 文件 | 说明 |
+|---|---|
+| `scripts/optimize_btc_covered_call.py` | 覆盖性卖 Call / Collar 历史回测核心逻辑 |
+| `scripts/bybit_cc_recommender_panel.py` | 独立 Bybit 行情推荐面板 |
+| `tmp/scan_independent_7of6_vote_count_delta_layers.py` | 7 因子投票数量分层 Delta 网格优化 |
+| `tmp/backtest_layered_delta_natural_monthly_compound.py` | 自然到期后再月度复利回测 |
+
+独立面板启动：
+
+```bash
+streamlit run scripts/bybit_cc_recommender_panel.py
+```
+
+面板功能：
+
+- 拉取 Bybit BTC 现货、永续资金费率与期权盘口
+- 自动计算 7 因子投票、牛熊强弱和目标 Call Delta
+- 推荐当前最接近策略条件的卖 Call 与保护性 Put
+- 展示权利金、最大潜在赔付、到期收益情景和 Greeks
+- 支持在侧边栏调整 Call/Put 倍数、Delta 分层和筛选条件
+
+研究回测结果（2023-04-25 至 2026-04-25，BTC 小时级期权数据）：
+
+| 版本 | 最终权益 | 总收益 | 最大回撤 | Sharpe |
+|---|---:|---:|---:|---:|
+| 固定 1 BTC 非复利 | `$170,350` | `+520.54%` | `-15.84%` | `2.189` |
+| 强制月度复利 | `$186,279` | `+578.56%` | `-28.68%` | `2.060` |
+| 自然到期后月度复利 | `$221,729` | `+707.70%` | `-20.35%` | `2.225` |
+
+自然复利版本不会在月末强制平仓，而是在跨月后等待原有期权腿自然到期，账户空仓后再按当前权益重置下一轮 BTC 名义本金，因此不会破坏保护性 Put 的连续性。
+
 ### Weekend Vol BTC（推荐）
 
 当前推荐配置是 BTC 周末波动率卖方策略；默认结构是**无翼结构**，但也可通过 `wing_delta > 0` 切到带翼结构：
