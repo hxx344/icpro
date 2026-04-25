@@ -105,7 +105,17 @@ python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 独立面板启动：
 
 ```bash
+# 推荐先设置面板登录凭据；未设置时默认 admin / change-me-now
+$env:CC_PANEL_USERNAME = "your_user"
+$env:CC_PANEL_PASSWORD = "your_strong_password"
 streamlit run scripts/bybit_cc_recommender_panel.py
+```
+
+也可以使用 Streamlit secrets 配置：
+
+```toml
+cc_panel_username = "your_user"
+cc_panel_password = "your_strong_password"
 ```
 
 面板功能：

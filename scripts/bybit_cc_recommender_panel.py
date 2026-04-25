@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import math
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -19,6 +21,8 @@ if str(REPO_ROOT) not in sys.path:
 
 BYBIT_BASE_URL = "https://api.bybit.com"
 MARKET_DATA_DIR = REPO_ROOT / "data" / "market_data"
+DEFAULT_PANEL_USERNAME = "admin"
+DEFAULT_PANEL_PASSWORD = "change-me-now"
 MONTH_MAP = {
     "JAN": 1,
     "FEB": 2,
@@ -667,6 +671,54 @@ def leg_row(side: str, quote: OptionQuote, price: float, qty: float, fee_pct: fl
     }
 
 
+def _secret_or_env(secret_keys: tuple[str, ...], env_key: str, default: str) -> str:
+    for key in secret_keys:
+        try:
+            value = st.secrets.get(key)
+        except Exception:
+            value = None
+        if value is not None and str(value):
+            return str(value)
+    return os.getenv(env_key, default)
+
+
+def panel_credentials() -> tuple[str, str]:
+    username = _secret_or_env(("cc_panel_username", "CC_PANEL_USERNAME"), "CC_PANEL_USERNAME", DEFAULT_PANEL_USERNAME)
+    password = _secret_or_env(("cc_panel_password", "CC_PANEL_PASSWORD"), "CC_PANEL_PASSWORD", DEFAULT_PANEL_PASSWORD)
+    return username, password
+
+
+def require_login() -> None:
+    expected_username, expected_password = panel_credentials()
+    if st.session_state.get("cc_panel_authenticated") is True:
+        with st.sidebar:
+            st.caption(f"已登录：{st.session_state.get('cc_panel_user', expected_username)}")
+            if st.button("退出登录"):
+                st.session_state.pop("cc_panel_authenticated", None)
+                st.session_state.pop("cc_panel_user", None)
+                st.rerun()
+        return
+
+    st.markdown("## 🔐 Bybit BTC Covered Call / Collar")
+    st.caption("请输入账户密码后查看推荐面板。可通过环境变量 `CC_PANEL_USERNAME` / `CC_PANEL_PASSWORD` 或 Streamlit secrets 配置。")
+    with st.form("cc_panel_login_form"):
+        username = st.text_input("账户", value="")
+        password = st.text_input("密码", value="", type="password")
+        submitted = st.form_submit_button("登录", type="primary")
+    if submitted:
+        ok = hmac.compare_digest(username, expected_username) and hmac.compare_digest(password, expected_password)
+        if ok:
+            st.session_state["cc_panel_authenticated"] = True
+            st.session_state["cc_panel_user"] = username
+            st.rerun()
+        else:
+            st.error("账户或密码错误。")
+
+    if expected_username == DEFAULT_PANEL_USERNAME and expected_password == DEFAULT_PANEL_PASSWORD:
+        st.warning("当前使用默认登录凭据 admin / change-me-now。部署前请务必通过环境变量或 Streamlit secrets 修改。")
+    st.stop()
+
+
 st.set_page_config(page_title="Bybit BTC Covered Call 推荐", page_icon="₿", layout="wide")
 st.markdown(
     """
@@ -728,6 +780,8 @@ hr {border-color: rgba(148,163,184,.14) !important;}
 """,
     unsafe_allow_html=True,
 )
+
+require_login()
 
 st.markdown(
         """
