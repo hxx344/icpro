@@ -104,12 +104,31 @@ python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 
 独立面板启动：
 
-```bash
-# 推荐先设置面板登录凭据；未设置时默认 admin / change-me-now
+Windows PowerShell：
+
+```powershell
 $env:CC_PANEL_USERNAME = "your_user"
 $env:CC_PANEL_PASSWORD = "your_strong_password"
 streamlit run scripts/bybit_cc_recommender_panel.py
 ```
+
+Linux/macOS Bash：
+
+```bash
+export CC_PANEL_USERNAME="your_user"
+export CC_PANEL_PASSWORD="your_strong_password"
+streamlit run scripts/bybit_cc_recommender_panel.py
+```
+
+Linux VPS 后台运行示例：
+
+```bash
+export CC_PANEL_USERNAME="your_user"
+export CC_PANEL_PASSWORD="your_strong_password"
+nohup python -m streamlit run scripts/bybit_cc_recommender_panel.py --server.address 0.0.0.0 --server.port 8509 > logs/cc_panel.log 2>&1 &
+```
+
+> 未设置登录凭据时默认 `admin / change-me-now`，部署到公网前务必修改。
 
 也可以使用 Streamlit secrets 配置：
 
