@@ -97,7 +97,7 @@ python -m trader.main run -c configs/trader/weekend_vol_btc.yaml
 
 | 文件 | 说明 |
 |---|---|
-| `scripts/optimize_btc_covered_call.py` | 覆盖性卖 Call / Collar 历史回测核心逻辑 |
+| `scripts/research/optimize_btc_covered_call.py` | 覆盖性卖 Call / Collar 历史回测核心逻辑 |
 | `scripts/bybit_cc_recommender_panel.py` | 独立 Bybit 行情推荐面板 |
 | `tmp/scan_independent_7of6_vote_count_delta_layers.py` | 7 因子投票数量分层 Delta 网格优化 |
 | `tmp/backtest_layered_delta_natural_monthly_compound.py` | 自然到期后再月度复利回测 |
@@ -323,18 +323,24 @@ options-bt run --config configs/backtest/iron_condor.yaml
 ## 项目结构
 
 ```
-src/options_backtest/    # 回测引擎（策略、撮合、定价、分析）
-trader/                  # 自动交易系统
-  ├── bybit_client/      #   Bybit API 客户端 + Greeks 获取
-  ├── position_manager.py#   仓位管理
-  ├── strategy.py        #   WeekendVolStrategy（支持带翼/无翼结构）
-  ├── engine.py          #   交易引擎（后台线程）
-  ├── dashboard.py       #   Streamlit 管理面板
-  ├── config.py          #   YAML 配置加载
-  └── storage.py         #   SQLite 持久化
-configs/                 # YAML 配置（回测 + 交易）
-monitor/                 # 行情监控面板
-tests/                   # 单元测试与回归测试
+src/options_backtest/      # 回测引擎（策略、撮合、定价、分析）
+trader/                    # 自动交易系统
+configs/
+  backtest/                # 回测配置
+  trader/                  # 实盘/面板配置
+monitor/                   # 行情监控面板
+scripts/
+  build_hourly_parquet.py  # 主数据构建入口
+  bybit_cc_recommender_panel.py
+  backtest_weekend_vol.py
+  data/                    # 数据下载、过滤、衍生数据集构建
+  research/                # 参数扫描、策略对比、研究脚本
+  debug/                   # 诊断、性能分析、API 探针
+  reporting/               # 报告生成与收益图表辅助脚本
+  maintenance/             # 一次性维护和演示数据工具
+tests/
+  options_backtest/        # 回测核心测试
+  trader/                  # 实盘交易模块测试
 ```
 
 ## 测试

@@ -1,5 +1,5 @@
 # Data
-data/
+/data/
 *.parquet
 
 # Python
@@ -19,6 +19,7 @@ build/
 
 # Virtual env
 .venv/
+.venv-1/
 venv/
 env/
 
@@ -35,11 +36,6 @@ Thumbs.db
 reports/
 sandbox/
 .benchmark_tmp/
-
-# Non-trader scripts and backtesting code
-scripts/
-src/options_backtest/
-configs/backtest/
 
 # Logs
 logs/
@@ -64,6 +60,7 @@ tmp/
 *.seg*
 *.csv.tmp
 *.tmp
+scripts/.cdd_0dte_checkpoint.json
 # Environment
 .env
 .env.*
@@ -77,3 +74,4 @@ tmp/
 
 tools/
 1024
+src/options_backtest.egg-info/
