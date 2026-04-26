@@ -1,0 +1,47 @@
+# BTC Weekday 0DTE Short Strangle — Mon-Fri only, real hourly data
+# 周一至周五每天 08:00 UTC 开仓，次日 08:00 到期结算
+# 与现有 weekday IC 配置相比，这里关闭保护翼，仅测试无翼宽跨
+backtest:
+  name: "BTC Weekday 0DTE Short Strangle (Mon-Fri)"
+  start_date: "2023-03-01"
+  end_date: "2026-01-31"
+  time_step: "1h"
+  underlying: "BTC"
+  margin_mode: "USD"
+  use_bs_only: false
+  option_data_source: "options_hourly"
+  option_snapshot_pick: "close"
+  iv_mode: "fixed"
+  fixed_iv: 0.60
+
+account:
+  initial_balance: 1.0
+
+execution:
+  slippage: 0.0001
+  taker_fee: 0.00024
+  maker_fee: 0.00024
+  min_fee: 0.00024
+  max_fee_pct: 0.10
+  delivery_fee: 0.00015
+  delivery_fee_max_pct: 0.10
+
+strategy:
+  name: "ShortStrangle"
+  params:
+    quantity: 1.0
+    min_days_to_expiry: 0.0
+    max_days_to_expiry: 1.5
+    roll_days_before_expiry: 0
+    otm_pct: 0.05                # 5% OTM 宽跨
+    entry_hour: 8                # 每日 08:00 UTC 开仓
+    roll_daily: true             # 每日滚仓
+    compound: true
+    take_profit_pct: 9999        # 禁用止盈，持有到结算
+    stop_loss_pct: 9999          # 禁用止损，持有到结算
+    max_positions: 1
+    hedge_otm_pct: 0.0           # 关闭保护翼 => 纯 short strangle
+    skip_weekends: true          # 仅周一至周五开仓
+
+report:
+  output_dir: "./reports/weekday_0dte_short_strangle_btc"

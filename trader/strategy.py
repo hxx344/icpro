@@ -389,106 +389,41 @@ class WeekendVolStrategy:
         if not self._passes_entry_rv_filter(rv24):
             return
 
-        # --- Get tickers ---
-        try:
-            tickers = self.client.get_tickers(ul)
-        except Exception as e:
-            logger.error(f"[WeekendVol] Failed to fetch tickers: {e}")
+        initial_candidate = self._resolve_entry_candidate(now, ul)
+        if initial_candidate is None:
+            return
+        sell_call, sell_put, buy_call, buy_put, spot, T_years = initial_candidate
+
+        refreshed_candidate = self._resolve_entry_candidate(now, ul)
+        if refreshed_candidate is None:
+            logger.warning("[WeekendVol] Final pre-trade refresh failed – skipping current attempt")
             return
 
-        if not tickers:
-            logger.warning("[WeekendVol] No tickers available")
-            return
-
-        # --- Spot price ---
-        spot = self.client.get_spot_price(ul)
-        if spot <= 0:
-            prices = [t.underlying_price for t in tickers if t.underlying_price > 0]
-            spot = prices[0] if prices else 0
-        if spot <= 0:
-            logger.error("[WeekendVol] Cannot determine spot price")
-            return
-
-        logger.info(f"[WeekendVol] {ul} spot = {spot:.2f}")
-
-        # --- Filter for coming Sunday 08:00 UTC expiry ---
-        sunday_expiry = self._next_sunday_0800(now)
-        tolerance_hours = 2.0  # allow ±2h tolerance for expiry matching
-
-        weekend_tickers = [
-            t for t in tickers
-            if abs((t.expiry - sunday_expiry).total_seconds()) < tolerance_hours * 3600
-        ]
-
-        if not weekend_tickers:
-            logger.warning(
-                f"[WeekendVol] No options expiring around {sunday_expiry.isoformat()} "
-                f"(found {len(tickers)} total tickers)"
-            )
-            return
-
-        logger.info(
-            f"[WeekendVol] Found {len(weekend_tickers)} tickers for Sunday expiry "
-            f"{sunday_expiry.strftime('%Y-%m-%d %H:%M')} UTC"
+        refreshed_sell_call, refreshed_sell_put, refreshed_buy_call, refreshed_buy_put, refreshed_spot, refreshed_T_years = refreshed_candidate
+        original_symbols = (
+            sell_put.symbol,
+            sell_call.symbol,
+            buy_put.symbol if buy_put else "",
+            buy_call.symbol if buy_call else "",
         )
-
-        # --- Fetch Greeks from exchange ---
-        try:
-            self.client.enrich_greeks(weekend_tickers, ul)
-        except Exception as e:
-            logger.warning(f"[WeekendVol] Failed to fetch greeks, will use Black-76 fallback: {e}")
-
-        calls = [t for t in weekend_tickers if t.option_type == "call"]
-        puts = [t for t in weekend_tickers if t.option_type == "put"]
-
-        T_years = max((sunday_expiry - now).total_seconds() / (365.25 * 86400), 1e-6)
-
-        # --- Select strikes by delta ---
-        sell_call = self._find_by_delta(calls, spot, T_years, self.cfg.target_delta, "call")
-        sell_put = self._find_by_delta(puts, spot, T_years, self.cfg.target_delta, "put")
-
-        if not sell_call or not sell_put:
-            logger.warning("[WeekendVol] Could not find both short legs by delta")
-            return
-
-        if sell_call.strike <= spot or sell_put.strike >= spot:
+        refreshed_symbols = (
+            refreshed_sell_put.symbol,
+            refreshed_sell_call.symbol,
+            refreshed_buy_put.symbol if refreshed_buy_put else "",
+            refreshed_buy_call.symbol if refreshed_buy_call else "",
+        )
+        if refreshed_symbols != original_symbols:
             logger.warning(
-                f"[WeekendVol] Reject non-OTM short legs: "
-                f"call K={sell_call.strike} spot={spot}, put K={sell_put.strike} spot={spot}"
+                "[WeekendVol] Entry legs changed on final refresh; switching to latest snapshot: "
+                f"old={original_symbols} new={refreshed_symbols}"
             )
-            return
 
-        # Validate liquidity
-        if sell_call.bid_price <= 0 or sell_put.bid_price <= 0:
-            logger.warning("[WeekendVol] Short legs have no bid – skipping")
-            return
-
-        # --- Wing legs ---
-        buy_call = None
-        buy_put = None
-        if self.cfg.wing_delta > 0:
-            wing_calls = [t for t in calls if float(t.strike) > float(sell_call.strike)]
-            wing_puts = [t for t in puts if float(t.strike) < float(sell_put.strike)]
-            buy_call = self._find_by_delta(wing_calls, spot, T_years, self.cfg.wing_delta, "call")
-            buy_put = self._find_by_delta(wing_puts, spot, T_years, self.cfg.wing_delta, "put")
-
-            if not buy_call or not buy_put:
-                logger.warning("[WeekendVol] Could not find wing legs by delta")
-                return
-
-            # Validate: call sell < buy, put sell > buy
-            if sell_call.strike >= buy_call.strike:
-                logger.warning(
-                    f"[WeekendVol] Invalid call spread: sell K={sell_call.strike} "
-                    f">= buy K={buy_call.strike}"
-                )
-                return
-            if sell_put.strike <= buy_put.strike:
-                logger.warning(
-                    f"[WeekendVol] Invalid put spread: sell K={sell_put.strike} "
-                    f"<= buy K={buy_put.strike}"
-                )
-                return
+        sell_call = refreshed_sell_call
+        sell_put = refreshed_sell_put
+        buy_call = refreshed_buy_call
+        buy_put = refreshed_buy_put
+        spot = refreshed_spot
+        T_years = refreshed_T_years
 
         # --- Compute quantity ---
         quantity = self._compute_quantity(
@@ -590,6 +525,128 @@ class WeekendVolStrategy:
                 status="failed",
             )
             logger.error("[WeekendVol] Failed to open position")
+
+    def _resolve_entry_candidate(
+        self,
+        now: datetime,
+        underlying: str,
+    ) -> tuple[OptionTicker, OptionTicker, OptionTicker | None, OptionTicker | None, float, float] | None:
+        snapshot = self._load_weekend_market_snapshot(now, underlying)
+        if snapshot is None:
+            return None
+
+        calls, puts, spot, T_years = snapshot
+        selected = self._select_entry_legs(calls, puts, spot, T_years)
+        if selected is None:
+            return None
+
+        sell_call, sell_put, buy_call, buy_put = selected
+        return sell_call, sell_put, buy_call, buy_put, spot, T_years
+
+    def _load_weekend_market_snapshot(
+        self,
+        now: datetime,
+        underlying: str,
+    ) -> tuple[list[OptionTicker], list[OptionTicker], float, float] | None:
+        try:
+            tickers = self.client.get_tickers(underlying)
+        except Exception as e:
+            logger.error(f"[WeekendVol] Failed to fetch tickers: {e}")
+            return None
+
+        if not tickers:
+            logger.warning("[WeekendVol] No tickers available")
+            return None
+
+        spot = self.client.get_spot_price(underlying)
+        if spot <= 0:
+            prices = [t.underlying_price for t in tickers if t.underlying_price > 0]
+            spot = prices[0] if prices else 0
+        if spot <= 0:
+            logger.error("[WeekendVol] Cannot determine spot price")
+            return None
+
+        logger.info(f"[WeekendVol] {underlying} spot = {spot:.2f}")
+
+        sunday_expiry = self._next_sunday_0800(now)
+        tolerance_hours = 2.0
+        weekend_tickers = [
+            t for t in tickers
+            if abs((t.expiry - sunday_expiry).total_seconds()) < tolerance_hours * 3600
+        ]
+        if not weekend_tickers:
+            logger.warning(
+                f"[WeekendVol] No options expiring around {sunday_expiry.isoformat()} "
+                f"(found {len(tickers)} total tickers)"
+            )
+            return None
+
+        logger.info(
+            f"[WeekendVol] Found {len(weekend_tickers)} tickers for Sunday expiry "
+            f"{sunday_expiry.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
+
+        try:
+            self.client.enrich_greeks(weekend_tickers, underlying)
+        except Exception as e:
+            logger.warning(f"[WeekendVol] Failed to fetch greeks, will use Black-76 fallback: {e}")
+
+        calls = [t for t in weekend_tickers if t.option_type == "call"]
+        puts = [t for t in weekend_tickers if t.option_type == "put"]
+        T_years = max((sunday_expiry - now).total_seconds() / (365.25 * 86400), 1e-6)
+        return calls, puts, spot, T_years
+
+    def _select_entry_legs(
+        self,
+        calls: list[OptionTicker],
+        puts: list[OptionTicker],
+        spot: float,
+        T_years: float,
+    ) -> tuple[OptionTicker, OptionTicker, OptionTicker | None, OptionTicker | None] | None:
+        sell_call = self._find_by_delta(calls, spot, T_years, self.cfg.target_delta, "call")
+        sell_put = self._find_by_delta(puts, spot, T_years, self.cfg.target_delta, "put")
+
+        if not sell_call or not sell_put:
+            logger.warning("[WeekendVol] Could not find both short legs by delta")
+            return None
+
+        if sell_call.strike <= spot or sell_put.strike >= spot:
+            logger.warning(
+                f"[WeekendVol] Reject non-OTM short legs: "
+                f"call K={sell_call.strike} spot={spot}, put K={sell_put.strike} spot={spot}"
+            )
+            return None
+
+        if sell_call.bid_price <= 0 or sell_put.bid_price <= 0:
+            logger.warning("[WeekendVol] Short legs have no bid – skipping")
+            return None
+
+        buy_call: OptionTicker | None = None
+        buy_put: OptionTicker | None = None
+        if self.cfg.wing_delta > 0:
+            wing_calls = [t for t in calls if float(t.strike) > float(sell_call.strike)]
+            wing_puts = [t for t in puts if float(t.strike) < float(sell_put.strike)]
+            buy_call = self._find_by_delta(wing_calls, spot, T_years, self.cfg.wing_delta, "call")
+            buy_put = self._find_by_delta(wing_puts, spot, T_years, self.cfg.wing_delta, "put")
+
+            if not buy_call or not buy_put:
+                logger.warning("[WeekendVol] Could not find wing legs by delta")
+                return None
+
+            if sell_call.strike >= buy_call.strike:
+                logger.warning(
+                    f"[WeekendVol] Invalid call spread: sell K={sell_call.strike} "
+                    f">= buy K={buy_call.strike}"
+                )
+                return None
+            if sell_put.strike <= buy_put.strike:
+                logger.warning(
+                    f"[WeekendVol] Invalid put spread: sell K={sell_put.strike} "
+                    f"<= buy K={buy_put.strike}"
+                )
+                return None
+
+        return sell_call, sell_put, buy_call, buy_put
 
     def _mark_order_attempt(self, status: str, message: str, group_id: str = "") -> None:
         self._last_order_attempt_at = datetime.now(timezone.utc).isoformat()

@@ -1,0 +1,49 @@
+# BTC 周一卖出、周五到期，按 delta 选腿的宽跨（15-delta）
+backtest:
+  name: "BTC Weekly Short Strangle (Mon entry, Fri expiry, 15-delta)"
+  start_date: "2023-03-01"
+  end_date: "2026-01-31"
+  time_step: "1h"
+  underlying: "BTC"
+  margin_mode: "USD"
+  use_bs_only: false
+  option_data_source: "options_hourly"
+  option_snapshot_pick: "close"
+  iv_mode: "fixed"
+  fixed_iv: 0.60
+
+account:
+  initial_balance: 1.0
+
+execution:
+  slippage: 0.0001
+  taker_fee: 0.00024
+  maker_fee: 0.00024
+  min_fee: 0.00024
+  max_fee_pct: 0.10
+  delivery_fee: 0.00015
+  delivery_fee_max_pct: 0.10
+
+strategy:
+  name: "ShortStrangle"
+  params:
+    quantity: 1.0
+    min_days_to_expiry: 3.5
+    max_days_to_expiry: 4.5
+    roll_days_before_expiry: 0
+    selection_mode: "delta"
+    target_delta: 0.15
+    max_delta_diff: 0.05
+    default_iv: 0.60
+    entry_hour: 8
+    entry_weekdays: [0]
+    roll_daily: false
+    compound: true
+    take_profit_pct: 9999
+    stop_loss_pct: 9999
+    max_positions: 1
+    hedge_otm_pct: 0.0
+    skip_weekends: true
+
+report:
+  output_dir: "./reports/weekly_short_monfri_btc_delta15"
