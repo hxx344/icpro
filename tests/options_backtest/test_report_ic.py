@@ -1,9 +1,12 @@
 """Research safeguards: complete packages, premium accounting, daily PnL basis."""
 from types import SimpleNamespace
+import os
 
 import numpy as np
 import pandas as pd
 import pytest
+
+from scripts.research import backtest_btc_report_ic as report_ic
 
 from scripts.research.backtest_btc_report_ic import (
     CashMarketValueAccount,
@@ -90,3 +93,67 @@ def test_all_four_legs_must_have_sufficient_directional_depth():
     metadata.loc["LP", "ask_amount"] = 0.9
     assert not has_package_depth(legs, metadata, 1.)
     assert not has_package_depth(legs, metadata.drop("LC"), 1.)
+
+
+@pytest.fixture
+def metadata_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(report_ic, "ROOT", tmp_path)
+    monkeypatch.setattr(report_ic, "_ENTRY_METADATA_PREFETCH", {})
+    report_ic._read_entry_metadata.cache_clear()
+    path = tmp_path / "data/options_hourly/BTC/2025-01.parquet"
+    path.parent.mkdir(parents=True)
+    times = pd.to_datetime(["2025-01-03 21:00Z", "2025-01-03 22:00Z", "2025-01-04 21:00Z"])
+    frame = pd.DataFrame({"hour": times, "hourly_pick": ["open"] * 3,
+                          "symbol": ["A"] * 3, "timestamp": [100, 200, 300],
+                          "bid_amount": [1., 2., 3.], "ask_amount": [4., 5., 6.]})
+    frame.to_parquet(path, index=False)
+    cfg = report_ic.Config()
+    cfg.backtest.start_date = "2025-01-03"
+    cfg.backtest.end_date = "2025-01-04 23:00:00"
+    cfg.strategy.params = {"entry_hour_utc": 21, "entry_retry_hours": 2}
+    yield path, frame, cfg
+    report_ic._read_entry_metadata.cache_clear()
+
+
+def test_prefetch_is_one_read_per_month_and_does_not_expose_future_rows(metadata_source, monkeypatch):
+    _, _, cfg = metadata_source
+    real_read = pd.read_parquet
+    reads = []
+
+    def read(*args, **kwargs):
+        reads.append(args[0])
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", read)
+    report_ic.prefetch_entry_metadata(cfg)
+    assert len(reads) == 1
+    first = report_ic.entry_metadata(pd.Timestamp("2025-01-03 21:00Z"))
+    later = report_ic.entry_metadata(pd.Timestamp("2025-01-03 22:00Z"))
+    assert first.loc["A", "bid_amount"] == 1.
+    assert later.loc["A", "bid_amount"] == 2.
+    assert report_ic.entry_metadata(pd.Timestamp("2025-01-03 23:00Z")).empty
+    assert len(reads) == 1
+    # Unscheduled callers retain the direct-read fallback.
+    assert report_ic.entry_metadata(pd.Timestamp("2025-01-04 21:00Z")).loc["A", "bid_amount"] == 3.
+    assert len(reads) == 2
+
+
+def test_metadata_cache_invalidates_when_raw_file_changes(metadata_source):
+    path, frame, cfg = metadata_source
+    now = pd.Timestamp("2025-01-03 21:00Z")
+    report_ic.prefetch_entry_metadata(cfg)
+    assert report_ic.entry_metadata(now).loc["A", "bid_amount"] == 1.
+    previous_mtime = path.stat().st_mtime_ns
+    frame.loc[0, "bid_amount"] = 9.
+    frame.to_parquet(path, index=False)
+    os.utime(path, ns=(previous_mtime + 1_000_000_000, previous_mtime + 1_000_000_000))
+    assert report_ic.entry_metadata(now).loc["A", "bid_amount"] == 9.
+
+
+def test_unused_duplicate_snapshot_does_not_break_prefetch(metadata_source):
+    path, frame, cfg = metadata_source
+    pd.concat([frame, frame.iloc[[1]]]).to_parquet(path, index=False)
+    report_ic.prefetch_entry_metadata(cfg)
+    assert report_ic.entry_metadata(pd.Timestamp("2025-01-03 21:00Z")).loc["A", "bid_amount"] == 1.
+    with pytest.raises(RuntimeError, match="Duplicate opening snapshots"):
+        report_ic.entry_metadata(pd.Timestamp("2025-01-03 22:00Z"))

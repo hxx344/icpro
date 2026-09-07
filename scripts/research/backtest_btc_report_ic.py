@@ -12,6 +12,7 @@ import json
 import sys
 from functools import lru_cache
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -27,16 +28,73 @@ from options_backtest.engine.backtest import BacktestEngine
 from options_backtest.strategy.base import BaseStrategy
 
 
-@lru_cache(maxsize=512)
-def entry_metadata(now: pd.Timestamp) -> pd.DataFrame:
-    """Read sizes/timestamps omitted from the normalized acceleration cache."""
-    path = ROOT / "data" / "options_hourly" / "BTC" / f"{now:%Y-%m}.parquet"
-    df = pd.read_parquet(path, columns=["symbol", "timestamp", "bid_amount", "ask_amount"],
-                         filters=[("hourly_pick", "==", "open"), ("hour", "==", now)])
+_ENTRY_METADATA_PREFETCH: dict[tuple[str, int, int], dict[pd.Timestamp, pd.DataFrame]] = {}
+
+
+def _metadata_source_key(path: Path) -> tuple[str, int, int]:
+    stat = path.stat()
+    return str(path), stat.st_mtime_ns, stat.st_size
+
+
+def _index_entry_metadata(df: pd.DataFrame, now: pd.Timestamp) -> pd.DataFrame:
     df = df.set_index("symbol")
     if not df.index.is_unique:
         raise RuntimeError(f"Duplicate opening snapshots at {now}")
     return df
+
+
+@lru_cache(maxsize=512)
+def _read_entry_metadata(source: tuple[str, int, int], now: pd.Timestamp) -> pd.DataFrame:
+    prepared = _ENTRY_METADATA_PREFETCH.get(source, {}).get(now)
+    if prepared is not None:
+        if not prepared.index.is_unique:
+            raise RuntimeError(f"Duplicate opening snapshots at {now}")
+        return prepared
+    df = pd.read_parquet(source[0], columns=["symbol", "timestamp", "bid_amount", "ask_amount"],
+                         filters=[("hourly_pick", "==", "open"), ("hour", "==", now)])
+    return _index_entry_metadata(df, now)
+
+
+def entry_metadata(now: pd.Timestamp) -> pd.DataFrame:
+    """Return original sizes/timestamps, invalidating cache on source changes."""
+    path = ROOT / "data" / "options_hourly" / "BTC" / f"{now:%Y-%m}.parquet"
+    return _read_entry_metadata(_metadata_source_key(path), now)
+
+
+def prefetch_entry_metadata(cfg: Config) -> None:
+    """Read candidate entry hours together, once per month instead of per hour.
+
+    Only immutable raw quote metadata is prefetched. Trading still evaluates
+    the current hour in order; future snapshots are not exposed to selection.
+    """
+    start = pd.to_datetime(cfg.backtest.start_date, utc=True)
+    end = pd.to_datetime(cfg.backtest.end_date, utc=True)
+    days = pd.date_range(start.normalize(), end.normalize(), freq="D")
+    entry_hour = int(cfg.strategy.params["entry_hour_utc"])
+    last_hour = min(23, entry_hour + int(cfg.strategy.params["entry_retry_hours"]))
+    by_month: dict[str, list[pd.Timestamp]] = {}
+    for day in days[days.weekday == 4]:
+        for hour in range(entry_hour, last_hour + 1):
+            now = day + pd.Timedelta(hours=hour)
+            if start <= now <= end:
+                by_month.setdefault(f"{now:%Y-%m}", []).append(now)
+    _ENTRY_METADATA_PREFETCH.clear()
+    _read_entry_metadata.cache_clear()
+    for month, hours in by_month.items():
+        path = ROOT / "data" / "options_hourly" / "BTC" / f"{month}.parquet"
+        if not path.exists():
+            continue  # No engine snapshots can be loaded from this month either.
+        source = _metadata_source_key(path)
+        raw = pd.read_parquet(
+            path, columns=["hour", "symbol", "timestamp", "bid_amount", "ask_amount"],
+            filters=[("hourly_pick", "==", "open"), ("hour", "in", hours)],
+        )
+        grouped = {
+            now: group.drop(columns="hour").set_index("symbol")
+            for now, group in raw.groupby("hour", sort=False)
+        }
+        empty = _index_entry_metadata(raw.iloc[:0].drop(columns="hour"), None)
+        _ENTRY_METADATA_PREFETCH[source] = {now: grouped.get(now, empty) for now in hours}
 
 
 def has_package_depth(legs, metadata, quantity):
@@ -163,12 +221,14 @@ class ReportEngine(BacktestEngine):
         self.market_marks = 0
 
     def _load_data(self, underlying, start, end, step):
+        started = perf_counter()
         super()._load_data(underlying, start, end, step)
         self._underlying_df = self._underlying_df.copy()
         # Both spot and options use the beginning of the hour, not hour-end data.
         self._underlying_df["close"] = self._underlying_df["open"]
         spot = float(self._underlying_df["close"].iloc[0])
         self.account.initial_balance = self.strategy.params["initial_usd"] / spot
+        self.load_seconds = perf_counter() - started
 
     def _get_quotes_fast(self, instrument_name, ts_np, underlying_price=0.0,
                          price_field="close", *, for_execution=False):
@@ -392,6 +452,7 @@ def write_report(output, summaries, cfg, config_path):
 
 
 def main():
+    started = perf_counter()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/backtest/btc_report_ic_45_15.yaml")
     parser.add_argument("--start")
@@ -411,6 +472,9 @@ def main():
     logger.remove()
     logger.add(str(output / "run.log"), level="INFO")
     logger.add(sys.stderr, level="WARNING")
+    prefetch_started = perf_counter()
+    prefetch_entry_metadata(cfg)
+    timings = {"metadata_prefetch_seconds": perf_counter() - prefetch_started, "modes": {}}
     summaries = {}
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         subplot_titles=("Cumulative PnL (USD)", "Hourly drawdown (USD)"))
@@ -427,10 +491,19 @@ def main():
         (output / name).mkdir(parents=True, exist_ok=True)
         run_cfg.to_yaml(output / name / "effective_config.yaml")
         print(f"Running {name}", flush=True)
+        run_started = perf_counter()
         results = engine.run()
+        run_seconds = perf_counter() - run_started
+        export_started = perf_counter()
         stats, equity, years = summarize(engine, results, output / name)
+        timings["modes"][name] = {
+            "data_load_seconds": engine.load_seconds,
+            "simulation_seconds": run_seconds - engine.load_seconds,
+            "export_seconds": perf_counter() - export_started,
+        }
         summaries[name] = {"summary": stats, "yearly": years}
         print(json.dumps(stats, ensure_ascii=False), flush=True)
+    charts_started = perf_counter()
     for name, _ in modes:
         summary_path = output / name / "summary.json"
         if not summary_path.exists():
@@ -451,6 +524,10 @@ def main():
     fig.write_html(output / "comparison.html", include_plotlyjs=True)
     (output / "comparison.json").write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")
     write_report(output, summaries, cfg, args.config)
+    timings["comparison_export_seconds"] = perf_counter() - charts_started
+    timings["total_seconds_excluding_imports"] = perf_counter() - started
+    (output / "performance.json").write_text(json.dumps(timings, indent=2), encoding="utf-8")
+    print(f"Timing: {timings['total_seconds_excluding_imports']:.2f}s (excluding imports)", flush=True)
     print(f"Reports: {output}", flush=True)
 
 

@@ -60,6 +60,10 @@ class HourlyOptionStore:
         init=False,
         repr=False,
     )
+    _last_quote_rows: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _last_quote_arrays: tuple[np.ndarray, np.ndarray, np.ndarray] | None = field(
+        default=None, init=False, repr=False,
+    )
 
     def get_snapshot(self, timestamp, pick: str = "close") -> pd.DataFrame:
         ts_ns = _to_utc_ns(timestamp)
@@ -103,27 +107,40 @@ class HourlyOptionStore:
         cache_key = (ts_ns, pick_key)
         if self._last_quote_key != cache_key:
             snap = self.get_snapshot(timestamp, pick=pick_key)
+            self._last_quote_map = {}
             if snap.empty:
-                self._last_quote_map = {}
+                self._last_quote_rows = {}
+                self._last_quote_arrays = None
             else:
-                inst_arr = snap["instrument_name"].astype(str).to_numpy()
-                bid_arr = snap["bid_price"].astype(float).to_numpy()
-                ask_arr = snap["ask_price"].astype(float).to_numpy()
-                mark_arr = snap["mark_price"].astype(float).to_numpy()
-                quote_map: dict[str, tuple[float | None, float | None, float | None]] = {}
-                for i, name in enumerate(inst_arr):
-                    bid = float(bid_arr[i]) if np.isfinite(bid_arr[i]) and bid_arr[i] > 0 else None
-                    ask = float(ask_arr[i]) if np.isfinite(ask_arr[i]) and ask_arr[i] > 0 else None
-                    mark = float(mark_arr[i]) if np.isfinite(mark_arr[i]) and mark_arr[i] > 0 else None
-                    if mark is None and bid is not None and ask is not None:
-                        mark = (bid + ask) / 2.0
-                    elif mark is None:
-                        mark = bid or ask
-                    quote_map[name] = (bid, ask, mark)
-                self._last_quote_map = quote_map
+                # Most strategies query a few held legs, not every listed option.
+                # Index the snapshot once and normalize only requested quotes.
+                # dict preserves the previous last-row-wins duplicate semantics.
+                names = snap["instrument_name"].astype(str).to_numpy(copy=False)
+                self._last_quote_rows = dict(zip(names, range(len(names))))
+                self._last_quote_arrays = tuple(
+                    snap[col].to_numpy(dtype=float, copy=False)
+                    for col in ("bid_price", "ask_price", "mark_price")
+                )
             self._last_quote_key = cache_key
 
-        return self._last_quote_map.get(str(instrument_name), (None, None, None))
+        name = str(instrument_name)
+        cached = self._last_quote_map.get(name)
+        if cached is not None:
+            return cached
+        row = self._last_quote_rows.get(name)
+        if row is None:
+            return None, None, None
+        bid_arr, ask_arr, mark_arr = self._last_quote_arrays
+        bid = float(bid_arr[row]) if np.isfinite(bid_arr[row]) and bid_arr[row] > 0 else None
+        ask = float(ask_arr[row]) if np.isfinite(ask_arr[row]) and ask_arr[row] > 0 else None
+        mark = float(mark_arr[row]) if np.isfinite(mark_arr[row]) and mark_arr[row] > 0 else None
+        if mark is None and bid is not None and ask is not None:
+            mark = (bid + ask) / 2.0
+        elif mark is None:
+            mark = bid or ask
+        quote = bid, ask, mark
+        self._last_quote_map[name] = quote
+        return quote
 
     def available_timestamps(self, pick: str = "close") -> np.ndarray:
         return self.available_ts_ns.get(str(pick).lower(), np.array([], dtype=np.int64))
@@ -323,23 +340,18 @@ def _load_or_build_month_cache(
 def _build_hour_index(df: pd.DataFrame) -> dict[tuple[int, str], tuple[int, int]]:
     hour_ns = _series_to_ns(df["hour"])
     pick_arr = df["hourly_pick"].to_numpy(copy=False)
-    index: dict[tuple[int, str], tuple[int, int]] = {}
     if len(df) == 0:
-        return index
+        return {}
 
-    start = 0
-    current_hour = int(hour_ns[0])
-    current_pick = str(pick_arr[0])
-    for i in range(1, len(df)):
-        hour_i = int(hour_ns[i])
-        pick_i = str(pick_arr[i])
-        if hour_i != current_hour or pick_i != current_pick:
-            index[(current_hour, current_pick)] = (start, i)
-            start = i
-            current_hour = hour_i
-            current_pick = pick_i
-    index[(current_hour, current_pick)] = (start, len(df))
-    return index
+    # Locate group boundaries in arrays; Python work scales with snapshot count
+    # instead of the tens of millions of contract rows in a multi-year store.
+    changed = (hour_ns[1:] != hour_ns[:-1]) | (pick_arr[1:] != pick_arr[:-1])
+    starts = np.r_[0, np.flatnonzero(changed) + 1]
+    ends = np.r_[starts[1:], len(df)]
+    return {
+        (int(hour_ns[start]), str(pick_arr[start])): (int(start), int(end))
+        for start, end in zip(starts, ends)
+    }
 
 
 def _build_quote_index(df: pd.DataFrame) -> tuple[dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]], dict[str, np.ndarray]]:
