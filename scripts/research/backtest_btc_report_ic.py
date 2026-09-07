@@ -335,11 +335,14 @@ def summarize(engine, results, output):
     return stats, equity, years
 
 
-def write_report(output, summaries):
+def write_report(output, summaries, cfg, config_path):
+    params = cfg.strategy.params
+    short_delta, wing_delta = params["short_delta"], params["wing_delta"]
+    delta_label = f"{short_delta * 100:g}/{wing_delta * 100:g}"
     labels = {"mark_no_fees": "标记价、无费用基准", "touch_with_fees": "盘口价格、含费用（不校验数量）",
               "touch_depth_checked": "盘口价格、含费用、校验四腿数量"}
     lines = [
-        "# BTC 45/15 四腿策略本地回测", "",
+        f"# BTC {delta_label} 四腿策略本地回测", "",
         "参考文件：`f27123cd490f461f_report.txt`。这是本地挂牌期权近似回测，不是原报告的 SABR/WV4 曲面复现。", "",
         "## 结果", "",
         "| 口径 | 净盈亏 USD | 日度 PnL Sharpe | 日度最大回撤 USD | 小时最大回撤 USD | 组合数 | 组合胜率 |",
@@ -361,7 +364,7 @@ def write_report(output, summaries):
                      f"{row['daily_pnl_sharpe_365']:.3f} | {int(row['packages'])} | {row['package_win_rate']:.2%} |")
     lines += ["", "2023、2026 为不完整年度，不将上述盈亏当作全年收益。", "",
               "## 交易规则与数据差异", "",
-              "- BTC，USD 线性盈亏。卖 Call/Put 的绝对 Delta 目标各 0.45，买 Call/Put 各 0.15，每腿固定 1 BTC，不复利、不做 Delta 对冲，不设额外止盈止损。",
+              f"- BTC，USD 线性盈亏。卖 Call/Put 的绝对 Delta 目标各 {short_delta:g}，买 Call/Put 各 {wing_delta:g}，每腿固定 {params['quantity']:g} BTC，不复利、不做 Delta 对冲，不设额外止盈止损。",
               "- 周五 21:00 UTC 开仓，最多持有一组，至周日挂牌合约 08:00 UTC 结算。若整组无法成交，22:00、23:00 重试，之后跳过该周。数量校验版本也对盘口数量不足作同样处理。",
               "- 标记价与不校验数量的盘口版本使用相同选腿，便于拆分价差与费用影响；数量校验版本的交易时间和样本会变化，不能把它与前两版的差额全部解释为费用。",
               "- 使用小时 `open` 快照及标的小时开盘价。原始快照在整点后数秒到达，不是严格同一毫秒的同时成交；不能复现原报告逐分钟向后搜索。",
@@ -376,15 +379,15 @@ def write_report(output, summaries):
               "- 组合胜率按一整组四腿的费后净盈亏计算。非零日胜率按每日非零 PnL 计算；两者不可混用，也不使用单腿胜率替代组合胜率。",
               "- 现金已收付权利金，持仓权益按现金＋有符号的期权市值计算，避免重复计入开仓权利金。相关修正只在本次研究脚本中生效。",
               f"- 数量校验版本：{s['eligible_fridays']} 个候选周五，成交 {s['packages']} 组，跳过 {s['skipped_fridays']} 周；开仓小时分布 {s['entry_hours_utc']}。",
-              f"- 四腿平均绝对 Delta 误差 {s['delta_error_mean']:.4f}，最大 {s['delta_error_max']:.4f}；这些结果不能当作精确 0.45/0.15 Delta 曲面组合。",
+              f"- 四腿平均绝对 Delta 误差 {s['delta_error_mean']:.4f}，最大 {s['delta_error_max']:.4f}；这些结果不能当作精确 {short_delta:g}/{wing_delta:g} Delta 曲面组合。",
               f"- 数量不足的已成交腿 {s['legs_touch_size_below_quantity']}；缺失持仓报价记录 {s['stale_mark_observations']}；原始快照较整点延迟 {s['min_snapshot_delay_seconds']:.3f}–{s['max_snapshot_delay_seconds']:.3f} 秒。",
               f"- 逐腿现金流、整组净 PnL 与最终权益已核对；整组账本差额 {s['ledger_reconciliation_error_usd']:.2e} USD。所有组合均四腿完整、无重叠、到期结算。",
               f"- 数量校验版本非零日胜率 {s['nonzero_daily_win_rate']:.2%}（{s['winning_days']}/{s['nonzero_days']}）；日度美元 PnL Calmar {s['pnl_calmar_365']:.3f}。", "",
               "## 复现与交付", "",
               "在项目根目录运行：", "", "```powershell",
-              r".\.venv-1\Scripts\python.exe scripts/research/backtest_btc_report_ic.py", "```", "",
-              "配置：`configs/backtest/btc_report_ic_45_15.yaml`。可用 `--mode` 单独运行一种口径；更改区间时请用新的 `--output-dir`。结束时间应落在组合结算之后，否则完整性检查会拒绝输出。", "",
-              "报告目录：`reports/btc_report_ic_45_15/`。`comparison.html` 为交互曲线，`comparison.json` 为汇总；各口径子目录含 `legs.csv`、`packages.csv`、`daily_pnl_21utc.csv`、`hourly_equity.csv`、`yearly.csv`、`entry_attempts.csv`、`source_snapshot_audit.csv`。", ""]
+              rf'.\.venv-1\Scripts\python.exe scripts/research/backtest_btc_report_ic.py --config "{config_path}"', "```", "",
+              f"配置：`{config_path}`。可用 `--mode` 单独运行一种口径；更改区间时请用新的 `--output-dir`。结束时间应落在组合结算之后，否则完整性检查会拒绝输出。", "",
+              f"报告目录：`{output.as_posix()}`。`comparison.html` 为交互曲线，`comparison.json` 为汇总；各口径子目录含 `legs.csv`、`packages.csv`、`daily_pnl_21utc.csv`、`hourly_equity.csv`、`yearly.csv`、`entry_attempts.csv`、`source_snapshot_audit.csv`。", ""]
     (output / "README.md").write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -444,10 +447,10 @@ def main():
         fig.add_trace(go.Scatter(x=equity.index, y=equity.cumulative_pnl_usd, name=name), row=1, col=1)
         fig.add_trace(go.Scatter(x=equity.index, y=equity.drawdown_usd, name=name, showlegend=False), row=2, col=1)
     fig.update_layout(template="plotly_white", height=850,
-                      title="BTC listed IC 45/15 | Fixed 1 BTC/leg | Fri 21 UTC to Sun 08 UTC")
+                      title=f"BTC listed IC {cfg.strategy.params['short_delta'] * 100:g}/{cfg.strategy.params['wing_delta'] * 100:g} | Fixed {cfg.strategy.params['quantity']:g} BTC/leg | Fri 21 UTC to Sun 08 UTC")
     fig.write_html(output / "comparison.html", include_plotlyjs=True)
     (output / "comparison.json").write_text(json.dumps(summaries, indent=2, ensure_ascii=False), encoding="utf-8")
-    write_report(output, summaries)
+    write_report(output, summaries, cfg, args.config)
     print(f"Reports: {output}", flush=True)
 
 

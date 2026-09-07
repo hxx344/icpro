@@ -1,0 +1,37 @@
+# Same experiment as btc_report_ic_45_15.yaml; only the wing delta changes.
+# Run with scripts/research/backtest_btc_report_ic.py --config this-file.
+backtest:
+  name: BTC report IC 45/10 fixed 1 BTC per leg
+  start_date: '2023-03-20'
+  end_date: '2026-03-24 23:00:00'
+  time_step: 1h
+  underlying: BTC
+  margin_mode: USD
+  use_bs_only: false
+  option_data_source: options_hourly
+  option_snapshot_pick: open
+  show_progress: false
+account:
+  initial_balance: 1.0
+execution:
+  require_touch_quote: true
+  require_real_quote_source: true
+  slippage: 0.0
+  taker_fee: 0.00024
+  maker_fee: 0.00024
+  min_fee: 0.00024
+  max_fee_pct: 0.10
+  delivery_fee: 0.00015
+  delivery_fee_max_pct: 0.10
+strategy:
+  name: BTCReportListedIC
+  params:
+    initial_usd: 10000.0
+    short_delta: 0.45
+    wing_delta: 0.10
+    quantity: 1.0
+    entry_hour_utc: 21
+    entry_retry_hours: 2
+report:
+  output_dir: reports/btc_report_ic_45_10
+  generate_plots: true
