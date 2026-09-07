@@ -61,7 +61,7 @@ def entry_metadata(now: pd.Timestamp) -> pd.DataFrame:
     return _read_entry_metadata(_metadata_source_key(path), now)
 
 
-def prefetch_entry_metadata(cfg: Config) -> None:
+def prefetch_entry_metadata(cfg: Config, *, additional_hours=()) -> None:
     """Read candidate entry hours together, once per month instead of per hour.
 
     Only immutable raw quote metadata is prefetched. Trading still evaluates
@@ -78,9 +78,14 @@ def prefetch_entry_metadata(cfg: Config) -> None:
             now = day + pd.Timedelta(hours=hour)
             if start <= now <= end:
                 by_month.setdefault(f"{now:%Y-%m}", []).append(now)
+    for timestamp in additional_hours:
+        now = pd.to_datetime(timestamp, utc=True)
+        if start <= now <= end:
+            by_month.setdefault(f"{now:%Y-%m}", []).append(now)
     _ENTRY_METADATA_PREFETCH.clear()
     _read_entry_metadata.cache_clear()
     for month, hours in by_month.items():
+        hours = sorted(set(hours))
         path = ROOT / "data" / "options_hourly" / "BTC" / f"{month}.parquet"
         if not path.exists():
             continue  # No engine snapshots can be loaded from this month either.
@@ -260,9 +265,10 @@ class ReportEngine(BacktestEngine):
 
     def _process_orders(self, ts_np, underlying_price, ctx=None, price_field="close"):
         expected = len(self._pending_orders)
-        before = len(self.strategy.fills)
+        before = len(self.strategy.fills) + len(getattr(self.strategy, "exit_fills", ()))
         super()._process_orders(ts_np, underlying_price, ctx, price_field)
-        if len(self.strategy.fills) - before != expected:
+        after = len(self.strategy.fills) + len(getattr(self.strategy, "exit_fills", ()))
+        if after - before != expected:
             raise RuntimeError("Incomplete package execution; discard this run")
         self.position_mgr.update_marks(self._get_mark_prices_fast(ts_np, underlying_price))
 
@@ -303,7 +309,7 @@ def audit_raw_entries(trades):
     return audit
 
 
-def summarize(engine, results, output):
+def summarize(engine, results, output, *, allow_early_close=False):
     output.mkdir(parents=True, exist_ok=True)
     strategy = engine.strategy
     equity = pd.DataFrame(results["equity_history"], columns=[
@@ -328,10 +334,23 @@ def summarize(engine, results, output):
     trades["exit_time"] = pd.to_datetime(trades.exit_time, utc=True)
     fees = pd.DataFrame(strategy.fills)
     fees["entry_time"] = pd.to_datetime(fees.entry_time, utc=True)
-    if not trades.close_type.eq("settlement").all():
+    if allow_early_close:
+        assert trades.close_type.isin(["settlement", "trade"]).all()
+        expected_exits = {pd.to_datetime(e["entry_time"], utc=True): e["exit_time"]
+                          for e in strategy.exits}
+        closed = trades.loc[trades.close_type == "trade"]
+        assert closed.exit_time.eq(closed.entry_time.map(expected_exits)).all(), "Unscheduled exit"
+        assert trades.groupby("entry_time").exit_time.nunique().eq(1).all(), "Split package exit"
+        assert trades.groupby("entry_time").close_type.nunique().eq(1).all(), "Mixed exit types"
+    elif not trades.close_type.eq("settlement").all():
         raise RuntimeError("Unexpected early or forced close in hold-to-expiry run")
     trades = trades.merge(fees, on=["entry_time", "instrument_name"], validate="one_to_one")
     trades["net_pnl_usd"] = trades.pnl - trades.entry_fee
+    if allow_early_close:
+        # Trade-close PnL excludes its fill fee; settlement PnL includes delivery fee.
+        trades["close_fee"] = trades.fee.where(trades.close_type == "trade", 0.0)
+        trades["delivery_fee"] = trades.fee.where(trades.close_type == "settlement", 0.0)
+        trades["net_pnl_usd"] -= trades.close_fee
     trades["gross_pnl_usd"] = trades.net_pnl_usd + trades.entry_fee + trades.fee
     entries = pd.DataFrame(strategy.entries)
     trades = trades.merge(entries, on=["entry_time", "instrument_name"], validate="one_to_one")
@@ -343,6 +362,9 @@ def summarize(engine, results, output):
         gross_pnl_usd=("gross_pnl_usd", "sum"), entry_fees_usd=("entry_fee", "sum"),
         settlement_fees_usd=("fee", "sum"), net_pnl_usd=("net_pnl_usd", "sum"),
         min_dte_hours=("dte_hours", "min"), max_dte_hours=("dte_hours", "max"))
+    if allow_early_close:
+        packages["settlement_fees_usd"] = trades.groupby("entry_time").delivery_fee.sum()
+        packages["close_fees_usd"] = trades.groupby("entry_time").close_fee.sum()
     assert packages.legs.eq(4).all(), "Partial packages"
     assert trades.quantity.eq(strategy.params["quantity"]).all(), "Unexpected position sizing"
     assert len(packages) == len(strategy.entries) // 4
@@ -377,6 +399,9 @@ def summarize(engine, results, output):
         "max_snapshot_delay_seconds": float(audit.snapshot_delay_seconds.max()),
         "legs_touch_size_below_quantity": int((audit.touch_size < audit.quantity).sum()),
     })
+    if allow_early_close:
+        stats["close_fees_usd"] = float(packages.close_fees_usd.sum())
+        stats["early_close_packages"] = len(strategy.exits)
     equity.to_csv(output / "hourly_equity.csv")
     daily.rename("pnl_usd").to_csv(output / "daily_pnl_21utc.csv", index_label="timestamp")
     trades.to_csv(output / "legs.csv", index=False)
