@@ -231,9 +231,10 @@ class Downloader:
         os.replace(part, final)
         shutil.rmtree(seg_dir, ignore_errors=True)
 
-def process_day(d: date, keep_cache: bool, chunk_mb: int) -> int:
+def process_day(d: date, keep_cache: bool, chunk_mb: int, underlyings: str) -> int:
     cmd = [sys.executable, "-u", str(BHP_SCRIPT), "--_worker-date", d.isoformat(), "--cache-only",
-           "--csv-read-mode", "polars-stream", "--polars-stream-chunk-mb", str(chunk_mb)]
+           "--csv-read-mode", "polars-stream", "--polars-stream-chunk-mb", str(chunk_mb),
+           "--underlyings", underlyings]
     if keep_cache:
         cmd.append("--keep-cache")
     return subprocess.run(cmd).returncode
@@ -255,6 +256,7 @@ def main() -> int:
     ap.add_argument("--download-only", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--polars-stream-chunk-mb", type=int, default=64)
+    ap.add_argument("--underlyings", default="BTC,ETH", help="comma-separated underlyings to keep")
     args = ap.parse_args()
 
     os.chdir(args.data_root)
@@ -313,7 +315,7 @@ def main() -> int:
                 ok.append(d)
                 continue
             t0 = time.time()
-            rc = process_day(d, args.keep_cache, args.polars_stream_chunk_mb)
+            rc = process_day(d, args.keep_cache, args.polars_stream_chunk_mb, args.underlyings)
             if rc == 0:
                 processed.add(d.isoformat())
                 bhp.save_checkpoint(processed)

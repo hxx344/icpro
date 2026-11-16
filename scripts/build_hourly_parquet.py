@@ -4373,6 +4373,8 @@ def main():
                         help="Limit CPU thread usage for Arrow/BLAS (0=auto, 1=lowest CPU, 2-4 recommended)")
     parser.add_argument("--force", action="store_true",
                         help="Re-download and reprocess all dates")
+    parser.add_argument("--underlyings", type=str, default="BTC,ETH",
+                        help="Comma-separated underlyings to keep (default: BTC,ETH)")
     parser.add_argument("--verbose", "-v", action="store_true")
     # Hidden args for subprocess worker isolation
     parser.add_argument("--_worker-date", dest="_worker_date", type=str,
@@ -4391,7 +4393,11 @@ def main():
     global _proxy, _session, _download_segments, timer, _csv_read_mode, _csv_block_mb, _hybrid_chunk_mb, _hybrid_staging
     global _stream_merge_every_batches, _stream_queue_depth, _mem_soft_limit_mb, _mem_hard_limit_mb
     global _mem_diagnostics, _mem_diag_every_batches, _mem_peak_interval_ms, _pandas_slice_rows, _csv_aggressive_parse
-    global _polars_stream_chunk_mb, _WORKER_PROGRESS_FILE
+    global _polars_stream_chunk_mb, _WORKER_PROGRESS_FILE, _VALID_UNDERLYINGS
+
+    _VALID_UNDERLYINGS = {u.strip().upper() for u in args.underlyings.split(",") if u.strip()}
+    if not _VALID_UNDERLYINGS:
+        parser.error("--underlyings must name at least one underlying")
 
     _csv_read_mode = args.csv_read_mode
     _csv_block_mb = max(16, args.csv_block_mb)
@@ -4700,6 +4706,7 @@ def main():
             "--mem-peak-interval-ms", str(args.mem_peak_interval_ms),
             "--pandas-slice-rows", str(args.pandas_slice_rows),
             "--cpu-limit", str(args.cpu_limit),
+            "--underlyings", args.underlyings,
         ]
         if args.csv_aggressive_parse:
             cmd.append("--csv-aggressive-parse")
