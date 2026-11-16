@@ -1013,6 +1013,28 @@ def _emit_worker_progress(percent: float, stage: str, message: str = ""):
             pass
 
 
+_STREAM_PROGRESS_LAST_TS = 0.0
+
+
+def _emit_stream_read_progress(max_hour_us: int, data_date: Optional[date]) -> None:
+    """Report how far into the day a time-ordered stream has been parsed."""
+    global _STREAM_PROGRESS_LAST_TS
+    if _WORKER_PROGRESS_FILE is None:
+        return
+    now = time.time()
+    if now - _STREAM_PROGRESS_LAST_TS < 1.0:
+        return
+    _STREAM_PROGRESS_LAST_TS = now
+    hour_us = 3_600_000_000
+    if data_date is not None:
+        day_start_us = int(datetime(data_date.year, data_date.month, data_date.day, tzinfo=timezone.utc).timestamp()) * 1_000_000
+        hour_idx = (max_hour_us - day_start_us) // hour_us
+    else:
+        hour_idx = (max_hour_us // hour_us) % 24
+    hour_idx = max(0, min(23, int(hour_idx)))
+    # The read stage spans 12%..78% of a worker's progress.
+    _emit_worker_progress(12 + 66 * (hour_idx + 1) / 24, "read", f"hour {hour_idx + 1:02d}/24")
+
 def _register_child_process(proc: subprocess.Popen):
     with _CHILD_PROCS_LOCK:
         _CHILD_PROCS.add(proc)
@@ -2683,6 +2705,7 @@ def _process_zst_to_hourly_polars_stream(
                     pending_rows = pending_tail.height if pending_tail is not None else 0
                     timer.stop(rows=(hourly_rows + pending_rows))
                     continue
+                _emit_stream_read_progress(chunk_max_hour_us, data_date)
 
                 if pending_tail is not None and pending_tail.height > 0 and pending_hour_us is not None:
                     older_part = chunk_hourly.filter(pl.col("hour_us") < pending_hour_us)
