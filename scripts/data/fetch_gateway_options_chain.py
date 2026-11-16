@@ -43,6 +43,7 @@ SYMBOL = "OPTIONS"
 LINK_REUSE_SECONDS = 50 * 60
 BHP_SCRIPT = Path(__file__).resolve().parents[1] / "build_hourly_parquet.py"
 GIB = 2**30
+LOG_APPEND_LOCK = threading.Lock()
 STAGE_LABELS = {
     "starting": "启动", "prepare": "准备", "read": "解压解析", "validate": "校验",
     "write": "写入 parquet", "cleanup": "清理缓存", "done": "完成", "retry": "重试",
@@ -77,6 +78,26 @@ def clip(text: str, width: int) -> str:
     return text
 
 
+class Slot:
+    """Live state of one download or processing worker."""
+
+    def __init__(self, idle: str):
+        self.date: date | None = None
+        self.size = 0
+        self.phase = idle
+        self.bytes_fn = None
+        self.samples: collections.deque = collections.deque(maxlen=12)
+        self.started = 0.0
+        self.progress_file: Path | None = None
+
+    def begin(self, d: date, size: int = 0, phase: str = "") -> None:
+        self.samples.clear()
+        self.size, self.phase, self.started, self.date = size, phase, time.time(), d
+
+    def idle(self, phase: str) -> None:
+        self.date, self.bytes_fn, self.progress_file, self.phase = None, None, None, phase
+
+
 class Status:
     """Shared pipeline state plus a live terminal panel.
 
@@ -85,7 +106,8 @@ class Status:
     written instead.
     """
 
-    def __init__(self, total_days: int, total_bytes: int, max_ahead: int, log_path: Path):
+    def __init__(self, total_days: int, total_bytes: int, max_ahead: int, log_path: Path,
+                 dl_workers: int, proc_workers: int):
         self.lock = threading.Lock()
         self.total_days = total_days
         self.total_bytes = total_bytes
@@ -93,16 +115,9 @@ class Status:
         self.started = time.time()
         self.done_days = 0
         self.fetched_bytes = 0  # bytes of fully downloaded files
-        self.dl_date: date | None = None
-        self.dl_size = 0
-        self.dl_phase = "准备中"
-        self.dl_bytes_fn = None
-        self.dl_samples: collections.deque = collections.deque(maxlen=12)
+        self.dl = [Slot("准备中") for _ in range(dl_workers)]
+        self.proc = [Slot("等待下载完成") for _ in range(proc_workers)]
         self.waiting: list[date] = []
-        self.proc_date: date | None = None
-        self.proc_started = 0.0
-        self.proc_file: Path | None = None
-        self.proc_phase = "等待下载完成"
         self._events: list[str] = []
         self._panel_lines = 0
         self._stop = threading.Event()
@@ -137,7 +152,7 @@ class Status:
                 self._flush_events()
                 if time.time() - last_plain >= 30:
                     last_plain = time.time()
-                    print(" | ".join(self._panel()[:4]), flush=True)
+                    print(" | ".join(self._panel()), flush=True)
 
     def _flush_events(self) -> None:
         with self.lock:
@@ -145,8 +160,9 @@ class Status:
         for line in events:
             print(line, flush=True)
 
-    def _dl_progress(self) -> tuple[int, float]:
-        fn = self.dl_bytes_fn
+    @staticmethod
+    def _dl_progress(slot: Slot) -> tuple[int, float]:
+        fn = slot.bytes_fn
         if fn is None:
             return 0, 0.0
         try:
@@ -154,16 +170,18 @@ class Status:
         except OSError:
             got = 0
         now = time.time()
-        self.dl_samples.append((now, got))
-        t0, b0 = self.dl_samples[0]
+        slot.samples.append((now, got))
+        t0, b0 = slot.samples[0]
         speed = (got - b0) / (now - t0) if now - t0 > 0.5 and got >= b0 else 0.0
         return got, speed
 
-    def _read_proc(self) -> tuple[float, str]:
-        if self.proc_file is None:
+    @staticmethod
+    def _read_proc(slot: Slot) -> tuple[float, str]:
+        path = slot.progress_file
+        if path is None:
             return 0.0, ""
         try:
-            payload = json.loads(self.proc_file.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return 0.0, "启动"
         stage = str(payload.get("stage", ""))
@@ -174,38 +192,43 @@ class Status:
 
     def _panel(self) -> list[str]:
         now = time.time()
-        got, speed = self._dl_progress()
+        dl_lines = []
+        in_flight = 0
+        total_speed = 0.0
+        for i, slot in enumerate(self.dl, 1):
+            d, size, phase = slot.date, slot.size, slot.phase
+            if d is None:
+                dl_lines.append(f"下载{i}  [{phase}]")
+                continue
+            got, speed = self._dl_progress(slot)
+            in_flight += got
+            total_speed += speed
+            left = fmt_dur((size - got) / speed) if speed > 0 else "--"
+            dl_lines.append(
+                f"下载{i}  {bar(got / max(1, size))} {d} {got / max(1, size) * 100:5.1f}%"
+                f"  {got / GIB:.2f}/{size / GIB:.2f} GiB  {speed / 1e6:5.1f} MB/s  剩余 {left}  [{phase}]"
+            )
         with self.lock:
-            dl_date, dl_size, dl_phase = self.dl_date, self.dl_size, self.dl_phase
             waiting = list(self.waiting)
-            proc_date, proc_started, proc_phase = self.proc_date, self.proc_started, self.proc_phase
             done_days, fetched = self.done_days, self.fetched_bytes
-        moved = fetched + (got if dl_date else 0)
+        moved = fetched + in_flight
         elapsed = now - self.started
         rate = moved / elapsed if elapsed > 5 else 0.0
         eta = fmt_dur((self.total_bytes - moved) / rate) if rate > 0 else "--"
         lines = [
             f"总进度 {bar(done_days / max(1, self.total_days))} {done_days}/{self.total_days} 天"
-            f"  已下载 {moved / GIB:.1f}/{self.total_bytes / GIB:.1f} GiB"
+            f"  已下载 {moved / GIB:.1f}/{self.total_bytes / GIB:.1f} GiB  {total_speed / 1e6:.1f} MB/s"
             f"  已用 {fmt_dur(elapsed)}  预计剩余 {eta}",
+            *dl_lines,
+            f"待处理队列 {len(waiting)}/{self.max_ahead}: " + (", ".join(d.isoformat() for d in waiting) or "空"),
         ]
-        if dl_date:
-            left = fmt_dur((dl_size - got) / speed) if speed > 0 else "--"
-            lines.append(
-                f"下载   {bar(got / max(1, dl_size))} {dl_date} {got / max(1, dl_size) * 100:5.1f}%"
-                f"  {got / GIB:.2f}/{dl_size / GIB:.2f} GiB  {speed / 1e6:5.1f} MB/s  剩余 {left}  [{dl_phase}]"
-            )
-        else:
-            lines.append(f"下载   [{dl_phase}]")
-        queue_txt = ", ".join(d.isoformat() for d in waiting) or "空"
-        lines.append(f"待处理队列 {len(waiting)}/{self.max_ahead}: {queue_txt}")
-        if proc_date:
-            pct, stage = self._read_proc()
-            lines.append(
-                f"处理   {bar(pct / 100)} {proc_date} {pct:5.1f}%  {stage}  已用 {fmt_dur(now - proc_started)}"
-            )
-        else:
-            lines.append(f"处理   [{proc_phase}]")
+        for i, slot in enumerate(self.proc, 1):
+            d = slot.date
+            if d is None:
+                lines.append(f"处理{i}  [{slot.phase}]")
+                continue
+            pct, stage = self._read_proc(slot)
+            lines.append(f"处理{i}  {bar(pct / 100)} {d} {pct:5.1f}%  {stage}  已用 {fmt_dur(now - slot.started)}")
         return lines
 
     def _render(self, final: bool = False) -> None:
@@ -225,7 +248,6 @@ class Status:
         self._panel_lines = 0 if final else len(panel)
         sys.stdout.write("".join(out))
         sys.stdout.flush()
-
 
 def load_bhp():
     spec = importlib.util.spec_from_file_location("build_hourly_parquet", BHP_SCRIPT)
@@ -334,11 +356,7 @@ class Downloader:
             time.sleep(min(30, 2 * (attempt + 1)))
         raise RuntimeError(f"chunk {start}-{end} failed: {last}")
 
-    def _phase(self, text: str) -> None:
-        with self.status.lock:
-            self.status.dl_phase = text
-
-    def download(self, d: date, size: int, final: Path) -> None:
+    def download(self, d: date, size: int, final: Path, slot: Slot) -> None:
         st = self.status
         if final.exists() and final.stat().st_size == size:
             st.event(f"[dl] {d} 已在本地缓存，跳过下载")
@@ -373,22 +391,21 @@ class Downloader:
                         total += entry.stat().st_size
             return total
 
-        with st.lock:
-            st.dl_date, st.dl_size, st.dl_bytes_fn = d, size, bytes_on_disk
-            st.dl_samples.clear()
+        slot.begin(d, size, "准备")
+        slot.bytes_fn = bytes_on_disk
         for _ in range(3):
             todo = missing()
             if not todo:
                 break
             if not state["loc"] or time.time() - state["issued_at"] > LINK_REUSE_SECONDS:
-                self._phase("申请下载链接")
+                slot.phase = "申请下载链接"
                 state["loc"] = self.gateway.issue_link(d)
                 state["issued_at"] = time.time()
                 state_path.write_text(json.dumps(state))
                 st.event(f"[dl] {d} 已申请下载链接（扣除额度 {size / GIB:.2f} GiB）")
             elif len(todo) < len(ranges):
                 st.event(f"[dl] {d} 续传：剩余 {len(todo)}/{len(ranges)} 个分块，复用原链接")
-            self._phase(f"下载中，{self.connections} 连接")
+            slot.phase = f"下载中，{self.connections} 连接"
             total = sum(e - s + 1 for _, s, e in todo)
             t0 = time.time()
             expired = False
@@ -412,7 +429,7 @@ class Downloader:
                      f"（{total / (time.time() - t0) / 1e6:.1f} MB/s）")
         if missing():
             raise RuntimeError(f"download {d} incomplete")
-        self._phase("合并分块")
+        slot.phase = "合并分块"
         part = final.with_name(final.name + ".part")
         with open(part, "wb") as out:
             for seg, _, _ in ranges:
@@ -422,36 +439,41 @@ class Downloader:
             raise RuntimeError(f"download {d} size mismatch after assembly")
         os.replace(part, final)
         with st.lock:
-            st.dl_date, st.dl_bytes_fn = None, None
+            slot.idle("已下完")
             st.fetched_bytes += size
         shutil.rmtree(seg_dir, ignore_errors=True)
 
 
-def process_day(d: date, args, status: Status, worker_log: Path) -> int:
+def process_day(d: date, args, slot: Slot, worker_log: Path) -> int:
     progress_file = Path(tempfile.gettempdir()) / f"_gateway_fetch_progress_{os.getpid()}_{d.isoformat()}.json"
+    day_log = worker_log.with_name(f"{worker_log.stem}_{d.isoformat()}.log")
     cmd = [sys.executable, "-u", str(BHP_SCRIPT), "--_worker-date", d.isoformat(), "--cache-only",
            "--csv-read-mode", "polars-stream", "--polars-stream-chunk-mb", str(args.polars_stream_chunk_mb),
            "--underlyings", args.underlyings, "--_progress-file", str(progress_file)]
     if args.keep_cache:
         cmd.append("--keep-cache")
-    with status.lock:
-        status.proc_date, status.proc_started, status.proc_file = d, time.time(), progress_file
+    slot.begin(d)
+    slot.progress_file = progress_file
     try:
-        with open(worker_log, "a", encoding="utf-8") as out:
-            out.write(f"\n===== {d} =====\n")
-            out.flush()
-            return subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT).returncode
+        with open(day_log, "w", encoding="utf-8") as out:
+            rc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT).returncode
     finally:
-        with status.lock:
-            status.proc_date, status.proc_file = None, None
+        slot.idle("等待下载完成")
         progress_file.unlink(missing_ok=True)
+    # Keep one combined log; per-day files only exist while workers run side by side.
+    with LOG_APPEND_LOCK, open(worker_log, "a", encoding="utf-8") as combined:
+        combined.write(f"\n===== {d} (exit {rc}) =====\n")
+        combined.write(day_log.read_text(encoding="utf-8", errors="replace"))
+    day_log.unlink(missing_ok=True)
+    return rc
 
 
-def tail(path: Path, lines: int = 6) -> list[str]:
+def log_tail(path: Path, marker: str, lines: int = 6) -> list[str]:
     try:
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+        text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return []
+    return text[text.rfind(marker):].splitlines()[-lines:]
 
 
 def main() -> int:
@@ -460,9 +482,12 @@ def main() -> int:
     ap.add_argument("--end", default=datetime.now(timezone.utc).date().isoformat())
     ap.add_argument("--data-root", default=".", help="directory holding data/ and tmp/ (default: cwd)")
     ap.add_argument("--proxy", default=None, help="route gateway and file transfers through this proxy")
-    ap.add_argument("--connections", type=int, default=16)
+    ap.add_argument("--download-workers", type=int, default=2, help="days downloaded at the same time")
+    ap.add_argument("--process-workers", type=int, default=2, help="days converted at the same time")
+    ap.add_argument("--connections", type=int, default=8, help="connections per downloading day")
     ap.add_argument("--chunk-mb", type=int, default=32)
-    ap.add_argument("--max-ahead", type=int, default=2, help="downloaded days allowed to wait for processing")
+    ap.add_argument("--max-ahead", type=int, default=0,
+                    help="downloaded days allowed to wait for processing (default: download workers + 1)")
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--user", default=None)
     ap.add_argument("--token-file", default="~/.cdg_token")
@@ -489,98 +514,121 @@ def main() -> int:
             print(f"  {d}  {files[d] / GIB:6.2f} GiB")
         return 0
 
-    max_ahead = max(1, args.max_ahead)
+    n_dl = max(1, min(args.download_workers, len(todo)))
+    n_proc = max(1, min(args.process_workers, len(todo)))
+    max_ahead = args.max_ahead if args.max_ahead > 0 else n_dl + 1
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     worker_log = log_dir / f"gateway_fetch_{stamp}_worker.log"
-    status = Status(len(todo), total, max_ahead, log_dir / f"gateway_fetch_{stamp}.log")
-    print(f"事件日志: {log_dir / f'gateway_fetch_{stamp}.log'}   处理明细: {worker_log}", flush=True)
+    status = Status(len(todo), total, max_ahead, log_dir / f"gateway_fetch_{stamp}.log", n_dl, n_proc)
+    print(f"并行: 下载 {n_dl} 天 x {args.connections} 连接，处理 {n_proc} 天   "
+          f"事件日志: {log_dir / f'gateway_fetch_{stamp}.log'}   处理明细: {worker_log}", flush=True)
 
     downloader = Downloader(gateway, args.proxy, args.connections, args.chunk_mb << 20, status)
+    pending: collections.deque = collections.deque(todo)
     ready: queue.Queue = queue.Queue(maxsize=max_ahead)
     stop = threading.Event()
+    state_lock = threading.Lock()
+    reserved = [0]  # bytes of downloads in flight, so the disk check counts them all
     quota_hit: list[str] = []
     dl_failed: list[date] = []
+    ok: list[date] = []
+    proc_failed: list[date] = []
 
-    def set_dl_phase(text: str, clear: bool = False) -> None:
-        with status.lock:
-            status.dl_phase = text
-            if clear:
-                status.dl_date, status.dl_bytes_fn = None, None
-
-    def download_loop() -> None:
-        for d in todo:
+    def download_loop(slot: Slot) -> None:
+        while not stop.is_set() and not quota_hit:
+            with state_lock:
+                if not pending:
+                    break
+                d = pending.popleft()
+            size = files[d]
+            while not stop.is_set():
+                with state_lock:
+                    if shutil.disk_usage(".").free - reserved[0] >= size + args.min_free_gb * GIB:
+                        reserved[0] += size
+                        break
+                slot.idle(f"等待磁盘空间（{d} 需要 {size / GIB:.1f} GiB）")
+                time.sleep(10)
             if stop.is_set():
                 break
-            path = bhp.cache_path(d)
-            while shutil.disk_usage(".").free < files[d] + args.min_free_gb * GIB and not stop.is_set():
-                set_dl_phase(f"等待磁盘空间（{d} 需要 {files[d] / GIB:.1f} GiB）", clear=True)
-                time.sleep(10)
             try:
-                downloader.download(d, files[d], path)
+                downloader.download(d, size, bhp.cache_path(d), slot)
             except QuotaExceeded as e:
                 quota_hit.append(f"{d}: {e}")
                 status.event(f"[dl] 网关下载额度已用完，停在 {d}: {e}")
                 break
             except Exception as e:  # noqa: BLE001
                 status.event(f"[dl] {d} 下载失败: {e}")
-                dl_failed.append(d)
+                with state_lock:
+                    dl_failed.append(d)
                 continue
-            set_dl_phase(f"{d} 已下完，等待处理队列空位", clear=True)
+            finally:
+                with state_lock:
+                    reserved[0] -= size
+            slot.idle(f"{d} 已下完，等待处理队列空位")
             while not stop.is_set():
+                # Listed before put() so a processor never sees a day that is not in `waiting`.
+                with status.lock:
+                    if d not in status.waiting:
+                        status.waiting.append(d)
                 try:
                     ready.put(d, timeout=0.5)
                     break
                 except queue.Full:
                     continue
-            with status.lock:
-                status.waiting.append(d)
-        set_dl_phase("额度用完，已停止下载" if quota_hit else "全部下载完成", clear=True)
-        ready.put(None)
+        slot.idle("额度用完，已停止" if quota_hit else "已完成")
 
-    status.start()
-    threading.Thread(target=download_loop, daemon=True).start()
-
-    ok: list[date] = []
-    proc_failed: list[date] = []
-    interrupted = False
-    try:
-        while True:
+    def process_loop(slot: Slot) -> None:
+        while not stop.is_set():
             try:
                 d = ready.get(timeout=0.5)
             except queue.Empty:
                 continue
             if d is None:
                 break
-            # The downloader appends to `waiting` just after its put() returns.
-            while True:
-                with status.lock:
-                    if d in status.waiting:
-                        status.waiting.remove(d)
-                        break
-                time.sleep(0.05)
+            with status.lock:
+                if d in status.waiting:
+                    status.waiting.remove(d)
             if args.download_only:
-                ok.append(d)
-                with status.lock:
-                    status.done_days += 1
-                continue
-            t0 = time.time()
-            rc = process_day(d, args, status, worker_log)
-            if rc == 0:
-                processed.add(d.isoformat())
-                bhp.save_checkpoint(processed)
-                ok.append(d)
-                with status.lock:
-                    status.done_days += 1
-                status.event(f"[proc] {d} 处理完成，用时 {time.time() - t0:.0f}s（{len(ok)}/{len(todo)}）")
+                rc = 0
             else:
-                proc_failed.append(d)
+                t0 = time.time()
+                rc = process_day(d, args, slot, worker_log)
+            if stop.is_set():
+                break
+            if rc == 0:
+                with state_lock:
+                    processed.add(d.isoformat())
+                    bhp.save_checkpoint(processed)
+                    ok.append(d)
+                    n_ok = len(ok)
+                with status.lock:
+                    status.done_days += 1
+                if not args.download_only:
+                    status.event(f"[proc] {d} 处理完成，用时 {time.time() - t0:.0f}s（{n_ok}/{len(todo)}）")
+            else:
+                with state_lock:
+                    proc_failed.append(d)
                 status.event(f"[proc] {d} 处理失败（exit {rc}），明细见 {worker_log}")
-                for line in tail(worker_log):
+                for line in log_tail(worker_log, f"===== {d} "):
                     status.event("    " + line)
-        with status.lock:
-            status.proc_phase = "全部处理完成"
+        slot.idle("已完成")
+
+    status.start()
+    dl_threads = [threading.Thread(target=download_loop, args=(s,), daemon=True) for s in status.dl]
+    proc_threads = [threading.Thread(target=process_loop, args=(s,), daemon=True) for s in status.proc]
+    for t in dl_threads + proc_threads:
+        t.start()
+
+    interrupted = False
+    try:
+        while any(t.is_alive() for t in dl_threads):
+            time.sleep(0.3)
+        for _ in proc_threads:
+            ready.put(None)
+        while any(t.is_alive() for t in proc_threads):
+            time.sleep(0.3)
     except KeyboardInterrupt:
         interrupted = True
         stop.set()
@@ -589,7 +637,7 @@ def main() -> int:
     status.event(f"结束：成功 {len(ok)} 天，下载失败 {len(dl_failed)} 天，处理失败 {len(proc_failed)} 天")
     for label, items in (("下载失败", dl_failed), ("处理失败", proc_failed)):
         if items:
-            status.event(f"  {label}: {', '.join(x.isoformat() for x in items)}")
+            status.event(f"  {label}: {', '.join(x.isoformat() for x in sorted(items))}")
     if quota_hit:
         status.event(f"  因网关额度停止: {quota_hit[0]}")
     status.close()

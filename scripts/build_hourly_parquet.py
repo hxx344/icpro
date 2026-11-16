@@ -32,6 +32,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import io
 import json
@@ -3777,6 +3778,41 @@ def _write_parquet_atomic(df: pd.DataFrame, out: Path) -> int:
         raise
 
 
+@contextlib.contextmanager
+def _output_write_lock(timeout: float = 3600.0):
+    """Serialize monthly parquet rewrites across concurrent worker processes.
+
+    Uses an OS byte-range lock, which is released automatically if the holder dies.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    deadline = time.time() + timeout
+    with open(OUTPUT_DIR / ".write.lock", "a+b") as fh:
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.time() > deadline:
+                        raise RuntimeError("Timed out waiting for the output write lock")
+                    time.sleep(0.2)
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
 def append_to_parquet(df: pd.DataFrame):
     """
     Write hourly data to Parquet, partitioned by underlying/year-month.
@@ -4197,12 +4233,14 @@ def process_single_date(
             if d == date(2024, 3, 5):
                 availability_threshold = 0.0
             if availability.empty:
-                _delete_output_for_date(d, sorted(df["underlying"].astype(str).str.upper().unique()))
+                with _output_write_lock():
+                    _delete_output_for_date(d, sorted(df["underlying"].astype(str).str.upper().unique()))
                 raise RuntimeError(f"No hourly rows found for target date {d}")
 
             bad_availability = availability[availability["availability_pct"] < availability_threshold]
             if not bad_availability.empty:
-                _delete_output_for_date(d, bad_availability["underlying"].astype(str).tolist())
+                with _output_write_lock():
+                    _delete_output_for_date(d, bad_availability["underlying"].astype(str).tolist())
                 details = ", ".join(
                     f"{row.underlying}={row.availability_pct:.2f}% ({int(row.unique_hours)}/24h)"
                     for row in bad_availability.itertuples(index=False)
@@ -4230,7 +4268,8 @@ def process_single_date(
             log.info("  Availability %s: %s", d, details)
 
             _emit_worker_progress(88, "write", f"write {d}")
-            append_to_parquet(df)
+            with _output_write_lock():
+                append_to_parquet(df)
             del df
             _emit_worker_progress(96, "cleanup", f"cleanup {d}")
             _release_memory()
