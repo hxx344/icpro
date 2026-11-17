@@ -41,6 +41,12 @@ def _to_utc_ns(timestamp) -> int:
     return int(ts.value)
 
 
+def _to_utc_ns_series(values) -> pd.Series:
+    # pandas 3 infers s/ms/us resolutions; consumers compare int64 views
+    # against Timestamp.value, which is always nanoseconds.
+    return pd.to_datetime(values, utc=True).dt.as_unit("ns")
+
+
 def _series_to_ns(values: pd.Series) -> np.ndarray:
     return values.to_numpy(dtype="datetime64[ns]").astype("int64")
 
@@ -225,8 +231,8 @@ def _load_disk_cached_store(
             return None
 
         df = pd.read_parquet(frame_path)
-        df["hour"] = pd.to_datetime(df["hour"], utc=True)
-        df["expiration_date"] = pd.to_datetime(df["expiration_date"], utc=True)
+        df["hour"] = _to_utc_ns_series(df["hour"])
+        df["expiration_date"] = _to_utc_ns_series(df["expiration_date"])
         available_ts_ns = meta.get("available_ts_ns") or {"open": np.array([], dtype=np.int64), "close": np.array([], dtype=np.int64)}
         hour_index = meta.get("hour_index") or {}
 
@@ -284,10 +290,10 @@ def _normalize_hourly_frame(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=_KEEP_COLS)
 
     df = df.copy()
-    df["hour"] = pd.to_datetime(df["hour"], utc=True)
+    df["hour"] = _to_utc_ns_series(df["hour"])
     df["instrument_name"] = df["symbol"].astype(str)
     df["option_type"] = df["type"].astype(str).str.lower()
-    df["expiration_date"] = pd.to_datetime(df["expiration"], unit="us", utc=True)
+    df["expiration_date"] = pd.to_datetime(df["expiration"], unit="us", utc=True).dt.as_unit("ns")
     df["hourly_pick"] = df["hourly_pick"].astype(str).str.lower()
 
     numeric_cols = [
@@ -332,8 +338,8 @@ def _load_or_build_month_cache(
     if month_df.empty:
         return month_df
 
-    month_df["hour"] = pd.to_datetime(month_df["hour"], utc=True)
-    month_df["expiration_date"] = pd.to_datetime(month_df["expiration_date"], utc=True)
+    month_df["hour"] = _to_utc_ns_series(month_df["hour"])
+    month_df["expiration_date"] = _to_utc_ns_series(month_df["expiration_date"])
     return month_df.reset_index(drop=True)
 
 

@@ -327,7 +327,7 @@ class WeekendVolStrategy(BaseStrategy):
         return candidate
 
     def _filter_target_expiry(self, chain, now: pd.Timestamp) -> pd.DataFrame:
-        exp_arr = pd.to_datetime(chain["expiration_date"].values, utc=True, errors="coerce")
+        exp_arr = pd.to_datetime(chain["expiration_date"].values, utc=True, errors="coerce").as_unit("ns")
         if len(exp_arr) == 0:
             return pd.DataFrame()
 
@@ -354,7 +354,7 @@ class WeekendVolStrategy(BaseStrategy):
         if df.empty:
             return df
 
-        expiry_col = pd.to_datetime(df["expiration_date"], utc=True, errors="coerce")
+        expiry_col = pd.to_datetime(df["expiration_date"], utc=True, errors="coerce").dt.as_unit("ns")
         expiry_col_ns = expiry_col.astype("int64", copy=False)
         diff_hours = (expiry_col_ns - target_close.value) / 3_600_000_000_000.0
         best_expiry = expiry_col.iloc[int(np.argmin(np.abs(diff_hours)))]

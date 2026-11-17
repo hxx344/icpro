@@ -78,3 +78,27 @@ def test_symbol_index_retains_past_only_search_behavior():
                                            np.array([3.]), np.array([2.]))}}
     assert store.get_quote("A", NOW - pd.Timedelta(seconds=1), "open") == (None, None, None)
     assert store.get_quote("A", NOW + pd.Timedelta(hours=1), "open") == (1., 3., 2.)
+
+def test_microsecond_expiry_is_normalized_and_matched_by_weekend_filter():
+    from options_backtest.data.hourly_store import _normalize_hourly_frame
+    from options_backtest.strategy.weekend_vol import WeekendVolStrategy
+
+    friday = pd.Timestamp("2026-10-02 18:00Z")
+    sunday = pd.Timestamp("2026-10-04 08:00Z")
+    raw = pd.DataFrame({
+        "symbol": ["A", "B"], "type": ["call", "put"], "strike_price": [1., 1.],
+        "expiration": [sunday.value // 1000, (sunday + pd.Timedelta(days=1)).value // 1000],
+        "hourly_pick": ["close", "close"], "hour": [friday, friday],
+        **{c: [1., 1.] for c in ("open_interest", "last_price", "bid_price", "ask_price",
+                                 "mark_price", "mark_iv", "bid_iv", "ask_iv",
+                                 "underlying_price", "delta", "gamma", "vega", "theta")},
+    })
+    frame = _normalize_hourly_frame(raw)
+    assert str(frame["expiration_date"].dtype) == "datetime64[ns, UTC]"
+    assert str(frame["hour"].dtype) == "datetime64[ns, UTC]"
+
+    chain = pd.DataFrame({"expiration_date": frame["expiration_date"].dt.as_unit("us"),
+                          "instrument_name": frame["instrument_name"]})
+    strategy = WeekendVolStrategy({"close_day": "sunday", "close_time_utc": "08:00",
+                                   "expiry_tolerance_hours": 2.0})
+    assert list(strategy._filter_target_expiry(chain, friday)["instrument_name"]) == ["A"]

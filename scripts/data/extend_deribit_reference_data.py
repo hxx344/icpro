@@ -5,6 +5,7 @@ Appends to the existing files instead of rebuilding them:
   * ``data/settlements/<ul>_settlements.parquet``  delivery prices
   * ``data/instruments/<ul>_instruments.parquet``  settled, listed and hourly-quoted options
   * ``data/underlying/<ul>_dvol_1D.parquet``       DVOL daily candles
+  * ``data/underlying/<ul>_index_60.parquet``      hourly perpetual candles
 
 Run from the directory that holds ``data/``:
     python scripts/data/extend_deribit_reference_data.py --underlying BTC --proxy http://127.0.0.1:7897
@@ -157,6 +158,48 @@ def extend_dvol(api: Deribit, underlying: str) -> None:
     print(f"dvol: +{len(merged) - len(existing)} rows, {last_ts} -> {merged['timestamp'].max()}")
 
 
+def extend_underlying(api: Deribit, underlying: str) -> None:
+    """Refresh the hourly underlying file with real perpetual candles.
+
+    Bars after the last traded one (volume > 0) are replaced: rows synthesised
+    from the option chain's median ``underlying_price`` sit above spot because
+    far expiries quote their futures price, which skews strike selection.
+    """
+    path = DATA_DIR / "underlying" / f"{underlying.lower()}_index_60.parquet"
+    if not path.exists():
+        print("underlying: no existing file, skipped")
+        return
+    existing = pd.read_parquet(path)
+    last_real = existing.loc[existing["volume"] > 0, "timestamp"].max()
+    hour_ms = 3_600_000
+    start_ms = int(last_real.timestamp() * 1000) + hour_ms
+    # The current hour is still forming; keep completed candles only.
+    end_ms = int(time.time() * 1000) // hour_ms * hour_ms - hour_ms
+    frames = []
+    while start_ms <= end_ms:
+        chunk_end = min(start_ms + 4500 * hour_ms, end_ms)
+        page = api.get("get_tradingview_chart_data", instrument_name=f"{underlying}-PERPETUAL",
+                       start_timestamp=start_ms, end_timestamp=chunk_end, resolution="60")
+        if page.get("status") != "ok" or not page.get("ticks"):
+            break
+        frames.append(pd.DataFrame({k: page[k] for k in ("ticks", "open", "high", "low", "close", "volume")}))
+        start_ms = int(page["ticks"][-1]) + hour_ms
+    if not frames:
+        print(f"underlying: already up to date ({last_real})")
+        return
+    new = pd.concat(frames, ignore_index=True).rename(columns={"ticks": "timestamp"})
+    new["timestamp"] = pd.to_datetime(new["timestamp"], unit="ms", utc=True).astype(existing["timestamp"].dtype)
+    new["underlying"] = underlying
+    new = new[new["timestamp"] > last_real]
+    # Hours the exchange has no candle for keep their previous row.
+    kept = existing[(existing["timestamp"] <= last_real) | ~existing["timestamp"].isin(new["timestamp"])]
+    merged = pd.concat([kept, new[existing.columns]], ignore_index=True).drop_duplicates(
+        subset=["timestamp"], keep="last").sort_values("timestamp").reset_index(drop=True)
+    atomic_write(path, merged)
+    synthetic = int((merged["volume"] <= 0).sum())
+    print(f"underlying: {len(new)} real bars after {last_real}, max {merged['timestamp'].max()}, "
+          f"{synthetic} bars without traded volume remain")
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--underlying", default="BTC")
@@ -169,6 +212,7 @@ def main() -> None:
     settled = extend_settlements(api, underlying)
     extend_instruments(api, underlying, settled, since)
     extend_dvol(api, underlying)
+    extend_underlying(api, underlying)
 
 
 if __name__ == "__main__":
