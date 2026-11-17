@@ -449,7 +449,8 @@ def process_day(d: date, args, slot: Slot, worker_log: Path) -> int:
     day_log = worker_log.with_name(f"{worker_log.stem}_{d.isoformat()}.log")
     cmd = [sys.executable, "-u", str(BHP_SCRIPT), "--_worker-date", d.isoformat(), "--cache-only",
            "--csv-read-mode", "polars-stream", "--polars-stream-chunk-mb", str(args.polars_stream_chunk_mb),
-           "--underlyings", args.underlyings, "--_progress-file", str(progress_file)]
+           "--underlyings", args.underlyings, "--min-availability", str(args.min_availability),
+           "--_progress-file", str(progress_file)]
     if args.keep_cache:
         cmd.append("--keep-cache")
     slot.begin(d)
@@ -496,6 +497,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--polars-stream-chunk-mb", type=int, default=64)
     ap.add_argument("--underlyings", default="BTC,ETH", help="comma-separated underlyings to keep")
+    ap.add_argument("--min-availability", type=float, default=98.0,
+                    help="minimum %% of 24 hours a day must cover; lower it to accept a day with a source gap")
     args = ap.parse_args()
 
     os.chdir(args.data_root)

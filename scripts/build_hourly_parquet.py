@@ -4435,6 +4435,8 @@ def main():
                         help="Limit CPU thread usage for Arrow/BLAS (0=auto, 1=lowest CPU, 2-4 recommended)")
     parser.add_argument("--force", action="store_true",
                         help="Re-download and reprocess all dates")
+    parser.add_argument("--min-availability", type=float, default=98.0,
+                        help="Minimum %% of the day's 24 hours a source file must cover (default: 98)")
     parser.add_argument("--underlyings", type=str, default="BTC,ETH",
                         help="Comma-separated underlyings to keep (default: BTC,ETH)")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -4455,7 +4457,9 @@ def main():
     global _proxy, _session, _download_segments, timer, _csv_read_mode, _csv_block_mb, _hybrid_chunk_mb, _hybrid_staging
     global _stream_merge_every_batches, _stream_queue_depth, _mem_soft_limit_mb, _mem_hard_limit_mb
     global _mem_diagnostics, _mem_diag_every_batches, _mem_peak_interval_ms, _pandas_slice_rows, _csv_aggressive_parse
-    global _polars_stream_chunk_mb, _WORKER_PROGRESS_FILE, _VALID_UNDERLYINGS
+    global _polars_stream_chunk_mb, _WORKER_PROGRESS_FILE, _VALID_UNDERLYINGS, MIN_DAILY_AVAILABILITY_PCT
+
+    MIN_DAILY_AVAILABILITY_PCT = args.min_availability
 
     _VALID_UNDERLYINGS = {u.strip().upper() for u in args.underlyings.split(",") if u.strip()}
     if not _VALID_UNDERLYINGS:
@@ -4769,6 +4773,7 @@ def main():
             "--pandas-slice-rows", str(args.pandas_slice_rows),
             "--cpu-limit", str(args.cpu_limit),
             "--underlyings", args.underlyings,
+            "--min-availability", str(args.min_availability),
         ]
         if args.csv_aggressive_parse:
             cmd.append("--csv-aggressive-parse")
